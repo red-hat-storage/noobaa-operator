@@ -14,6 +14,7 @@ func Cmd() *cobra.Command {
 		Use:   "options",
 		Short: "Print the list of global flags",
 		Run:   RunOptions,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -29,7 +30,7 @@ const (
 	// ContainerImageRepo is the repo of the default image url
 	ContainerImageRepo = "noobaa-core"
 	// ContainerImageTag is the tag of the default image url
-	ContainerImageTag = "5.8.0-20210519"
+	ContainerImageTag = "master-20220913"
 	// ContainerImageSemverLowerBound is the lower bound for supported image versions
 	ContainerImageSemverLowerBound = "5.0.0"
 	// ContainerImageSemverUpperBound is the upper bound for supported image versions
@@ -47,6 +48,9 @@ const (
 
 	// SystemName is a constant as we want just a single system per namespace
 	SystemName = "noobaa"
+
+	// ServiceServingCertCAFile points to OCP root CA to be added to the default root CA list
+	ServiceServingCertCAFile = "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt"
 )
 
 // Namespace is the target namespace for locating the noobaa system
@@ -90,8 +94,8 @@ var DBStorageClass = ""
 // it can be overridden for testing or different url.
 var MongoDbURL = ""
 
-//DebugLevel can be used to override the default debug level
-var DebugLevel = 0
+// DebugLevel can be used to override the default debug level
+var DebugLevel = "default_level"
 
 // PVPoolDefaultStorageClass is used for PVC's allocation for the noobaa server data
 // it can be overridden for testing or different PV providers.
@@ -106,6 +110,23 @@ var ImagePullSecret = ""
 // pod)
 var MiniEnv = false
 
+// DisableLoadBalancerService is used for setting the service type to ClusterIP instead of LoadBalancer
+var DisableLoadBalancerService = false
+
+// AdmissionWebhook is used for deploying the system with admission validation webhook
+var AdmissionWebhook = false
+
+// S3LoadBalancerSourceSubnets is used for setting the source subnets for the load balancer
+// created for noobaa S3 service
+var S3LoadBalancerSourceSubnets = []string{}
+
+// STSLoadBalancerSourceSubnets is used for setting the source subnets for the load balancer
+// created for noobaa STS service
+var STSLoadBalancerSourceSubnets = []string{}
+
+// ShowSecrets is used to show the secrets in the status output
+var ShowSecrets = false
+
 // SubDomainNS returns a unique subdomain for the namespace
 func SubDomainNS() string {
 	return Namespace + ".noobaa.io"
@@ -114,6 +135,16 @@ func SubDomainNS() string {
 // ObjectBucketProvisionerName returns the provisioner name to be used in storage classes for OB/OBC
 func ObjectBucketProvisionerName() string {
 	return SubDomainNS() + "/obc"
+}
+
+// WatchNamespace returns the namespace which NooBaa operator will watch for changes
+func WatchNamespace() string {
+	ns, err := util.GetWatchNamespace()
+	if err == nil {
+		return ns
+	}
+
+	return Namespace
 }
 
 // FlagSet defines the
@@ -159,9 +190,9 @@ func init() {
 		&MongoDbURL, "mongodb-url",
 		MongoDbURL, "url for mongodb",
 	)
-	FlagSet.IntVar(
+	FlagSet.StringVar(
 		&DebugLevel, "debug-level",
-		DebugLevel, "Sets debug level prints of the system, affects the install spec",
+		DebugLevel, "The type of debug sets that the system prints (all, nsfs, warn, default_level)",
 	)
 	FlagSet.StringVar(
 		&PVPoolDefaultStorageClass, "pv-pool-default-storage-class",
@@ -174,5 +205,25 @@ func init() {
 	FlagSet.BoolVar(
 		&MiniEnv, "mini",
 		false, "Signal the operator that it is running in a low resource environment",
+	)
+	FlagSet.BoolVar(
+		&DisableLoadBalancerService, "disable-load-balancer",
+		false, "Set the service type to ClusterIP instead of LoadBalancer",
+	)
+	FlagSet.BoolVar(
+		&AdmissionWebhook, "admission",
+		false, "Install the system with admission validation webhook",
+	)
+	FlagSet.BoolVar(
+		&ShowSecrets, "show-secrets",
+		false, "Show the secrets in the status output",
+	)
+	FlagSet.StringArrayVar(
+		&S3LoadBalancerSourceSubnets, "s3-load-balancer-source-subnets",
+		[]string{}, "The source subnets for the S3 service load balancer",
+	)
+	FlagSet.StringArrayVar(
+		&STSLoadBalancerSourceSubnets, "sts-load-balancer-source-subnets",
+		[]string{}, "The source subnets for the STS service load balancer",
 	)
 }

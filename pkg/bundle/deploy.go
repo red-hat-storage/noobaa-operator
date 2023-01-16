@@ -1,8 +1,8 @@
 package bundle
 
-const Version = "5.9.0"
+const Version = "5.13.0"
 
-const Sha256_deploy_cluster_role_yaml = "349e613915ed288629c4926e22cd42f4a3776ed38dfbc9e814a9b28211a67b3c"
+const Sha256_deploy_cluster_role_yaml = "af479a2ade093cf0a2c220fe4650151075cc0aaa58a01dd0ae60e7f7022d42d5"
 
 const File_deploy_cluster_role_yaml = `apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -51,6 +51,7 @@ rules:
       - watch
       - create
       - update
+      - delete
   - apiGroups:
       - ""
     resources:
@@ -71,6 +72,20 @@ rules:
       - subjectaccessreviews
     verbs:
       - create
+  - apiGroups:
+      - admissionregistration.k8s.io
+    resources:
+      - validatingwebhookconfigurations
+    verbs:
+      - get
+      - update
+      - list
+  - apiGroups:
+      - security.openshift.io
+    resources:
+      - securitycontextconstraints
+    verbs:
+      - '*'
 `
 
 const Sha256_deploy_cluster_role_binding_yaml = "15c78355aefdceaf577bd96b4ae949ae424a3febdc8853be0917cf89a63941fc"
@@ -89,7 +104,7 @@ roleRef:
   name: noobaa.noobaa.io
 `
 
-const Sha256_deploy_crds_noobaa_io_backingstores_crd_yaml = "a16b5064b97194d8041a09ff0b43929b5496c32fc034f68f5da87cb35a169cc6"
+const Sha256_deploy_crds_noobaa_io_backingstores_crd_yaml = "3027bd7e2d6ce876ed7c6fad8cbe3dd48513b1ace2f3b35a5d10a330eb094a3c"
 
 const File_deploy_crds_noobaa_io_backingstores_crd_yaml = `apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
@@ -139,6 +154,8 @@ spec:
               awsS3:
                 description: AWSS3Spec specifies a backing store of type aws-s3
                 properties:
+                  awsSTSRoleARN:
+                    type: string
                   region:
                     description: Region is the AWS region
                     type: string
@@ -147,11 +164,11 @@ spec:
                       The secret should define AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
                     properties:
                       name:
-                        description: Name is unique within a namespace to reference
+                        description: name is unique within a namespace to reference
                           a secret resource.
                         type: string
                       namespace:
-                        description: Namespace defines the space within which the
+                        description: namespace defines the space within which the
                           secret name must be unique.
                         type: string
                     type: object
@@ -162,7 +179,6 @@ spec:
                     description: TargetBucket is the name of the target S3 bucket
                     type: string
                 required:
-                - secret
                 - targetBucket
                 type: object
               azureBlob:
@@ -174,11 +190,11 @@ spec:
                       by Azure Blob.
                     properties:
                       name:
-                        description: Name is unique within a namespace to reference
+                        description: name is unique within a namespace to reference
                           a secret resource.
                         type: string
                       namespace:
-                        description: Namespace defines the space within which the
+                        description: namespace defines the space within which the
                           secret name must be unique.
                         type: string
                     type: object
@@ -200,11 +216,11 @@ spec:
                       containing the entire json string as provided by Google.
                     properties:
                       name:
-                        description: Name is unique within a namespace to reference
+                        description: name is unique within a namespace to reference
                           a secret resource.
                         type: string
                       namespace:
-                        description: Namespace defines the space within which the
+                        description: namespace defines the space within which the
                           secret name must be unique.
                         type: string
                     type: object
@@ -226,11 +242,11 @@ spec:
                       The secret should define IBM_COS_ACCESS_KEY_ID and IBM_COS_SECRET_ACCESS_KEY
                     properties:
                       name:
-                        description: Name is unique within a namespace to reference
+                        description: name is unique within a namespace to reference
                           a secret resource.
                         type: string
                       namespace:
-                        description: Namespace defines the space within which the
+                        description: namespace defines the space within which the
                           secret name must be unique.
                         type: string
                     type: object
@@ -264,7 +280,7 @@ spec:
                           pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                           x-kubernetes-int-or-string: true
                         description: 'Limits describes the maximum amount of compute
-                          resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/'
+                          resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                         type: object
                       requests:
                         additionalProperties:
@@ -276,7 +292,7 @@ spec:
                         description: 'Requests describes the minimum amount of compute
                           resources required. If Requests is omitted for a container,
                           it defaults to Limits if that is explicitly specified, otherwise
-                          to an implementation-defined value. More info: https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/'
+                          to an implementation-defined value. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                         type: object
                     type: object
                   secret:
@@ -285,11 +301,11 @@ spec:
                       agent_configuration from noobaa-core.
                     properties:
                       name:
-                        description: Name is unique within a namespace to reference
+                        description: name is unique within a namespace to reference
                           a secret resource.
                         type: string
                       namespace:
-                        description: Namespace defines the space within which the
+                        description: namespace defines the space within which the
                           secret name must be unique.
                         type: string
                     type: object
@@ -311,11 +327,11 @@ spec:
                       The secret should define AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
                     properties:
                       name:
-                        description: Name is unique within a namespace to reference
+                        description: name is unique within a namespace to reference
                           a secret resource.
                         type: string
                       namespace:
-                        description: Namespace defines the space within which the
+                        description: namespace defines the space within which the
                           secret name must be unique.
                         type: string
                     type: object
@@ -386,31 +402,31 @@ spec:
               relatedObjects:
                 description: RelatedObjects is a list of objects related to this operator.
                 items:
-                  description: 'ObjectReference contains enough information to let
+                  description: "ObjectReference contains enough information to let
                     you inspect or modify the referred object. --- New uses of this
                     type are discouraged because of difficulty describing its usage
                     when embedded in APIs.  1. Ignored fields.  It includes many fields
                     which are not generally honored.  For instance, ResourceVersion
                     and FieldPath are both very rarely valid in actual usage.  2.
                     Invalid usage help.  It is impossible to add specific help for
-                    individual usage.  In most embedded usages, there are particular     restrictions
-                    like, "must refer only to types A and B" or "UID not honored"
-                    or "name must be restricted".     Those cannot be well described
-                    when embedded.  3. Inconsistent validation.  Because the usages
-                    are different, the validation rules are different by usage, which
-                    makes it hard for users to predict what will happen.  4. The fields
-                    are both imprecise and overly precise.  Kind is not a precise
-                    mapping to a URL. This can produce ambiguity     during interpretation
-                    and require a REST mapping.  In most cases, the dependency is
-                    on the group,resource tuple     and the version of the actual
-                    struct is irrelevant.  5. We cannot easily change it.  Because
-                    this type is embedded in many locations, updates to this type     will
-                    affect numerous schemas.  Don''t make new APIs embed an underspecified
-                    API type they do not control. Instead of using this type, create
-                    a locally provided and used type that is well-focused on your
-                    reference. For example, ServiceReferences for admission registration:
-                    https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533
-                    .'
+                    individual usage.  In most embedded usages, there are particular
+                    \    restrictions like, \"must refer only to types A and B\" or
+                    \"UID not honored\" or \"name must be restricted\".     Those
+                    cannot be well described when embedded.  3. Inconsistent validation.
+                    \ Because the usages are different, the validation rules are different
+                    by usage, which makes it hard for users to predict what will happen.
+                    \ 4. The fields are both imprecise and overly precise.  Kind is
+                    not a precise mapping to a URL. This can produce ambiguity     during
+                    interpretation and require a REST mapping.  In most cases, the
+                    dependency is on the group,resource tuple     and the version
+                    of the actual struct is irrelevant.  5. We cannot easily change
+                    it.  Because this type is embedded in many locations, updates
+                    to this type     will affect numerous schemas.  Don't make new
+                    APIs embed an underspecified API type they do not control. \n
+                    Instead of using this type, create a locally provided and used
+                    type that is well-focused on your reference. For example, ServiceReferences
+                    for admission registration: https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533
+                    ."
                   properties:
                     apiVersion:
                       description: API version of the referent.
@@ -454,7 +470,7 @@ spec:
       status: {}
 `
 
-const Sha256_deploy_crds_noobaa_io_bucketclasses_crd_yaml = "f8103950e9d3f6a0a8b61c32d26201799310268dd67a2673e4c2035679397c42"
+const Sha256_deploy_crds_noobaa_io_bucketclasses_crd_yaml = "191c182d176270769416393926ca85198f43e94168f4bfa40e0a6aa2bfb04b79"
 
 const File_deploy_crds_noobaa_io_bucketclasses_crd_yaml = `apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
@@ -477,6 +493,10 @@ spec:
     - description: NamespacePolicy
       jsonPath: .spec.namespacePolicy
       name: NamespacePolicy
+      type: string
+    - description: Quota
+      jsonPath: .spec.quota
+      name: Quota
       type: string
     - description: Phase
       jsonPath: .status.phase
@@ -583,6 +603,21 @@ spec:
                       type: object
                     type: array
                 type: object
+              quota:
+                description: Quota specifies the quota configuration for the bucket
+                  class
+                properties:
+                  maxObjects:
+                    description: limits the max total quantity of objects per bucket
+                    type: string
+                  maxSize:
+                    description: limits the max total size of objects per bucket
+                    type: string
+                type: object
+              replicationPolicy:
+                description: ReplicationPolicy specifies a json of replication rules
+                  for the bucketclass
+                type: string
             type: object
           status:
             description: Most recently observed status of the noobaa BackingStore.
@@ -626,31 +661,31 @@ spec:
               relatedObjects:
                 description: RelatedObjects is a list of objects related to this operator.
                 items:
-                  description: 'ObjectReference contains enough information to let
+                  description: "ObjectReference contains enough information to let
                     you inspect or modify the referred object. --- New uses of this
                     type are discouraged because of difficulty describing its usage
                     when embedded in APIs.  1. Ignored fields.  It includes many fields
                     which are not generally honored.  For instance, ResourceVersion
                     and FieldPath are both very rarely valid in actual usage.  2.
                     Invalid usage help.  It is impossible to add specific help for
-                    individual usage.  In most embedded usages, there are particular     restrictions
-                    like, "must refer only to types A and B" or "UID not honored"
-                    or "name must be restricted".     Those cannot be well described
-                    when embedded.  3. Inconsistent validation.  Because the usages
-                    are different, the validation rules are different by usage, which
-                    makes it hard for users to predict what will happen.  4. The fields
-                    are both imprecise and overly precise.  Kind is not a precise
-                    mapping to a URL. This can produce ambiguity     during interpretation
-                    and require a REST mapping.  In most cases, the dependency is
-                    on the group,resource tuple     and the version of the actual
-                    struct is irrelevant.  5. We cannot easily change it.  Because
-                    this type is embedded in many locations, updates to this type     will
-                    affect numerous schemas.  Don''t make new APIs embed an underspecified
-                    API type they do not control. Instead of using this type, create
-                    a locally provided and used type that is well-focused on your
-                    reference. For example, ServiceReferences for admission registration:
-                    https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533
-                    .'
+                    individual usage.  In most embedded usages, there are particular
+                    \    restrictions like, \"must refer only to types A and B\" or
+                    \"UID not honored\" or \"name must be restricted\".     Those
+                    cannot be well described when embedded.  3. Inconsistent validation.
+                    \ Because the usages are different, the validation rules are different
+                    by usage, which makes it hard for users to predict what will happen.
+                    \ 4. The fields are both imprecise and overly precise.  Kind is
+                    not a precise mapping to a URL. This can produce ambiguity     during
+                    interpretation and require a REST mapping.  In most cases, the
+                    dependency is on the group,resource tuple     and the version
+                    of the actual struct is irrelevant.  5. We cannot easily change
+                    it.  Because this type is embedded in many locations, updates
+                    to this type     will affect numerous schemas.  Don't make new
+                    APIs embed an underspecified API type they do not control. \n
+                    Instead of using this type, create a locally provided and used
+                    type that is well-focused on your reference. For example, ServiceReferences
+                    for admission registration: https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533
+                    ."
                   properties:
                     apiVersion:
                       description: API version of the referent.
@@ -694,7 +729,7 @@ spec:
       status: {}
 `
 
-const Sha256_deploy_crds_noobaa_io_namespacestores_crd_yaml = "75ea24de1ab0e53c7cdebe2e1f55fe7cd0dc28f469920d64a8451d5429967c8f"
+const Sha256_deploy_crds_noobaa_io_namespacestores_crd_yaml = "94617b9c3967ae0d8515f6196e9a6571242e74ebca91eedba56b57e8ac460551"
 
 const File_deploy_crds_noobaa_io_namespacestores_crd_yaml = `apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
@@ -741,9 +776,14 @@ spec:
           spec:
             description: Specification of the desired behavior of the noobaa NamespaceStore.
             properties:
+              accessMode:
+                description: AccessMode is an enum of supported access modes
+                type: string
               awsS3:
                 description: AWSS3Spec specifies a namespace store of type aws-s3
                 properties:
+                  awsSTSRoleARN:
+                    type: string
                   region:
                     description: Region is the AWS region
                     type: string
@@ -752,11 +792,11 @@ spec:
                       The secret should define AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
                     properties:
                       name:
-                        description: Name is unique within a namespace to reference
+                        description: name is unique within a namespace to reference
                           a secret resource.
                         type: string
                       namespace:
-                        description: Namespace defines the space within which the
+                        description: namespace defines the space within which the
                           secret name must be unique.
                         type: string
                     type: object
@@ -767,7 +807,6 @@ spec:
                     description: TargetBucket is the name of the target S3 bucket
                     type: string
                 required:
-                - secret
                 - targetBucket
                 type: object
               azureBlob:
@@ -779,11 +818,11 @@ spec:
                       by Azure Blob.
                     properties:
                       name:
-                        description: Name is unique within a namespace to reference
+                        description: name is unique within a namespace to reference
                           a secret resource.
                         type: string
                       namespace:
-                        description: Namespace defines the space within which the
+                        description: namespace defines the space within which the
                           secret name must be unique.
                         type: string
                     type: object
@@ -806,11 +845,11 @@ spec:
                       The secret should define IBM_COS_ACCESS_KEY_ID and IBM_COS_SECRET_ACCESS_KEY
                     properties:
                       name:
-                        description: Name is unique within a namespace to reference
+                        description: name is unique within a namespace to reference
                           a secret resource.
                         type: string
                       namespace:
-                        description: Namespace defines the space within which the
+                        description: namespace defines the space within which the
                           secret name must be unique.
                         type: string
                     type: object
@@ -858,11 +897,11 @@ spec:
                       The secret should define AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
                     properties:
                       name:
-                        description: Name is unique within a namespace to reference
+                        description: name is unique within a namespace to reference
                           a secret resource.
                         type: string
                       namespace:
-                        description: Namespace defines the space within which the
+                        description: namespace defines the space within which the
                           secret name must be unique.
                         type: string
                     type: object
@@ -933,31 +972,31 @@ spec:
               relatedObjects:
                 description: RelatedObjects is a list of objects related to this operator.
                 items:
-                  description: 'ObjectReference contains enough information to let
+                  description: "ObjectReference contains enough information to let
                     you inspect or modify the referred object. --- New uses of this
                     type are discouraged because of difficulty describing its usage
                     when embedded in APIs.  1. Ignored fields.  It includes many fields
                     which are not generally honored.  For instance, ResourceVersion
                     and FieldPath are both very rarely valid in actual usage.  2.
                     Invalid usage help.  It is impossible to add specific help for
-                    individual usage.  In most embedded usages, there are particular     restrictions
-                    like, "must refer only to types A and B" or "UID not honored"
-                    or "name must be restricted".     Those cannot be well described
-                    when embedded.  3. Inconsistent validation.  Because the usages
-                    are different, the validation rules are different by usage, which
-                    makes it hard for users to predict what will happen.  4. The fields
-                    are both imprecise and overly precise.  Kind is not a precise
-                    mapping to a URL. This can produce ambiguity     during interpretation
-                    and require a REST mapping.  In most cases, the dependency is
-                    on the group,resource tuple     and the version of the actual
-                    struct is irrelevant.  5. We cannot easily change it.  Because
-                    this type is embedded in many locations, updates to this type     will
-                    affect numerous schemas.  Don''t make new APIs embed an underspecified
-                    API type they do not control. Instead of using this type, create
-                    a locally provided and used type that is well-focused on your
-                    reference. For example, ServiceReferences for admission registration:
-                    https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533
-                    .'
+                    individual usage.  In most embedded usages, there are particular
+                    \    restrictions like, \"must refer only to types A and B\" or
+                    \"UID not honored\" or \"name must be restricted\".     Those
+                    cannot be well described when embedded.  3. Inconsistent validation.
+                    \ Because the usages are different, the validation rules are different
+                    by usage, which makes it hard for users to predict what will happen.
+                    \ 4. The fields are both imprecise and overly precise.  Kind is
+                    not a precise mapping to a URL. This can produce ambiguity     during
+                    interpretation and require a REST mapping.  In most cases, the
+                    dependency is on the group,resource tuple     and the version
+                    of the actual struct is irrelevant.  5. We cannot easily change
+                    it.  Because this type is embedded in many locations, updates
+                    to this type     will affect numerous schemas.  Don't make new
+                    APIs embed an underspecified API type they do not control. \n
+                    Instead of using this type, create a locally provided and used
+                    type that is well-focused on your reference. For example, ServiceReferences
+                    for admission registration: https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533
+                    ."
                   properties:
                     apiVersion:
                       description: API version of the referent.
@@ -1001,7 +1040,186 @@ spec:
       status: {}
 `
 
-const Sha256_deploy_crds_noobaa_io_noobaas_crd_yaml = "a77ff65531f26c4361ca51ba1f38c0076da1ab24403007641a131ce63f2065cd"
+const Sha256_deploy_crds_noobaa_io_noobaaaccounts_crd_yaml = "5f3305547e62fc4d42e8ec78e66176a69e4747c01e25ce148570b7f3de3cc072"
+
+const File_deploy_crds_noobaa_io_noobaaaccounts_crd_yaml = `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: noobaaaccounts.noobaa.io
+spec:
+  group: noobaa.io
+  names:
+    kind: NooBaaAccount
+    listKind: NooBaaAccountList
+    plural: noobaaaccounts
+    singular: noobaaaccount
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - description: Phase
+      jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: NooBaaAccount is the Schema for the NooBaaAccounts API
+        properties:
+          apiVersion:
+            description: 'APIVersion defines the versioned schema of this representation
+              of an object. Servers should convert recognized schemas to the latest
+              internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources'
+            type: string
+          kind:
+            description: 'Kind is a string value representing the REST resource this
+              object represents. Servers may infer this from the endpoint the client
+              submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: Specification of the desired behavior of the NooBaaAccount.
+            properties:
+              allow_bucket_creation:
+                description: AllowBucketCreate specifies if new buckets can be created
+                  by this account
+                type: boolean
+              default_resource:
+                description: DefaultResource specifies which backingstore this account
+                  will use to create new buckets
+                type: string
+              nsfs_account_config:
+                description: NsfsAccountConfig specifies the configurations on Namespace
+                  FS
+                nullable: true
+                properties:
+                  gid:
+                    type: integer
+                  new_buckets_path:
+                    type: string
+                  nsfs_only:
+                    type: boolean
+                  uid:
+                    type: integer
+                required:
+                - gid
+                - new_buckets_path
+                - nsfs_only
+                - uid
+                type: object
+            required:
+            - allow_bucket_creation
+            type: object
+          status:
+            description: Most recently observed status of the NooBaaAccount.
+            properties:
+              conditions:
+                description: Conditions is a list of conditions related to operator
+                  reconciliation
+                items:
+                  description: Condition represents the state of the operator's reconciliation
+                    functionality.
+                  properties:
+                    lastHeartbeatTime:
+                      format: date-time
+                      type: string
+                    lastTransitionTime:
+                      format: date-time
+                      type: string
+                    message:
+                      type: string
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      description: ConditionType is the state of the operator's reconciliation
+                        functionality.
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              phase:
+                description: Phase is a simple, high-level summary of where the noobaa
+                  user is in its lifecycle
+                type: string
+              relatedObjects:
+                description: RelatedObjects is a list of objects related to this operator.
+                items:
+                  description: "ObjectReference contains enough information to let
+                    you inspect or modify the referred object. --- New uses of this
+                    type are discouraged because of difficulty describing its usage
+                    when embedded in APIs.  1. Ignored fields.  It includes many fields
+                    which are not generally honored.  For instance, ResourceVersion
+                    and FieldPath are both very rarely valid in actual usage.  2.
+                    Invalid usage help.  It is impossible to add specific help for
+                    individual usage.  In most embedded usages, there are particular
+                    \    restrictions like, \"must refer only to types A and B\" or
+                    \"UID not honored\" or \"name must be restricted\".     Those
+                    cannot be well described when embedded.  3. Inconsistent validation.
+                    \ Because the usages are different, the validation rules are different
+                    by usage, which makes it hard for users to predict what will happen.
+                    \ 4. The fields are both imprecise and overly precise.  Kind is
+                    not a precise mapping to a URL. This can produce ambiguity     during
+                    interpretation and require a REST mapping.  In most cases, the
+                    dependency is on the group,resource tuple     and the version
+                    of the actual struct is irrelevant.  5. We cannot easily change
+                    it.  Because this type is embedded in many locations, updates
+                    to this type     will affect numerous schemas.  Don't make new
+                    APIs embed an underspecified API type they do not control. \n
+                    Instead of using this type, create a locally provided and used
+                    type that is well-focused on your reference. For example, ServiceReferences
+                    for admission registration: https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533
+                    ."
+                  properties:
+                    apiVersion:
+                      description: API version of the referent.
+                      type: string
+                    fieldPath:
+                      description: 'If referring to a piece of an object instead of
+                        an entire object, this string should contain a valid JSON/Go
+                        field access statement, such as desiredState.manifest.containers[2].
+                        For example, if the object reference is to a container within
+                        a pod, this would take on a value like: "spec.containers{name}"
+                        (where "name" refers to the name of the container that triggered
+                        the event) or if no container name is specified "spec.containers[2]"
+                        (container with index 2 in this pod). This syntax is chosen
+                        only to have some well-defined way of referencing a part of
+                        an object. TODO: this design is not final and this field is
+                        subject to change in the future.'
+                      type: string
+                    kind:
+                      description: 'Kind of the referent. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
+                      type: string
+                    name:
+                      description: 'Name of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names'
+                      type: string
+                    namespace:
+                      description: 'Namespace of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/'
+                      type: string
+                    resourceVersion:
+                      description: 'Specific resourceVersion to which this reference
+                        is made, if any. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#concurrency-control-and-consistency'
+                      type: string
+                    uid:
+                      description: 'UID of the referent. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids'
+                      type: string
+                  type: object
+                type: array
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+`
+
+const Sha256_deploy_crds_noobaa_io_noobaas_crd_yaml = "a04493f5b341dd61972a1e61620e2226efde852d05702d25defc26479b1a5d5d"
 
 const File_deploy_crds_noobaa_io_noobaas_crd_yaml = `apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
@@ -1019,13 +1237,13 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - description: Management Endpoints
-      jsonPath: .status.services.serviceMgmt.nodePorts
-      name: Mgmt-Endpoints
-      type: string
     - description: S3 Endpoints
       jsonPath: .status.services.serviceS3.nodePorts
       name: S3-Endpoints
+      type: string
+    - description: STS Endpoints
+      jsonPath: .status.services.serviceSts.nodePorts
+      name: Sts-Endpoints
       type: string
     - description: Actual Image
       jsonPath: .status.actualImage
@@ -1340,10 +1558,69 @@ spec:
                                         The requirements are ANDed.
                                       type: object
                                   type: object
+                                namespaceSelector:
+                                  description: A label query over the set of namespaces
+                                    that the term applies to. The term is applied
+                                    to the union of the namespaces selected by this
+                                    field and the ones listed in the namespaces field.
+                                    null selector and null or empty namespaces list
+                                    means "this pod's namespace". An empty selector
+                                    ({}) matches all namespaces.
+                                  properties:
+                                    matchExpressions:
+                                      description: matchExpressions is a list of label
+                                        selector requirements. The requirements are
+                                        ANDed.
+                                      items:
+                                        description: A label selector requirement
+                                          is a selector that contains values, a key,
+                                          and an operator that relates the key and
+                                          values.
+                                        properties:
+                                          key:
+                                            description: key is the label key that
+                                              the selector applies to.
+                                            type: string
+                                          operator:
+                                            description: operator represents a key's
+                                              relationship to a set of values. Valid
+                                              operators are In, NotIn, Exists and
+                                              DoesNotExist.
+                                            type: string
+                                          values:
+                                            description: values is an array of string
+                                              values. If the operator is In or NotIn,
+                                              the values array must be non-empty.
+                                              If the operator is Exists or DoesNotExist,
+                                              the values array must be empty. This
+                                              array is replaced during a strategic
+                                              merge patch.
+                                            items:
+                                              type: string
+                                            type: array
+                                        required:
+                                        - key
+                                        - operator
+                                        type: object
+                                      type: array
+                                    matchLabels:
+                                      additionalProperties:
+                                        type: string
+                                      description: matchLabels is a map of {key,value}
+                                        pairs. A single {key,value} in the matchLabels
+                                        map is equivalent to an element of matchExpressions,
+                                        whose key field is "key", the operator is
+                                        "In", and the values array contains only "value".
+                                        The requirements are ANDed.
+                                      type: object
+                                  type: object
                                 namespaces:
-                                  description: namespaces specifies which namespaces
-                                    the labelSelector applies to (matches against);
-                                    null or empty list means "this pod's namespace"
+                                  description: namespaces specifies a static list
+                                    of namespace names that the term applies to. The
+                                    term is applied to the union of the namespaces
+                                    listed in this field and the ones selected by
+                                    namespaceSelector. null or empty namespaces list
+                                    and null namespaceSelector means "this pod's namespace".
                                   items:
                                     type: string
                                   type: array
@@ -1435,10 +1712,64 @@ spec:
                                     requirements are ANDed.
                                   type: object
                               type: object
+                            namespaceSelector:
+                              description: A label query over the set of namespaces
+                                that the term applies to. The term is applied to the
+                                union of the namespaces selected by this field and
+                                the ones listed in the namespaces field. null selector
+                                and null or empty namespaces list means "this pod's
+                                namespace". An empty selector ({}) matches all namespaces.
+                              properties:
+                                matchExpressions:
+                                  description: matchExpressions is a list of label
+                                    selector requirements. The requirements are ANDed.
+                                  items:
+                                    description: A label selector requirement is a
+                                      selector that contains values, a key, and an
+                                      operator that relates the key and values.
+                                    properties:
+                                      key:
+                                        description: key is the label key that the
+                                          selector applies to.
+                                        type: string
+                                      operator:
+                                        description: operator represents a key's relationship
+                                          to a set of values. Valid operators are
+                                          In, NotIn, Exists and DoesNotExist.
+                                        type: string
+                                      values:
+                                        description: values is an array of string
+                                          values. If the operator is In or NotIn,
+                                          the values array must be non-empty. If the
+                                          operator is Exists or DoesNotExist, the
+                                          values array must be empty. This array is
+                                          replaced during a strategic merge patch.
+                                        items:
+                                          type: string
+                                        type: array
+                                    required:
+                                    - key
+                                    - operator
+                                    type: object
+                                  type: array
+                                matchLabels:
+                                  additionalProperties:
+                                    type: string
+                                  description: matchLabels is a map of {key,value}
+                                    pairs. A single {key,value} in the matchLabels
+                                    map is equivalent to an element of matchExpressions,
+                                    whose key field is "key", the operator is "In",
+                                    and the values array contains only "value". The
+                                    requirements are ANDed.
+                                  type: object
+                              type: object
                             namespaces:
-                              description: namespaces specifies which namespaces the
-                                labelSelector applies to (matches against); null or
-                                empty list means "this pod's namespace"
+                              description: namespaces specifies a static list of namespace
+                                names that the term applies to. The term is applied
+                                to the union of the namespaces listed in this field
+                                and the ones selected by namespaceSelector. null or
+                                empty namespaces list and null namespaceSelector means
+                                "this pod's namespace".
                               items:
                                 type: string
                               type: array
@@ -1532,10 +1863,69 @@ spec:
                                         The requirements are ANDed.
                                       type: object
                                   type: object
+                                namespaceSelector:
+                                  description: A label query over the set of namespaces
+                                    that the term applies to. The term is applied
+                                    to the union of the namespaces selected by this
+                                    field and the ones listed in the namespaces field.
+                                    null selector and null or empty namespaces list
+                                    means "this pod's namespace". An empty selector
+                                    ({}) matches all namespaces.
+                                  properties:
+                                    matchExpressions:
+                                      description: matchExpressions is a list of label
+                                        selector requirements. The requirements are
+                                        ANDed.
+                                      items:
+                                        description: A label selector requirement
+                                          is a selector that contains values, a key,
+                                          and an operator that relates the key and
+                                          values.
+                                        properties:
+                                          key:
+                                            description: key is the label key that
+                                              the selector applies to.
+                                            type: string
+                                          operator:
+                                            description: operator represents a key's
+                                              relationship to a set of values. Valid
+                                              operators are In, NotIn, Exists and
+                                              DoesNotExist.
+                                            type: string
+                                          values:
+                                            description: values is an array of string
+                                              values. If the operator is In or NotIn,
+                                              the values array must be non-empty.
+                                              If the operator is Exists or DoesNotExist,
+                                              the values array must be empty. This
+                                              array is replaced during a strategic
+                                              merge patch.
+                                            items:
+                                              type: string
+                                            type: array
+                                        required:
+                                        - key
+                                        - operator
+                                        type: object
+                                      type: array
+                                    matchLabels:
+                                      additionalProperties:
+                                        type: string
+                                      description: matchLabels is a map of {key,value}
+                                        pairs. A single {key,value} in the matchLabels
+                                        map is equivalent to an element of matchExpressions,
+                                        whose key field is "key", the operator is
+                                        "In", and the values array contains only "value".
+                                        The requirements are ANDed.
+                                      type: object
+                                  type: object
                                 namespaces:
-                                  description: namespaces specifies which namespaces
-                                    the labelSelector applies to (matches against);
-                                    null or empty list means "this pod's namespace"
+                                  description: namespaces specifies a static list
+                                    of namespace names that the term applies to. The
+                                    term is applied to the union of the namespaces
+                                    listed in this field and the ones selected by
+                                    namespaceSelector. null or empty namespaces list
+                                    and null namespaceSelector means "this pod's namespace".
                                   items:
                                     type: string
                                   type: array
@@ -1627,10 +2017,64 @@ spec:
                                     requirements are ANDed.
                                   type: object
                               type: object
+                            namespaceSelector:
+                              description: A label query over the set of namespaces
+                                that the term applies to. The term is applied to the
+                                union of the namespaces selected by this field and
+                                the ones listed in the namespaces field. null selector
+                                and null or empty namespaces list means "this pod's
+                                namespace". An empty selector ({}) matches all namespaces.
+                              properties:
+                                matchExpressions:
+                                  description: matchExpressions is a list of label
+                                    selector requirements. The requirements are ANDed.
+                                  items:
+                                    description: A label selector requirement is a
+                                      selector that contains values, a key, and an
+                                      operator that relates the key and values.
+                                    properties:
+                                      key:
+                                        description: key is the label key that the
+                                          selector applies to.
+                                        type: string
+                                      operator:
+                                        description: operator represents a key's relationship
+                                          to a set of values. Valid operators are
+                                          In, NotIn, Exists and DoesNotExist.
+                                        type: string
+                                      values:
+                                        description: values is an array of string
+                                          values. If the operator is In or NotIn,
+                                          the values array must be non-empty. If the
+                                          operator is Exists or DoesNotExist, the
+                                          values array must be empty. This array is
+                                          replaced during a strategic merge patch.
+                                        items:
+                                          type: string
+                                        type: array
+                                    required:
+                                    - key
+                                    - operator
+                                    type: object
+                                  type: array
+                                matchLabels:
+                                  additionalProperties:
+                                    type: string
+                                  description: matchLabels is a map of {key,value}
+                                    pairs. A single {key,value} in the matchLabels
+                                    map is equivalent to an element of matchExpressions,
+                                    whose key field is "key", the operator is "In",
+                                    and the values array contains only "value". The
+                                    requirements are ANDed.
+                                  type: object
+                              type: object
                             namespaces:
-                              description: namespaces specifies which namespaces the
-                                labelSelector applies to (matches against); null or
-                                empty list means "this pod's namespace"
+                              description: namespaces specifies a static list of namespace
+                                names that the term applies to. The term is applied
+                                to the union of the namespaces listed in this field
+                                and the ones selected by namespaceSelector. null or
+                                empty namespaces list and null namespaceSelector means
+                                "this pod's namespace".
                               items:
                                 type: string
                               type: array
@@ -1649,10 +2093,23 @@ spec:
                         type: array
                     type: object
                 type: object
+              annotations:
+                additionalProperties:
+                  additionalProperties:
+                    type: string
+                  description: Annotations are annotation for a given daemon
+                  type: object
+                description: The annotations-related configuration to add/set on each
+                  Pod related object.
+                nullable: true
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
               cleanupPolicy:
                 description: CleanupPolicy (optional) Indicates user's policy for
                   deletion
                 properties:
+                  allowNoobaaDeletion:
+                    type: boolean
                   confirmation:
                     description: CleanupConfirmationProperty is a string that specifies
                       cleanup confirmation
@@ -1670,7 +2127,7 @@ spec:
                       pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                       x-kubernetes-int-or-string: true
                     description: 'Limits describes the maximum amount of compute resources
-                      allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/'
+                      allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                     type: object
                   requests:
                     additionalProperties:
@@ -1682,9 +2139,13 @@ spec:
                     description: 'Requests describes the minimum amount of compute
                       resources required. If Requests is omitted for a container,
                       it defaults to Limits if that is explicitly specified, otherwise
-                      to an implementation-defined value. More info: https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/'
+                      to an implementation-defined value. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                     type: object
                 type: object
+              dbConf:
+                description: DBConf (optional) overrides the default postgresql db
+                  config
+                type: string
               dbImage:
                 description: DBImage (optional) overrides the default image for the
                   db container
@@ -1701,7 +2162,7 @@ spec:
                       pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                       x-kubernetes-int-or-string: true
                     description: 'Limits describes the maximum amount of compute resources
-                      allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/'
+                      allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                     type: object
                   requests:
                     additionalProperties:
@@ -1713,7 +2174,7 @@ spec:
                     description: 'Requests describes the minimum amount of compute
                       resources required. If Requests is omitted for a container,
                       it defaults to Limits if that is explicitly specified, otherwise
-                      to an implementation-defined value. More info: https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/'
+                      to an implementation-defined value. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                     type: object
                 type: object
               dbStorageClass:
@@ -1746,7 +2207,7 @@ spec:
                       pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                       x-kubernetes-int-or-string: true
                     description: 'Limits describes the maximum amount of compute resources
-                      allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/'
+                      allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                     type: object
                   requests:
                     additionalProperties:
@@ -1758,12 +2219,231 @@ spec:
                     description: 'Requests describes the minimum amount of compute
                       resources required. If Requests is omitted for a container,
                       it defaults to Limits if that is explicitly specified, otherwise
-                      to an implementation-defined value. More info: https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/'
+                      to an implementation-defined value. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                     type: object
                 type: object
               debugLevel:
                 description: DebugLevel (optional) sets the debug level
+                enum:
+                - all
+                - nsfs
+                - warn
+                - default_level
                 type: integer
+              defaultBackingStoreSpec:
+                description: BackingStoreSpec defines the desired state of BackingStore
+                properties:
+                  awsS3:
+                    description: AWSS3Spec specifies a backing store of type aws-s3
+                    properties:
+                      awsSTSRoleARN:
+                        type: string
+                      region:
+                        description: Region is the AWS region
+                        type: string
+                      secret:
+                        description: Secret refers to a secret that provides the credentials
+                          The secret should define AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+                        properties:
+                          name:
+                            description: name is unique within a namespace to reference
+                              a secret resource.
+                            type: string
+                          namespace:
+                            description: namespace defines the space within which
+                              the secret name must be unique.
+                            type: string
+                        type: object
+                      sslDisabled:
+                        description: SSLDisabled allows to disable SSL and use plain
+                          http
+                        type: boolean
+                      targetBucket:
+                        description: TargetBucket is the name of the target S3 bucket
+                        type: string
+                    required:
+                    - targetBucket
+                    type: object
+                  azureBlob:
+                    description: AzureBlob specifies a backing store of type azure-blob
+                    properties:
+                      secret:
+                        description: Secret refers to a secret that provides the credentials
+                          The secret should define AccountName and AccountKey as provided
+                          by Azure Blob.
+                        properties:
+                          name:
+                            description: name is unique within a namespace to reference
+                              a secret resource.
+                            type: string
+                          namespace:
+                            description: namespace defines the space within which
+                              the secret name must be unique.
+                            type: string
+                        type: object
+                      targetBlobContainer:
+                        description: TargetBlobContainer is the name of the target
+                          Azure Blob container
+                        type: string
+                    required:
+                    - secret
+                    - targetBlobContainer
+                    type: object
+                  googleCloudStorage:
+                    description: GoogleCloudStorage specifies a backing store of type
+                      google-cloud-storage
+                    properties:
+                      secret:
+                        description: Secret refers to a secret that provides the credentials
+                          The secret should define GoogleServiceAccountPrivateKeyJson
+                          containing the entire json string as provided by Google.
+                        properties:
+                          name:
+                            description: name is unique within a namespace to reference
+                              a secret resource.
+                            type: string
+                          namespace:
+                            description: namespace defines the space within which
+                              the secret name must be unique.
+                            type: string
+                        type: object
+                      targetBucket:
+                        description: TargetBucket is the name of the target S3 bucket
+                        type: string
+                    required:
+                    - secret
+                    - targetBucket
+                    type: object
+                  ibmCos:
+                    description: IBMCos specifies a backing store of type ibm-cos
+                    properties:
+                      endpoint:
+                        description: 'Endpoint is the IBM COS compatible endpoint:
+                          http(s)://host:port'
+                        type: string
+                      secret:
+                        description: Secret refers to a secret that provides the credentials
+                          The secret should define IBM_COS_ACCESS_KEY_ID and IBM_COS_SECRET_ACCESS_KEY
+                        properties:
+                          name:
+                            description: name is unique within a namespace to reference
+                              a secret resource.
+                            type: string
+                          namespace:
+                            description: namespace defines the space within which
+                              the secret name must be unique.
+                            type: string
+                        type: object
+                      signatureVersion:
+                        description: SignatureVersion specifies the client signature
+                          version to use when signing requests.
+                        type: string
+                      targetBucket:
+                        description: TargetBucket is the name of the target IBM COS
+                          bucket
+                        type: string
+                    required:
+                    - endpoint
+                    - secret
+                    - targetBucket
+                    type: object
+                  pvPool:
+                    description: PVPool specifies a backing store of type pv-pool
+                    properties:
+                      numVolumes:
+                        description: NumVolumes is the number of volumes to allocate
+                        type: integer
+                      resources:
+                        description: VolumeResources represents the minimum resources
+                          each volume should have.
+                        properties:
+                          limits:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: 'Limits describes the maximum amount of compute
+                              resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                            type: object
+                          requests:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: 'Requests describes the minimum amount of
+                              compute resources required. If Requests is omitted for
+                              a container, it defaults to Limits if that is explicitly
+                              specified, otherwise to an implementation-defined value.
+                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                            type: object
+                        type: object
+                      secret:
+                        description: Secret refers to a secret that provides the agent
+                          configuration The secret should define AGENT_CONFIG containing
+                          agent_configuration from noobaa-core.
+                        properties:
+                          name:
+                            description: name is unique within a namespace to reference
+                              a secret resource.
+                            type: string
+                          namespace:
+                            description: namespace defines the space within which
+                              the secret name must be unique.
+                            type: string
+                        type: object
+                      storageClass:
+                        description: StorageClass is the name of the storage class
+                          to use for the PV's
+                        type: string
+                    required:
+                    - numVolumes
+                    type: object
+                  s3Compatible:
+                    description: S3Compatible specifies a backing store of type s3-compatible
+                    properties:
+                      endpoint:
+                        description: 'Endpoint is the S3 compatible endpoint: http(s)://host:port'
+                        type: string
+                      secret:
+                        description: Secret refers to a secret that provides the credentials
+                          The secret should define AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+                        properties:
+                          name:
+                            description: name is unique within a namespace to reference
+                              a secret resource.
+                            type: string
+                          namespace:
+                            description: namespace defines the space within which
+                              the secret name must be unique.
+                            type: string
+                        type: object
+                      signatureVersion:
+                        description: SignatureVersion specifies the client signature
+                          version to use when signing requests.
+                        type: string
+                      targetBucket:
+                        description: TargetBucket is the name of the target S3 bucket
+                        type: string
+                    required:
+                    - endpoint
+                    - secret
+                    - targetBucket
+                    type: object
+                  type:
+                    description: Type is an enum of supported types
+                    type: string
+                required:
+                - type
+                type: object
+              disableLoadBalancerService:
+                description: DisableLoadBalancerService (optional) sets the service
+                  type to ClusterIP instead of LoadBalancer
+                nullable: true
+                type: boolean
               endpoints:
                 description: Endpoints (optional) sets configuration info for the
                   noobaa endpoint deployment.
@@ -1798,7 +2478,7 @@ spec:
                           pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                           x-kubernetes-int-or-string: true
                         description: 'Limits describes the maximum amount of compute
-                          resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/'
+                          resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                         type: object
                       requests:
                         additionalProperties:
@@ -1810,7 +2490,7 @@ spec:
                         description: 'Requests describes the minimum amount of compute
                           resources required. If Requests is omitted for a container,
                           it defaults to Limits if that is explicitly specified, otherwise
-                          to an implementation-defined value. More info: https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/'
+                          to an implementation-defined value. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                         type: object
                     type: object
                 type: object
@@ -1832,13 +2512,43 @@ spec:
                   another cluster and point to a secret that holds the join information
                 properties:
                   name:
-                    description: Name is unique within a namespace to reference a
+                    description: name is unique within a namespace to reference a
                       secret resource.
                     type: string
                   namespace:
-                    description: Namespace defines the space within which the secret
+                    description: namespace defines the space within which the secret
                       name must be unique.
                     type: string
+                type: object
+              labels:
+                additionalProperties:
+                  additionalProperties:
+                    type: string
+                  description: Labels are label for a given daemon
+                  type: object
+                description: The labels-related configuration to add/set on each Pod
+                  related object.
+                nullable: true
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              loadBalancerSourceSubnets:
+                description: LoadBalancerSourceSubnets (optional) if given will allow
+                  access to the NooBaa services only from the listed subnets. This
+                  field will have no effect if DisableLoadBalancerService is set to
+                  true
+                properties:
+                  s3:
+                    description: S3 is a list of subnets that will be allowed to access
+                      the Noobaa S3 service
+                    items:
+                      type: string
+                    type: array
+                  sts:
+                    description: STS is a list of subnets that will be allowed to
+                      access the Noobaa STS service
+                    items:
+                      type: string
+                    type: array
                 type: object
               mongoDbURL:
                 description: MongoDbURL (optional) overrides the default mongo db
@@ -1925,11 +2635,11 @@ spec:
                           It has enough information to retrieve secret in any namespace
                         properties:
                           name:
-                            description: Name is unique within a namespace to reference
+                            description: name is unique within a namespace to reference
                               a secret resource.
                             type: string
                           namespace:
-                            description: Namespace defines the space within which
+                            description: namespace defines the space within which
                               the secret name must be unique.
                             type: string
                         type: object
@@ -2004,31 +2714,31 @@ spec:
               relatedObjects:
                 description: RelatedObjects is a list of objects related to this operator.
                 items:
-                  description: 'ObjectReference contains enough information to let
+                  description: "ObjectReference contains enough information to let
                     you inspect or modify the referred object. --- New uses of this
                     type are discouraged because of difficulty describing its usage
                     when embedded in APIs.  1. Ignored fields.  It includes many fields
                     which are not generally honored.  For instance, ResourceVersion
                     and FieldPath are both very rarely valid in actual usage.  2.
                     Invalid usage help.  It is impossible to add specific help for
-                    individual usage.  In most embedded usages, there are particular     restrictions
-                    like, "must refer only to types A and B" or "UID not honored"
-                    or "name must be restricted".     Those cannot be well described
-                    when embedded.  3. Inconsistent validation.  Because the usages
-                    are different, the validation rules are different by usage, which
-                    makes it hard for users to predict what will happen.  4. The fields
-                    are both imprecise and overly precise.  Kind is not a precise
-                    mapping to a URL. This can produce ambiguity     during interpretation
-                    and require a REST mapping.  In most cases, the dependency is
-                    on the group,resource tuple     and the version of the actual
-                    struct is irrelevant.  5. We cannot easily change it.  Because
-                    this type is embedded in many locations, updates to this type     will
-                    affect numerous schemas.  Don''t make new APIs embed an underspecified
-                    API type they do not control. Instead of using this type, create
-                    a locally provided and used type that is well-focused on your
-                    reference. For example, ServiceReferences for admission registration:
-                    https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533
-                    .'
+                    individual usage.  In most embedded usages, there are particular
+                    \    restrictions like, \"must refer only to types A and B\" or
+                    \"UID not honored\" or \"name must be restricted\".     Those
+                    cannot be well described when embedded.  3. Inconsistent validation.
+                    \ Because the usages are different, the validation rules are different
+                    by usage, which makes it hard for users to predict what will happen.
+                    \ 4. The fields are both imprecise and overly precise.  Kind is
+                    not a precise mapping to a URL. This can produce ambiguity     during
+                    interpretation and require a REST mapping.  In most cases, the
+                    dependency is on the group,resource tuple     and the version
+                    of the actual struct is irrelevant.  5. We cannot easily change
+                    it.  Because this type is embedded in many locations, updates
+                    to this type     will affect numerous schemas.  Don't make new
+                    APIs embed an underspecified API type they do not control. \n
+                    Instead of using this type, create a locally provided and used
+                    type that is well-focused on your reference. For example, ServiceReferences
+                    for admission registration: https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533
+                    ."
                   properties:
                     apiVersion:
                       description: API version of the referent.
@@ -2173,6 +2883,59 @@ spec:
                           type: string
                         type: array
                     type: object
+                  serviceSts:
+                    description: ServiceStatus is the status info and network addresses
+                      of a service
+                    properties:
+                      externalDNS:
+                        description: ExternalDNS are external public addresses for
+                          the service
+                        items:
+                          type: string
+                        type: array
+                      externalIP:
+                        description: ExternalIP are external public addresses for
+                          the service LoadBalancerPorts such as AWS ELB provide public
+                          address and load balancing for the service IngressPorts
+                          are manually created public addresses for the service https://kubernetes.io/docs/concepts/services-networking/service/#external-ips
+                          https://kubernetes.io/docs/concepts/services-networking/service/#loadbalancer
+                          https://kubernetes.io/docs/concepts/services-networking/ingress/
+                        items:
+                          type: string
+                        type: array
+                      internalDNS:
+                        description: InternalDNS are internal addresses of the service
+                          inside the cluster
+                        items:
+                          type: string
+                        type: array
+                      internalIP:
+                        description: InternalIP are internal addresses of the service
+                          inside the cluster https://kubernetes.io/docs/concepts/services-networking/service/#publishing-services-service-types
+                        items:
+                          type: string
+                        type: array
+                      nodePorts:
+                        description: NodePorts are the most basic network available.
+                          NodePorts use the networks available on the hosts of kubernetes
+                          nodes. This generally works from within a pod, and from
+                          the internal network of the nodes, but may fail from public
+                          network. https://kubernetes.io/docs/concepts/services-networking/service/#nodeport
+                        items:
+                          type: string
+                        type: array
+                      podPorts:
+                        description: 'PodPorts are the second most basic network address.
+                          Every pod has an IP in the cluster and the pods network
+                          is a mesh so the operator running inside a pod in the cluster
+                          can use this address. Note: pod IPs are not guaranteed to
+                          persist over restarts, so should be rediscovered. Note2:
+                          when running the operator outside of the cluster, pod IP
+                          is not accessible.'
+                        items:
+                          type: string
+                        type: array
+                    type: object
                 required:
                 - serviceMgmt
                 - serviceS3
@@ -2222,6 +2985,71 @@ kind: NooBaa
 metadata:
   name: noobaa
 spec: {}
+`
+
+const Sha256_deploy_crds_noobaa_io_v1alpha1_noobaaaccount_cr_yaml = "69085515e8d16eaa9f320a32f2881cbd93d232bfbb072eef8692896a86f7b6dd"
+
+const File_deploy_crds_noobaa_io_v1alpha1_noobaaaccount_cr_yaml = `apiVersion: noobaa.io/v1alpha1
+kind: NooBaaAccount
+metadata:
+  name: default
+spec: {}
+`
+
+const Sha256_deploy_internal_admission_webhook_yaml = "6ac4c09a3923e2545fe484dbf68171d718669cf03e874889f44e005ed5f8529c"
+
+const File_deploy_internal_admission_webhook_yaml = `apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: admission-validation-webhook
+webhooks:
+  - name: admissionwebhook.noobaa.io
+    matchPolicy: Equivalent
+    rules:
+    - apiGroups:   ["noobaa.io"]
+      apiVersions: ["v1alpha1"]
+      operations:  
+      - "CREATE" 
+      - "UPDATE"
+      - "DELETE"
+      resources:   
+      - "backingstores"
+      - "namespacestores"
+      scope: "Namespaced"
+    - apiGroups:   ["noobaa.io"]
+      apiVersions: ["v1alpha1"]
+      operations:  
+      - "CREATE" 
+      resources:   
+      - "bucketclasses"
+      scope: "Namespaced"
+    - apiGroups:   ["noobaa.io"]
+      apiVersions: ["v1alpha1"]
+      operations:  
+      - "CREATE" 
+      - "UPDATE"
+      resources:   
+      - "noobaaaccounts"
+      scope: "Namespaced"
+    - apiGroups:   ["noobaa.io"]
+      apiVersions: ["v1alpha1"]
+      operations:  
+      - "DELETE"
+      - "CREATE"
+      - "UPDATE"
+      resources:   
+      - "noobaas"
+      scope: "Namespaced"
+    sideEffects: None
+    clientConfig:
+      service:
+        name: admission-webhook-service
+        namespace: placeholder
+        path: "/validate"
+      caBundle:
+    admissionReviewVersions: ["v1", "v1beta1"]
+    failurePolicy: Ignore
+    timeoutSeconds: 5
 `
 
 const Sha256_deploy_internal_ceph_objectstore_user_yaml = "655f33a1e3053847a298294d67d7db647d26fd11d1df7e229af718a8308bbd8e"
@@ -2305,6 +3133,17 @@ spec:
     skipServiceCheck: true
 `
 
+const Sha256_deploy_internal_configmap_ca_inject_yaml = "75f8ab503a683bcebd2ed6a2c9f8da0a4c174a62b4e6ca7e97ebc3da847ca866"
+
+const File_deploy_internal_configmap_ca_inject_yaml = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    config.openshift.io/inject-trusted-cabundle: "true"
+  name: noobaa-ca-inject
+data: {}
+`
+
 const Sha256_deploy_internal_configmap_empty_yaml = "6405c531c6522ecd54808f5cb531c1001b9ad01a73917427c523a92be44f348f"
 
 const File_deploy_internal_configmap_empty_yaml = `apiVersion: v1
@@ -2315,7 +3154,7 @@ metadata:
 data: {}
 `
 
-const Sha256_deploy_internal_configmap_postgres_db_yaml = "d1e0721ff0214b5ed8af9c9f189d70173f934bfcf4710d2826c61f05cad9b152"
+const Sha256_deploy_internal_configmap_postgres_db_yaml = "afe8a865abf2b033229df9dcea392abc1cb27df965d5ff0181f6d931504dce4e"
 
 const File_deploy_internal_configmap_postgres_db_yaml = `apiVersion: v1
 kind: ConfigMap
@@ -2328,9 +3167,67 @@ data:
     # disable huge_pages trial
     # see https://bugzilla.redhat.com/show_bug.cgi?id=1946792
     huge_pages = off
+
+    # postgres tuning
+    max_connections = 600
+    shared_buffers = 1GB
+    effective_cache_size = 3GB
+    maintenance_work_mem = 256MB
+    checkpoint_completion_target = 0.9
+    wal_buffers = 16MB
+    default_statistics_target = 100
+    random_page_cost = 1.1
+    effective_io_concurrency = 300
+    work_mem = 1747kB
+    min_wal_size = 2GB
+    max_wal_size = 8GB
+    shared_preload_libraries = 'pg_stat_statements'
 `
 
-const Sha256_deploy_internal_deployment_endpoint_yaml = "6769a038678b5d5d41a3a731e1cfd63acf113c45aef2855f790cbe6e2fc91b9a"
+const Sha256_deploy_internal_configmap_postgres_initdb_yaml = "016881f9a5e0561dbf10e7034dead0ee636556c162439d4d54c974a65253357c"
+
+const File_deploy_internal_configmap_postgres_initdb_yaml = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: noobaa-postgres-initdb-sh
+  labels:
+    app: noobaa
+data:
+  initdb.sh: |
+          # If the config file is present, the DB is initiazed
+          # and we're out of here
+          export PGDATA=$HOME/data/userdata
+          if [ -f $PGDATA/postgresql.conf ]; then
+            echo postgresql.conf file is found
+            exit 0
+          fi
+
+          # Wrap the postgres binary, force huge_pages=off for initdb
+          # see https://bugzilla.redhat.com/show_bug.cgi?id=1946792
+          p=/opt/rh/rh-postgresql12/root/usr/bin/postgres
+
+          # Latest RH images moved the postgres binary
+          # from /opt/rh/rh-postgresql12/root/usr/bin/postgres to /usr/bin/postgres
+          # see https://bugzilla.redhat.com/show_bug.cgi?id=2051249
+          if [ ! -x $p ]; then
+            p=/usr/bin/postgres
+          fi
+
+          mv $p $p.orig
+          echo exec $p.orig \"\$@\" -c huge_pages=off > $p
+          chmod 755 $p
+
+          # The NooBaa DB runs with UID 10001 GID 0
+          sed -i -e 's/^\(postgres:[^:]\):[0-9]*:[0-9]*:/\1:10001:0:/' /etc/passwd
+
+          # Init the DB and exit once the DB is ready to run
+          sed -i -e 's/^exec.*$/exit 0/' \
+                 -e 's/^pg_ctl\sstart.*/pg_ctl start || true/'                                   \
+                    /usr/bin/run-postgresql
+          su postgres -c "bash -x /usr/bin/run-postgresql"
+`
+
+const Sha256_deploy_internal_deployment_endpoint_yaml = "e2f7a049793e8f36151d349aefdc40c5a17d4de950bbcfd022ee2a4c07b9a067"
 
 const File_deploy_internal_deployment_endpoint_yaml = `apiVersion: apps/v1
 kind: Deployment
@@ -2353,6 +3250,8 @@ spec:
       labels:
         noobaa-s3: noobaa
         app: noobaa
+      annotations:
+        noobaa.io/configmap-hash: ""
     spec:
       serviceAccountName: noobaa-endpoint
       volumes:
@@ -2364,6 +3263,13 @@ spec:
           secret:
             secretName: noobaa-s3-serving-cert
             optional: true
+        - name: oidc-token
+          projected:
+            sources:
+            - serviceAccountToken:
+                path: oidc-token
+                expirationSeconds: 3600
+                audience: api
       containers:
         - name: endpoint
           image: NOOBAA_CORE_IMAGE
@@ -2372,18 +3278,32 @@ spec:
             - init_endpoint
           resources:
             requests:
-              cpu: "1"
+              cpu: "999m"
               memory: "2Gi"
             limits:
-              cpu: "1"
+              cpu: "999m"
               memory: "2Gi"
           securityContext:
+            fsGroupChangePolicy: "OnRootMismatch"
+            seLinuxOptions:
+              type: "spc_t"
             capabilities:
               add: ["SETUID", "SETGID"]
           ports:
             - containerPort: 6001
             - containerPort: 6443
+            - containerPort: 7443
           env:
+            - name: NOOBAA_DISABLE_COMPRESSION
+              valueFrom:
+                configMapKeyRef:
+                  name: noobaa-config
+                  key: NOOBAA_DISABLE_COMPRESSION
+            - name: NOOBAA_LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: noobaa-config
+                  key: NOOBAA_LOG_LEVEL
             - name: MGMT_ADDR
             - name: BG_ADDR
             - name: MD_ADDR
@@ -2402,10 +3322,7 @@ spec:
             - name: LOCAL_N2N_AGENT
             - name: JWT_SECRET
             - name: NOOBAA_ROOT_SECRET
-            - name: NOOBAA_LOG_LEVEL
-              value: "0"
-            - name: NOOBAA_DISABLE_COMPRESSION
-              value: "false"
+            - name: NODE_EXTRA_CA_CERTS
             - name: NOOBAA_AUTH_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -2435,6 +3352,10 @@ spec:
               readOnly: true
             - name: s3-secret
               mountPath: /etc/s3-secret
+              readOnly: true
+            # used for aws sts endpoint type
+            - name: oidc-token
+              mountPath: /var/run/secrets/openshift/serviceaccount
               readOnly: true
           readinessProbe: # must be configured to support rolling updates
             tcpSocket:
@@ -2535,7 +3456,7 @@ spec:
         claimName: noobaa-pv-claim
 `
 
-const Sha256_deploy_internal_prometheus_rules_yaml = "a52b7e8fd6aab6754cf72a74a741148bfc60a1fc566ade36377caee1715b086a"
+const Sha256_deploy_internal_prometheus_rules_yaml = "cb2ad373486d32ee49226251ebe7f07ff0f189c4efe9cfaa6e2d8b23f606a6d6"
 
 const File_deploy_internal_prometheus_rules_yaml = `apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
@@ -2570,6 +3491,61 @@ spec:
     - expr: |
         NooBaa_total_usage
       record: noobaa_total_usage
+  - name: noobaa-odf.rules
+    rules:
+    - expr: |
+        NooBaa_odf_health_status
+      labels:
+        system_type: OCS
+        system_vendor: Red Hat
+      record: odf_system_health_status
+    - expr: |
+        NooBaa_total_usage
+      labels:
+        system_type: OCS
+        system_vendor: Red Hat
+      record: odf_system_raw_capacity_used_bytes
+    - expr: |
+        sum by (namespace, managedBy, job, service) (rate(NooBaa_providers_ops_read_num[5m]) + rate(NooBaa_providers_ops_write_num[5m]))
+      labels:
+        system_type: OCS
+        system_vendor: Red Hat
+      record: odf_system_iops_total_bytes
+    - expr: |
+        sum by (namespace, managedBy, job, service) (rate(NooBaa_providers_bandwidth_read_size[5m]) + rate(NooBaa_providers_bandwidth_write_size[5m]))
+      labels:
+        system_type: OCS
+        system_vendor: Red Hat
+      record: odf_system_throughput_total_bytes
+    - expr: |
+        sum(NooBaa_num_buckets + NooBaa_num_buckets_claims)
+      record: odf_system_bucket_count
+      labels:
+        system_type: OCS
+        system_vendor: Red Hat
+    - expr: |
+        sum(NooBaa_num_objects + NooBaa_num_objects_buckets_claims)
+      record: odf_system_objects_total
+      labels:
+        system_type: OCS
+        system_vendor: Red Hat
+  - name: noobaa-replication.rules
+    rules:
+    - expr: |
+        sum_over_time(sum by (replication_id) (NooBaa_replication_last_cycle_writes_size)[1y:6m])
+      record: noobaa_replication_total_writes_size
+    - expr: |
+        sum_over_time(sum by (replication_id) (NooBaa_replication_last_cycle_writes_num)[1y:6m])
+      record: noobaa_replication_total_writes_num
+    - expr: |
+        sum_over_time(sum by (replication_id) (NooBaa_replication_last_cycle_error_writes_size)[1y:6m])
+      record: noobaa_replication_total_error_writes_size
+    - expr: |
+        sum_over_time(sum by (replication_id) (NooBaa_replication_last_cycle_error_writes_num)[1y:6m])
+      record: noobaa_replication_total_error_writes_num
+    - expr: |
+        count_over_time(count by (replication_id) (NooBaa_replication_last_cycle_writes_size)[1y:6m])
+      record: noobaa_replication_total_cycles
   - name: bucket-state-alert.rules
     rules:
     - alert: NooBaaBucketErrorState
@@ -2746,7 +3722,7 @@ spec:
   wildcardPolicy: None
 `
 
-const Sha256_deploy_internal_route_s3_yaml = "e5d832cf3912c648ab4b799ded80a70eaec9fc13d6181726d934af99f71a6686"
+const Sha256_deploy_internal_route_s3_yaml = "16050267fd5cb0a34ff7b4d849a601d2583da1a11394a94f38c4f066c1613f34"
 
 const File_deploy_internal_route_s3_yaml = `apiVersion: route.openshift.io/v1
 kind: Route
@@ -2758,10 +3734,31 @@ spec:
   port:
     targetPort: s3-https
   tls:
+    insecureEdgeTerminationPolicy: Allow
     termination: reencrypt
   to:
     kind: Service
     name: s3
+    weight: 100
+  wildcardPolicy: None
+`
+
+const Sha256_deploy_internal_route_sts_yaml = "a593179d9e3864dbc953e61cae744cd747ddd41aeb524248597f8f932680854e"
+
+const File_deploy_internal_route_sts_yaml = `apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  labels:
+    app: noobaa
+  name: sts
+spec:
+  port:
+    targetPort: sts-https
+  tls:
+    termination: reencrypt
+  to:
+    kind: Service
+    name: sts
     weight: 100
   wildcardPolicy: None
 `
@@ -2798,7 +3795,7 @@ spec:
       name: mongodb
 `
 
-const Sha256_deploy_internal_service_mgmt_yaml = "89c34cdc0078bec5fdd4146775838248fccfb30032ffe8279e62b460a3856204"
+const Sha256_deploy_internal_service_mgmt_yaml = "fa5f052fb360e6893fc446a318413a6f494a8610706ae7e36ff985b3b3a5c070"
 
 const File_deploy_internal_service_mgmt_yaml = `apiVersion: v1
 kind: Service
@@ -2814,7 +3811,7 @@ metadata:
     service.beta.openshift.io/serving-cert-secret-name: noobaa-mgmt-serving-cert
     service.alpha.openshift.io/serving-cert-secret-name: noobaa-mgmt-serving-cert
 spec:
-  type: LoadBalancer
+  type: ClusterIP
   selector:
     noobaa-mgmt: SYSNAME
   ports:
@@ -2860,6 +3857,40 @@ spec:
 
 `
 
+const Sha256_deploy_internal_service_sts_yaml = "51e73a53da81ceaad02fb6380658dee5375b824183aba1a27c83251ce62bccb6"
+
+const File_deploy_internal_service_sts_yaml = `apiVersion: v1
+kind: Service
+metadata:
+  name: sts
+  labels:
+    app: noobaa
+spec:
+  type: LoadBalancer
+  selector:
+    noobaa-s3: SYSNAME
+  ports:
+    - port: 443
+      targetPort: 7443
+      name: sts-https
+
+`
+
+const Sha256_deploy_internal_service_admission_webhook_yaml = "810a70b263d44621713864aa6e6e72e6079bbdc02f6e2b9143ba9ebf4ab52102"
+
+const File_deploy_internal_service_admission_webhook_yaml = `apiVersion: v1
+kind: Service
+metadata:
+  name: admission-webhook-service
+spec:
+  ports:
+  - name: webhook
+    port: 443
+    targetPort: 8080
+  selector:
+    noobaa-operator: deployment
+`
+
 const Sha256_deploy_internal_servicemonitor_mgmt_yaml = "172b25b71872e74fb32ecf32b9c68d41cc60d155cb469ed5ecf7ad282f3e597a"
 
 const File_deploy_internal_servicemonitor_mgmt_yaml = `apiVersion: monitoring.coreos.com/v1
@@ -2900,7 +3931,7 @@ spec:
       noobaa-s3-svc: "true"
 `
 
-const Sha256_deploy_internal_statefulset_core_yaml = "758e83226e32791df7c5199203122def00d5df31d46eab3f0daddbf62ab1a068"
+const Sha256_deploy_internal_statefulset_core_yaml = "3b0aec2d946e02a9d8b44b8f191c335be33a75c8c2d2dc2f04c64cf37ecbfa3f"
 
 const File_deploy_internal_statefulset_core_yaml = `apiVersion: apps/v1
 kind: StatefulSet
@@ -2922,6 +3953,8 @@ spec:
         app: noobaa
         noobaa-core: noobaa
         noobaa-mgmt: noobaa
+      annotations:
+        noobaa.io/configmap-hash: ""
     spec:
       serviceAccountName: noobaa
       volumes:
@@ -2935,6 +3968,13 @@ spec:
           secret:
             secretName: noobaa-s3-serving-cert
             optional: true
+        - name: oidc-token
+          projected:
+            sources:
+            - serviceAccountToken:
+                path: oidc-token
+                expirationSeconds: 3600
+                audience: api
       containers:
         #----------------#
         # CORE CONTAINER #
@@ -2950,12 +3990,15 @@ spec:
             - name: s3-secret
               mountPath: /etc/s3-secret
               readOnly: true
+            - mountPath: /var/run/secrets/openshift/serviceaccount
+              name: oidc-token
+              readOnly: true
           resources:
             requests:
-              cpu: "1"
+              cpu: "999m"
               memory: "4Gi"
             limits:
-              cpu: "1"
+              cpu: "999m"
               memory: "4Gi"
           ports:
             - containerPort: 8080
@@ -2965,6 +4008,21 @@ spec:
             - containerPort: 8446
             - containerPort: 60100
           env:
+            - name: NOOBAA_DISABLE_COMPRESSION
+              valueFrom:
+                configMapKeyRef:
+                  name: noobaa-config
+                  key: NOOBAA_DISABLE_COMPRESSION
+            - name: DISABLE_DEV_RANDOM_SEED
+              valueFrom:
+                configMapKeyRef:
+                  name: noobaa-config
+                  key: DISABLE_DEV_RANDOM_SEED
+            - name: NOOBAA_LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: noobaa-config
+                  key: NOOBAA_LOG_LEVEL
             - name: MONGODB_URL
               value: "mongodb://noobaa-db-0.noobaa-db/nbcore"
             - name: POSTGRES_HOST
@@ -2977,10 +4035,6 @@ spec:
               value: mongodb
             - name: CONTAINER_PLATFORM
               value: KUBERNETES
-            - name: NOOBAA_LOG_LEVEL
-              value: "0"
-            - name: NOOBAA_DISABLE_COMPRESSION
-              value: "false"
             - name: JWT_SECRET
               valueFrom:
                 secretKeyRef:
@@ -2992,10 +4046,9 @@ spec:
                   name: noobaa-server
                   key: server_secret
             - name: NOOBAA_ROOT_SECRET
+            - name: NODE_EXTRA_CA_CERTS
             - name: AGENT_PROFILE
               value: VALUE_AGENT_PROFILE
-            - name: DISABLE_DEV_RANDOM_SEED
-              value: "true"
             - name: OAUTH_AUTHORIZATION_ENDPOINT
               value: ""
             - name: OAUTH_TOKEN_ENDPOINT
@@ -3004,8 +4057,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.serviceAccountName
-            - name: container_dbg
-              value: "" # any non-empty value will set the container to dbg mode
             - name: CONTAINER_CPU_REQUEST
               valueFrom:
                 resourceFieldRef:
@@ -3024,7 +4075,7 @@ spec:
                   resource: limits.memory
 `
 
-const Sha256_deploy_internal_statefulset_db_yaml = "40ccae24471e291d5cec7941ffc93e16c9c30e45bccb67e0beb009ad154b0cb0"
+const Sha256_deploy_internal_statefulset_db_yaml = "b6039d7ba3604deb54fdf6c48a7df758e1768e1af294ea21d0988cf30103c1c4"
 
 const File_deploy_internal_statefulset_db_yaml = `apiVersion: apps/v1
 kind: StatefulSet
@@ -3046,7 +4097,7 @@ spec:
         app: noobaa
         noobaa-db: noobaa
     spec:
-      serviceAccountName: noobaa
+      serviceAccountName: noobaa-db
       terminationGracePeriodSeconds: 60
       initContainers:
       #----------------#
@@ -3103,7 +4154,7 @@ spec:
           storage: 50Gi
 `
 
-const Sha256_deploy_internal_statefulset_postgres_db_yaml = "eedfd246f622f56f1b99e9ce7d0e6d30cbe3e1fc64f83e5a2349e76ce6a6d015"
+const Sha256_deploy_internal_statefulset_postgres_db_yaml = "98abe98cd3089424ef5a7dcebd973b1c307f879d434872029b58c0be392b2756"
 
 const File_deploy_internal_statefulset_postgres_db_yaml = `apiVersion: apps/v1
 kind: StatefulSet
@@ -3125,11 +4176,11 @@ spec:
         app: noobaa
         noobaa-db: postgres
     spec:
-      serviceAccountName: noobaa
+      serviceAccountName: noobaa-db
       initContainers:
-      #----------------#
-      # INIT CONTAINER #
-      #----------------#
+      #-----------------#
+      # INIT CONTAINERS #
+      #-----------------#
       - name: init
         image: NOOBAA_CORE_IMAGE
         command:
@@ -3145,6 +4196,42 @@ spec:
         volumeMounts:
         - name: db
           mountPath: /var/lib/pgsql
+      - name: initialize-database
+        image: NOOBAA_DB_IMAGE
+        env:
+          - name: POSTGRESQL_DATABASE
+            value: nbcore
+          - name: LC_COLLATE
+            value: C
+          - name: POSTGRESQL_USER
+            valueFrom:
+              secretKeyRef:
+                key: user
+                name: noobaa-db
+          - name: POSTGRESQL_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                key: password
+                name: noobaa-db
+        command:
+        - sh
+        - -x
+        - /init/initdb.sh
+        securityContext:
+          runAsUser: 0
+          runAsGroup: 0
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "500Mi"
+          limits:
+            cpu: "500m"
+            memory: "500Mi"
+        volumeMounts:
+        - name: db
+          mountPath: /var/lib/pgsql
+        - name: noobaa-postgres-initdb-sh-volume
+          mountPath: /init
       containers:
       #--------------------#
       # Postgres CONTAINER #
@@ -3154,27 +4241,42 @@ spec:
         env:
           - name: POSTGRESQL_DATABASE
             value: nbcore
+          - name: LC_COLLATE
+            value: C
           - name: POSTGRESQL_USER
+            valueFrom:
+              secretKeyRef:
+                key: user
+                name: noobaa-db
           - name: POSTGRESQL_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                key: password
+                name: noobaa-db
         imagePullPolicy: "IfNotPresent"
         ports:
           - containerPort: 5432
         resources:
           requests:
-            cpu: "2"
+            cpu: "500m"
             memory: "4Gi"
           limits:
-            cpu: "2"
+            cpu: "500m"
             memory: "4Gi"
         volumeMounts:
           - name: db
             mountPath: /var/lib/pgsql
           - name: noobaa-postgres-config-volume
             mountPath: /opt/app-root/src/postgresql-cfg
+          - name: noobaa-postgres-initdb-sh-volume
+            mountPath: /init
       volumes:
       - name: noobaa-postgres-config-volume
         configMap:
           name: noobaa-postgres-config
+      - name: noobaa-postgres-initdb-sh-volume
+        configMap:
+          name: noobaa-postgres-initdb-sh
       securityContext: 
         runAsUser: 10001
         runAsGroup: 0
@@ -3210,7 +4312,7 @@ const File_deploy_internal_text_system_status_readme_progress_tmpl = `
 	NooBaa Operator Version: {{.OperatorVersion}}
 `
 
-const Sha256_deploy_internal_text_system_status_readme_ready_tmpl = "ed4077141304bbf69b08401f314b70c381523c60a7e18211576ba5275a286c30"
+const Sha256_deploy_internal_text_system_status_readme_ready_tmpl = "224e606bf5eee299b2b2070a193a6579f9cb685e78e47d7b92fe9714c9eee63f"
 
 const File_deploy_internal_text_system_status_readme_ready_tmpl = `
 
@@ -3221,18 +4323,7 @@ const File_deploy_internal_text_system_status_readme_ready_tmpl = `
 
 	Lets get started:
 
-	1. Connect to Management console:
-
-		Read your mgmt console login information (email & password) from secret: "{{.SecretAdmin.Name}}".
-
-			kubectl get secret {{.SecretAdmin.Name}} -n {{.SecretAdmin.Namespace}} -o json | jq '.data|map_values(@base64d)'
-
-		Open the management console service - take External IP/DNS or Node Port or use port forwarding:
-
-			kubectl port-forward -n {{.ServiceMgmt.Namespace}} service/{{.ServiceMgmt.Name}} 11443:443 &
-			open https://localhost:11443
-
-	2. Test S3 client:
+	Test S3 client:
 
 		kubectl port-forward -n {{.ServiceS3.Namespace}} service/{{.ServiceS3.Name}} 10443:443 &
 		NOOBAA_ACCESS_KEY=$(kubectl get secret {{.SecretAdmin.Name}} -n {{.SecretAdmin.Namespace}} -o json | jq -r '.data.AWS_ACCESS_KEY_ID|@base64d')
@@ -3840,7 +4931,7 @@ s3 ls s3://first.bucket
 ` + "`" + `` + "`" + `` + "`" + `
 `
 
-const Sha256_deploy_olm_noobaa_operator_clusterserviceversion_yaml = "b9bb7c35dacebb254fddffe38f7d2f79021605207ebe9fa7ac621fd780abc577"
+const Sha256_deploy_olm_noobaa_operator_clusterserviceversion_yaml = "900ed615837a7f63510de5bff4bd8ffdcc02bea8cec0cf231d21e32812f78ed7"
 
 const File_deploy_olm_noobaa_operator_clusterserviceversion_yaml = `apiVersion: operators.coreos.com/v1alpha1
 kind: ClusterServiceVersion
@@ -3855,6 +4946,7 @@ metadata:
     description: NooBaa is an object data service for hybrid and multi cloud environments.
     support: Red Hat
     alm-examples: placeholder
+    operators.openshift.io/infrastructure-features: '["disconnected"]'
   name: placeholder
   namespace: placeholder
 spec:
@@ -3958,7 +5050,7 @@ spec:
   sourceNamespace: default
 `
 
-const Sha256_deploy_operator_yaml = "3030f31026433e2737957a3f153739ce3d1a69cf11813d27b4fd95e7452ee3df"
+const Sha256_deploy_operator_yaml = "2870838f688bf1691d85c64dc5e302eb6575996427c7cfdb7143f322ff0dbd18"
 
 const File_deploy_operator_yaml = `apiVersion: apps/v1
 kind: Deployment
@@ -3976,9 +5068,20 @@ spec:
         noobaa-operator: deployment
     spec:
       serviceAccountName: noobaa
+      volumes:
+      - name: oidc-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              path: oidc-token
+              expirationSeconds: 3600
+              audience: api
       containers:
         - name: noobaa-operator
           image: NOOBAA_OPERATOR_IMAGE
+          volumeMounts:
+          - mountPath: /var/run/secrets/openshift/serviceaccount
+            name: oidc-token
           resources:
             limits:
               cpu: "250m"
@@ -3996,7 +5099,7 @@ spec:
                   fieldPath: metadata.namespace
 `
 
-const Sha256_deploy_role_yaml = "eb0941a5e095fa7ac391e05782e6847e419e4d0dc17f6d8151df0032c977c743"
+const Sha256_deploy_role_yaml = "99798a1daa31e0f0546dbea3ba11411f0298051c64c401c9f168120ef2a9ef46"
 
 const File_deploy_role_yaml = `apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -4007,12 +5110,6 @@ rules:
   - noobaa.io
   resources:
   - '*'
-  - noobaas
-  - backingstores
-  - bucketclasses
-  - noobaas/finalizers
-  - backingstores/finalizers
-  - bucketclasses/finalizers
   verbs:
   - '*'
 - apiGroups:
@@ -4132,13 +5229,11 @@ rules:
   - watch
   - delete
 - apiGroups:
-  - security.openshift.io 
-  resourceNames:
-  - noobaa 
+  - rbac.authorization.k8s.io
   resources:
-  - securitycontextconstraints 
+  - '*'
   verbs: 
-  - use
+  - '*'
 `
 
 const Sha256_deploy_role_binding_yaml = "59a2627156ed3db9cd1a4d9c47e8c1044279c65e84d79c525e51274329cb16ff"
@@ -4156,6 +5251,21 @@ roleRef:
   name: noobaa
 `
 
+const Sha256_deploy_role_binding_db_yaml = "3a4872fcde50e692ae52bbd208a8e1d115c574431c25a9644a7c820ae13c7748"
+
+const File_deploy_role_binding_db_yaml = `apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: noobaa-db
+subjects:
+  - kind: ServiceAccount
+    name: noobaa-db
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: noobaa-db
+`
+
 const Sha256_deploy_role_binding_endpoint_yaml = "ab85a33434b0a5fb685fb4983a9d97313e277a5ec8a2142e49c276d51b8ba0e9"
 
 const File_deploy_role_binding_endpoint_yaml = `apiVersion: rbac.authorization.k8s.io/v1
@@ -4169,6 +5279,23 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: noobaa-endpoint
+`
+
+const Sha256_deploy_role_db_yaml = "8a7b6895de2e9847ec4a9e6e298b63251253f446961eb97f4dee50ee156f6d12"
+
+const File_deploy_role_db_yaml = `apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: noobaa-db
+rules:
+- apiGroups:
+  - security.openshift.io
+  resourceNames:
+  - noobaa-db
+  resources:
+  - securitycontextconstraints
+  verbs:
+  - use
 `
 
 const Sha256_deploy_role_endpoint_yaml = "27ace6cdcae4d87add5ae79265c4eee9d247e5910fc8a74368139d31add6dac2"
@@ -4222,49 +5349,52 @@ rules:
   - use
 `
 
-const Sha256_deploy_scc_yaml = "cbb071961f7dd77e5bdca7e36b89e1e1982265c4e7dc95f00109d0acc64a3c06"
+const Sha256_deploy_role_ui_yaml = "49d210f2ec7facbd486e6ac96515c1d2886f26afe6f7155be3994b4f0b1d0311"
 
-const File_deploy_scc_yaml = `apiVersion: security.openshift.io/v1
+const File_deploy_role_ui_yaml = `apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: noobaa-odf-ui
+rules:
+  - verbs:
+      - get
+      - watch
+      - list
+    apiGroups:
+      - noobaa.io
+    resources:
+      - noobaas
+      - bucketclasses
+`
+
+const Sha256_deploy_scc_db_yaml = "49d970f874b9f458e286badddd46d772bbf8270b4d28a7c02002f1eef4d226be"
+
+const File_deploy_scc_db_yaml = `apiVersion: security.openshift.io/v1
 kind: SecurityContextConstraints
 metadata:
-  name: noobaa
+  name: noobaa-db
+allowPrivilegeEscalation: true
 allowHostDirVolumePlugin: false
 allowHostIPC: false
 allowHostNetwork: false
 allowHostPID: false
 allowHostPorts: false
-allowPrivilegeEscalation: true
 allowPrivilegedContainer: false
-allowedCapabilities: []
-defaultAddCapabilities: []
-fsGroup:
-  type: MustRunAs
-groups: []
-priority: null
 readOnlyRootFilesystem: false
-requiredDropCapabilities:
-- KILL
-- MKNOD
+allowedCapabilities:
 - SETUID
 - SETGID
+fsGroup:
+  type: MustRunAs
 runAsUser:
   type: RunAsAny
 seLinuxContext:
   type: MustRunAs
 supplementalGroups:
   type: RunAsAny
-users:
-- system:serviceaccount:openshift-storage:noobaa
-volumes:
-- configMap
-- downwardAPI
-- emptyDir
-- persistentVolumeClaim
-- projected
-- secret
 `
 
-const Sha256_deploy_scc_endpoint_yaml = "5b7d6160b89ee45394d9c972fdee8a1f7527fd6bc87de5c90958c4386cd877e5"
+const Sha256_deploy_scc_endpoint_yaml = "f097a29eb11230a7612ab5f86894da523a743093e21eb2217a39332c5a31b10c"
 
 const File_deploy_scc_endpoint_yaml = `apiVersion: security.openshift.io/v1
 kind: SecurityContextConstraints
@@ -4275,7 +5405,7 @@ allowHostIPC: false
 allowHostNetwork: false
 allowHostPID: false
 allowHostPorts: false
-allowPrivilegeEscalation: false
+allowPrivilegeEscalation: true
 allowPrivilegedContainer: false
 allowedCapabilities:
 - SETUID
@@ -4292,11 +5422,9 @@ requiredDropCapabilities:
 runAsUser:
   type: RunAsAny
 seLinuxContext:
-  type: MustRunAs
+  type: RunAsAny
 supplementalGroups:
   type: RunAsAny
-users:
-- system:serviceaccount:openshift-storage:noobaa-endpoint
 volumes:
 - configMap
 - downwardAPI
@@ -4316,11 +5444,27 @@ metadata:
     serviceaccounts.openshift.io/oauth-redirectreference.noobaa-mgmt: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"noobaa-mgmt"}}'
 `
 
+const Sha256_deploy_service_account_db_yaml = "fcbccd7518ee5a426b071a3acc85d22142e27c5628b61ce4292cc393d2ecac31"
+
+const File_deploy_service_account_db_yaml = `apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: noobaa-db
+`
+
 const Sha256_deploy_service_account_endpoint_yaml = "c2331e027114658e48a2bd1139b00cce06dfd834aa682eae923de54874a6baed"
 
 const File_deploy_service_account_endpoint_yaml = `apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: noobaa-endpoint
+`
+
+const Sha256_deploy_service_account_ui_yaml = "d6cb0e92fdb350148399e1ac42bfa640e254bdbb295c9a15dc9edfd4335e73f6"
+
+const File_deploy_service_account_ui_yaml = `apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: noobaa-odf-ui
 `
 

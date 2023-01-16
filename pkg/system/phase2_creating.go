@@ -3,20 +3,24 @@ package system
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"reflect"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/libopenstorage/secrets"
 	nbv1 "github.com/noobaa/noobaa-operator/v5/pkg/apis/noobaa/v1alpha1"
 	"github.com/noobaa/noobaa-operator/v5/pkg/bundle"
 	"github.com/noobaa/noobaa-operator/v5/pkg/options"
 	"github.com/noobaa/noobaa-operator/v5/pkg/util"
+	"github.com/noobaa/noobaa-operator/v5/pkg/util/kms"
+	secv1 "github.com/openshift/api/security/v1"
 	cloudcredsv1 "github.com/openshift/cloud-credential-operator/pkg/apis/cloudcredential/v1"
+	conditionsv1 "github.com/openshift/custom-resource-status/conditions/v1"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,6 +49,10 @@ func (r *Reconciler) ReconcilePhaseCreating() error {
 			r.NooBaaMongoDB.Name, r.NooBaaMongoDB.Spec.ServiceName)
 	}
 
+	if err := r.ReconcileCAInject(); err != nil {
+		return err
+	}
+
 	if err := r.ReconcileObject(r.ServiceAccount, r.SetDesiredServiceAccount); err != nil {
 		return err
 	}
@@ -55,6 +63,12 @@ func (r *Reconciler) ReconcilePhaseCreating() error {
 		return err
 	}
 	if err := r.ReconcileObjectOptional(r.RouteS3, nil); err != nil {
+		return err
+	}
+	if err := r.ReconcileObject(r.ServiceSts, r.SetDesiredServiceSts); err != nil {
+		return err
+	}
+	if err := r.ReconcileObjectOptional(r.RouteSts, nil); err != nil {
 		return err
 	}
 	// the credentials that are created by cloud-credentials-operator sometimes take time
@@ -73,6 +87,10 @@ func (r *Reconciler) ReconcilePhaseCreatingForMainClusters() error {
 	// Skip if joining another NooBaa
 	if r.JoinSecret != nil {
 		return nil
+	}
+
+	if err := r.ReconcileObject(r.CoreAppConfig, r.SetDesiredCoreAppConfig); err != nil {
+		return err
 	}
 
 	// A failure to discover OAuth endpoints should not fail the entire reconcile phase.
@@ -115,7 +133,7 @@ func (r *Reconciler) ReconcilePhaseCreatingForMainClusters() error {
 			// the mongo service with postgres values. see here:
 			// https://github.com/noobaa/noobaa-operator/blob/112c510650612b1a6b88582cf41c53b30068161c/pkg/system/phase2_creating.go#L121-L126
 			// to fix that, reconcile mongo service as well if it exists
-			if util.KubeCheck(r.ServiceDb) {
+			if util.KubeCheckQuiet(r.ServiceDb) {
 				r.Logger.Infof("found existing mongo db service [%q] will reconcile", r.ServiceDb.Name)
 				if err := r.ReconcileObject(r.ServiceDb, r.SetDesiredServiceDBForMongo); err != nil {
 					r.Logger.Errorf("got error when trying to reconcile mongo service. %v", err)
@@ -169,8 +187,30 @@ func (r *Reconciler) SetDesiredServiceMgmt() error {
 
 // SetDesiredServiceS3 updates the ServiceS3 as desired for reconciling
 func (r *Reconciler) SetDesiredServiceS3() error {
+	if r.NooBaa.Spec.DisableLoadBalancerService {
+		r.ServiceS3.Spec.Type = corev1.ServiceTypeClusterIP
+		r.ServiceS3.Spec.LoadBalancerSourceRanges = []string{}
+	} else {
+		// It is here in case disableLoadBalancerService is removed from the crd or changed to false
+		r.ServiceS3.Spec.Type = corev1.ServiceTypeLoadBalancer
+		r.ServiceS3.Spec.LoadBalancerSourceRanges = r.NooBaa.Spec.LoadBalancerSourceSubnets.S3
+	}
 	r.ServiceS3.Spec.Selector["noobaa-s3"] = r.Request.Name
 	r.ServiceS3.Labels["noobaa-s3-svc"] = "true"
+	return nil
+}
+
+// SetDesiredServiceSts updates the ServiceSts as desired for reconciling
+func (r *Reconciler) SetDesiredServiceSts() error {
+	if r.NooBaa.Spec.DisableLoadBalancerService {
+		r.ServiceSts.Spec.Type = corev1.ServiceTypeClusterIP
+		r.ServiceSts.Spec.LoadBalancerSourceRanges = []string{}
+	} else {
+		// It is here in case disableLoadBalancerService is removed from the crd or changed to false
+		r.ServiceSts.Spec.Type = corev1.ServiceTypeLoadBalancer
+		r.ServiceSts.Spec.LoadBalancerSourceRanges = r.NooBaa.Spec.LoadBalancerSourceSubnets.STS
+	}
+	r.ServiceSts.Spec.Selector["noobaa-s3"] = r.Request.Name
 	return nil
 }
 
@@ -199,12 +239,24 @@ func (r *Reconciler) SetDesiredNooBaaDB() error {
 
 	if r.NooBaa.Spec.DBType == "postgres" {
 		NooBaaDB = r.NooBaaPostgresDB
+		if dbLabels, ok := r.NooBaa.Spec.Labels["db"]; ok {
+			NooBaaDB.Spec.Template.Labels = dbLabels
+		}
+		if dbAnnotations, ok := r.NooBaa.Spec.Annotations["db"]; ok {
+			NooBaaDB.Spec.Template.Annotations = dbAnnotations
+		}
 		NooBaaDB.Spec.Template.Labels["noobaa-db"] = "postgres"
 		NooBaaDB.Spec.Selector.MatchLabels["noobaa-db"] = "postgres"
 		NooBaaDB.Spec.ServiceName = r.ServiceDbPg.Name
 		NooBaaDBTemplate = util.KubeObject(bundle.File_deploy_internal_statefulset_postgres_db_yaml).(*appsv1.StatefulSet)
 	} else {
 		NooBaaDB = r.NooBaaMongoDB
+		if dbLabels, ok := r.NooBaa.Spec.Labels["db"]; ok {
+			NooBaaDB.Spec.Template.Labels = dbLabels
+		}
+		if dbAnnotations, ok := r.NooBaa.Spec.Annotations["db"]; ok {
+			NooBaaDB.Spec.Template.Annotations = dbAnnotations
+		}
 		NooBaaDB.Spec.Template.Labels["noobaa-db"] = r.Request.Name
 		NooBaaDB.Spec.Selector.MatchLabels["noobaa-db"] = r.Request.Name
 		NooBaaDB.Spec.ServiceName = r.ServiceDb.Name
@@ -212,7 +264,7 @@ func (r *Reconciler) SetDesiredNooBaaDB() error {
 	}
 
 	podSpec := &NooBaaDB.Spec.Template.Spec
-	podSpec.ServiceAccountName = "noobaa"
+	podSpec.ServiceAccountName = "noobaa-db"
 	defaultUID := int64(10001)
 	defaulfGID := int64(0)
 	podSpec.SecurityContext.RunAsUser = &defaultUID
@@ -222,46 +274,17 @@ func (r *Reconciler) SetDesiredNooBaaDB() error {
 		if c.Name == "init" {
 			c.Image = r.NooBaa.Status.ActualImage
 		}
+		if c.Name == "initialize-database" {
+			c.Image = GetDesiredDBImage(r.NooBaa)
+		}
 	}
 	for i := range podSpec.Containers {
 		c := &podSpec.Containers[i]
 		if c.Name == "db" {
 
-			c.Image = options.DBImage
-			if os.Getenv("NOOBAA_DB_IMAGE") != "" {
-				c.Image = os.Getenv("NOOBAA_DB_IMAGE")
-			}
-			if r.NooBaa.Spec.DBImage != nil {
-				c.Image = *r.NooBaa.Spec.DBImage
-			}
-
+			c.Image = GetDesiredDBImage(r.NooBaa)
 			if r.NooBaa.Spec.DBResources != nil {
 				c.Resources = *r.NooBaa.Spec.DBResources
-			}
-			if r.NooBaa.Spec.DBType == "postgres" {
-				for j := range c.Env {
-					switch c.Env[j].Name {
-					case "POSTGRESQL_USER":
-						c.Env[j].ValueFrom = &corev1.EnvVarSource{
-							SecretKeyRef: &corev1.SecretKeySelector{
-								LocalObjectReference: corev1.LocalObjectReference{
-									Name: r.SecretDB.Name,
-								},
-								Key: "user",
-							},
-						}
-					case "POSTGRESQL_PASSWORD":
-						c.Env[j].ValueFrom = &corev1.EnvVarSource{
-							SecretKeyRef: &corev1.SecretKeySelector{
-								LocalObjectReference: corev1.LocalObjectReference{
-									Name: r.SecretDB.Name,
-								},
-								Key: "password",
-							},
-						}
-					}
-
-				}
 			}
 		}
 	}
@@ -292,6 +315,13 @@ func (r *Reconciler) SetDesiredNooBaaDB() error {
 			case "db":
 				if r.NooBaa.Spec.DBStorageClass != nil {
 					pvc.Spec.StorageClassName = r.NooBaa.Spec.DBStorageClass
+				} else {
+					storageClassName, err := r.findLocalStorageClass()
+					if err != nil {
+						r.Logger.Errorf("got error finding a default/local storage class. error: %v", err)
+						return err
+					}
+					pvc.Spec.StorageClassName = &storageClassName
 				}
 				if r.NooBaa.Spec.DBVolumeResources != nil {
 					pvc.Spec.Resources = *r.NooBaa.Spec.DBVolumeResources
@@ -302,13 +332,13 @@ func (r *Reconciler) SetDesiredNooBaaDB() error {
 	} else {
 		// upgrade path add new resources,
 		// merge the volumes & volumeMounts from the template
-		util.MergeVolumeList( &NooBaaDB.Spec.Template.Spec.Volumes, &NooBaaDBTemplate.Spec.Template.Spec.Volumes)
+		util.MergeVolumeList(&NooBaaDB.Spec.Template.Spec.Volumes, &NooBaaDBTemplate.Spec.Template.Spec.Volumes)
 		for i := range NooBaaDB.Spec.Template.Spec.Containers {
 			util.MergeVolumeMountList(&NooBaaDB.Spec.Template.Spec.Containers[i].VolumeMounts, &NooBaaDBTemplate.Spec.Template.Spec.Containers[i].VolumeMounts)
 		}
 
 		// when already exists we check that there is no update requested to the volumes
-		// otherwise we report that volume update is unsupported
+		// otherwise we report that volume updarte is unsupported
 		for i := range NooBaaDB.Spec.VolumeClaimTemplates {
 			pvc := &NooBaaDB.Spec.VolumeClaimTemplates[i]
 			switch pvc.Name {
@@ -320,12 +350,12 @@ func (r *Reconciler) SetDesiredNooBaaDB() error {
 				}
 				if r.NooBaa.Spec.DBStorageClass != nil {
 					desiredClass = *r.NooBaa.Spec.DBStorageClass
-				}
-				if desiredClass != currentClass {
-					r.Recorder.Eventf(r.NooBaa, corev1.EventTypeWarning, "DBStorageClassIsImmutable",
-						"spec.dbStorageClass is immutable and cannot be updated for volume %q in existing %s %q"+
-							" since it requires volume recreate and migrate which is unsupported by the operator",
-						pvc.Name, r.CoreApp.TypeMeta.Kind, r.CoreApp.Name)
+					if desiredClass != currentClass {
+						r.Recorder.Eventf(r.NooBaa, corev1.EventTypeWarning, "DBStorageClassIsImmutable",
+							"spec.dbStorageClass is immutable and cannot be updated for volume %q in existing %s %q"+
+								" since it requires volume recreate and migrate which is unsupported by the operator",
+							pvc.Name, r.CoreApp.TypeMeta.Kind, r.CoreApp.Name)
+					}
 				}
 				if r.NooBaa.Spec.DBVolumeResources != nil &&
 					!reflect.DeepEqual(pvc.Spec.Resources, *r.NooBaa.Spec.DBVolumeResources) {
@@ -353,9 +383,6 @@ func (r *Reconciler) setDesiredCoreEnv(c *corev1.Container) {
 			} else {
 				c.Env[j].Value = "mongodb://" + r.NooBaaMongoDB.Name + "-0." + r.NooBaaMongoDB.Spec.ServiceName + "/nbcore"
 			}
-
-		case "NOOBAA_LOG_LEVEL":
-				c.Env[j].Value = strconv.Itoa(r.NooBaa.Spec.DebugLevel)
 
 		case "POSTGRES_HOST":
 			c.Env[j].Value = r.NooBaaPostgresDB.Name + "-0." + r.NooBaaPostgresDB.Spec.ServiceName
@@ -403,9 +430,9 @@ func (r *Reconciler) setDesiredCoreEnv(c *corev1.Container) {
 				}
 			}
 		case "NOOBAA_ROOT_SECRET":
-			if r.SecretRootMasterKey.StringData["cipher_key_b64"] != "" {
-				c.Env[j].Value = r.SecretRootMasterKey.StringData["cipher_key_b64"]
-			}
+			c.Env[j].Value = r.SecretRootMasterKey
+		case "NODE_EXTRA_CA_CERTS":
+			c.Env[j].Value = r.ApplyCAsToPods
 		}
 
 	}
@@ -413,6 +440,12 @@ func (r *Reconciler) setDesiredCoreEnv(c *corev1.Container) {
 
 // SetDesiredCoreApp updates the CoreApp as desired for reconciling
 func (r *Reconciler) SetDesiredCoreApp() error {
+	if coreLabels, ok := r.NooBaa.Spec.Labels["core"]; ok {
+		r.CoreApp.Spec.Template.Labels = coreLabels
+	}
+	if coreAnnotations, ok := r.NooBaa.Spec.Annotations["core"]; ok {
+		r.CoreApp.Spec.Template.Annotations = coreAnnotations
+	}
 	r.CoreApp.Spec.Template.Labels["noobaa-core"] = r.Request.Name
 	r.CoreApp.Spec.Template.Labels["noobaa-mgmt"] = r.Request.Name
 	r.CoreApp.Spec.Selector.MatchLabels["noobaa-core"] = r.Request.Name
@@ -440,6 +473,14 @@ func (r *Reconciler) SetDesiredCoreApp() error {
 
 			if r.NooBaa.Spec.CoreResources != nil {
 				c.Resources = *r.NooBaa.Spec.CoreResources
+			}
+			if util.KubeCheckQuiet(r.CaBundleConf) {
+				configMapVolumeMounts := []corev1.VolumeMount{{
+					Name:      r.CaBundleConf.Name,
+					MountPath: "/etc/pki/ca-trust/extracted/pem",
+					ReadOnly:  true,
+				}}
+				util.MergeVolumeMountList(&c.VolumeMounts, &configMapVolumeMounts)
 			}
 		}
 	}
@@ -474,12 +515,36 @@ func (r *Reconciler) SetDesiredCoreApp() error {
 
 	}
 
+	if r.CoreApp.Spec.Template.Annotations == nil {
+		r.CoreApp.Spec.Template.Annotations = make(map[string]string)
+	}
+
+	r.CoreApp.Spec.Template.Annotations["noobaa.io/configmap-hash"] = r.CoreAppConfig.Annotations["noobaa.io/configmap-hash"]
+
 	phase := r.NooBaa.Status.UpgradePhase
 	replicas := int32(1)
 	if phase == nbv1.UpgradePhasePrepare || phase == nbv1.UpgradePhaseMigrate {
 		replicas = int32(0)
 	}
 	r.CoreApp.Spec.Replicas = &replicas
+
+	if util.KubeCheckQuiet(r.CaBundleConf) {
+		configMapVolumes := []corev1.Volume{{
+			Name: r.CaBundleConf.Name,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: r.CaBundleConf.Name,
+					},
+					Items: []corev1.KeyToPath{{
+						Key:  "ca-bundle.crt",
+						Path: "tls-ca-bundle.pem",
+					}},
+				},
+			},
+		}}
+		util.MergeVolumeList(&podSpec.Volumes, &configMapVolumes)
+	}
 	return nil
 }
 
@@ -491,11 +556,16 @@ func (r *Reconciler) ReconcileBackingStoreCredentials() error {
 	if r.JoinSecret != nil {
 		return nil
 	}
+	// If DefaultBackingStore Spec is set do nothing
+	if r.NooBaa.Spec.DefaultBackingStoreSpec != nil {
+		r.Logger.Info("DefaultBackingStoreSpec found Skipping Reconciling Backing Store Credentials")
+		return nil
+	}
 
 	if util.IsAWSPlatform() {
 		return r.ReconcileAWSCredentials()
 	}
-	if util.IsAzurePlatform() {
+	if util.IsAzurePlatformNonGovernment() {
 		return r.ReconcileAzureCredentials()
 	}
 	if util.IsGCPPlatform() {
@@ -679,6 +749,24 @@ func (r *Reconciler) ReconcileIBMCredentials() error {
 	return nil
 }
 
+// ReconcileCAInject checks if a namespace called openshift-config exist (OCP)
+// if so creates a cofig map for OCP to inject supported CAs to
+func (r *Reconciler) ReconcileCAInject() error {
+	ocpConfigNamespace := &corev1.Namespace{
+		TypeMeta: metav1.TypeMeta{Kind: "Namespace"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "openshift-config",
+		},
+	}
+	if util.KubeCheckQuiet(ocpConfigNamespace) {
+		r.Logger.Infof("Found openshift-config ns - will reconcile CA inject configmap: %q", r.CaBundleConf.Name)
+		if err := r.ReconcileObject(r.CaBundleConf, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // SetDesiredAgentProfile updates the value of the AGENT_PROFILE env
 func (r *Reconciler) SetDesiredAgentProfile(profileString string) string {
 	agentProfile := map[string]interface{}{}
@@ -697,75 +785,136 @@ func (r *Reconciler) SetDesiredAgentProfile(profileString string) string {
 	return string(profileBytes)
 }
 
+func (r *Reconciler) setKMSConditionStatus(s corev1.ConditionStatus) {
+	conditions := &r.NooBaa.Status.Conditions
+	conditionsv1.SetStatusCondition(conditions, conditionsv1.Condition{
+		LastHeartbeatTime: metav1.NewTime(time.Now()),
+		Type:              nbv1.ConditionTypeKMSStatus,
+		Status:            s,
+	})
+	r.Logger.Infof("setKMSConditionStatus %v", s)
+}
+
+func (r *Reconciler) setKMSConditionType(t string) {
+	conditions := &r.NooBaa.Status.Conditions
+	conditionsv1.SetStatusCondition(conditions, conditionsv1.Condition{
+		LastHeartbeatTime: metav1.NewTime(time.Now()),
+		Type:              nbv1.ConditionTypeKMSType,
+		Status:            corev1.ConditionStatus(t),
+	})
+	r.Logger.Infof("setKMSConditionType %v", t)
+}
+
 // ReconcileRootSecret choose KMS for root secret key
 func (r *Reconciler) ReconcileRootSecret() error {
-	log := r.Logger
-	var err error
 
+	// External KMS Spec
 	connectionDetails := r.NooBaa.Spec.Security.KeyManagementService.ConnectionDetails
 	authTokenSecretName := r.NooBaa.Spec.Security.KeyManagementService.TokenSecretName
 
-	// set noobaa root master key secret
-	if len(connectionDetails) != 0 {
-		if err := util.ValidateConnectionDetails(connectionDetails, authTokenSecretName, options.Namespace); err != nil {
-			return fmt.Errorf("could not get/put key in external KMS: external kms connection details validation failed: %q", err)
-		}
-		kmsProvider := connectionDetails["KMS_PROVIDER"]
-		if util.IsVaultKMS(kmsProvider) {
-			keySecretName := "rootkeyb64-" + string(r.NooBaa.ObjectMeta.UID)
-			// reconcile root master key externally (vault)
-			c, err := util.InitVaultClient(connectionDetails, authTokenSecretName, options.Namespace)
-			if err == nil {
-				secretPath, err1 := util.BuildExternalSecretPath(c, r.NooBaa.Spec.Security.KeyManagementService, string(r.NooBaa.ObjectMeta.UID))
-				if err1 != nil {
-					return fmt.Errorf("could not get/put key in external KMS %+v", err1)
-				}
-				// get secret from external KMS
-				rootKey, err := util.GetSecret(c, keySecretName, secretPath, connectionDetails["VAULT_BACKEND_PATH"])
-				if err != nil {
-					return fmt.Errorf("got error in fetch root secret from external KMS %v", err)
-				}
-				if err == nil && rootKey != "" {
-					log.Infof("found root secret in external KMS successfully")
-					r.SecretRootMasterKey.StringData["cipher_key_b64"] = rootKey
-					return nil
-				}
-				log.Infof("could not find root secret in external KMS %v", err)
-				// put secret in external KMS
-				if r.NooBaa.DeletionTimestamp == nil {
-					log.Infof("could not find root secret in external KMS, will upload new secret root key %v", err)
-					err = util.PutSecret(c, keySecretName, r.SecretRootMasterKey.StringData["cipher_key_b64"], secretPath, connectionDetails["VAULT_BACKEND_PATH"])
-					if err == nil {
-						log.Infof("uploaded root secret to external KMS successfully")
-						return nil
-					}
-					return fmt.Errorf("Error put secret in vault: %+v", err)
-				}
-			}
-			return fmt.Errorf("could not initialize external KMS client %+v", err)
-		}
-	}
-	// reconcile root master key as K8s secret
-	err = r.ReconcileObject(r.SecretRootMasterKey, nil)
+	k, err := kms.NewKMS(connectionDetails, authTokenSecretName, r.Request.Name, r.Request.Namespace, string(r.NooBaa.UID))
 	if err != nil {
+		r.Logger.Errorf("ReconcileRootSecret, NewKMS error %v", err)
+		r.setKMSConditionStatus(nbv1.ConditionKMSInvalid)
 		return err
 	}
+	r.setKMSConditionType(k.Type)
+
+	v, err := k.Get()
+	if err != nil {
+		r.Logger.Errorf("ReconcileRootSecret, KMS Get error %v", err)
+		// the KMS root key was empty
+		// Initialize external KMS with a randomly generated key
+		if err == secrets.ErrInvalidSecretId {
+			r.SecretRootMasterKey = util.RandomBase64(32)
+			err := k.Set(r.SecretRootMasterKey)
+			if err != nil {
+				r.Logger.Errorf("ReconcileRootSecret, KMS Set error %v", err)
+				r.setKMSConditionStatus(nbv1.ConditionKMSErrorWrite)
+				return err
+			}
+			r.setKMSConditionStatus(nbv1.ConditionKMSInit)
+			return nil
+		}
+		// Unknown get error
+		r.setKMSConditionStatus(nbv1.ConditionKMSErrorRead)
+		return err
+	}
+	// Set the value from KMS
+	r.SecretRootMasterKey = v
+	r.setKMSConditionStatus(nbv1.ConditionKMSSync)
+
 	return nil
+}
+
+func (r *Reconciler) reconcileRbac(scc, sa, role, binding string) error {
+	SCC := util.KubeObject(scc).(*secv1.SecurityContextConstraints)
+	util.KubeCreateOptional(SCC)
+
+	SA := util.KubeObject(sa).(*corev1.ServiceAccount)
+	SA.Namespace = options.Namespace
+	if err := r.ReconcileObject(SA, nil); err != nil {
+		return err
+	}
+	Role := util.KubeObject(role).(*rbacv1.Role)
+	Role.Namespace = options.Namespace
+	if err := r.ReconcileObject(Role, nil); err != nil {
+		return err
+	}
+	RoleBinding := util.KubeObject(binding).(*rbacv1.RoleBinding)
+	RoleBinding.Namespace = options.Namespace
+	if err := r.ReconcileObject(RoleBinding, nil); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// reconcileDBRBAC creates DB scc, role, rolebinding and service account
+func (r *Reconciler) reconcileDBRBAC() error {
+	return r.reconcileRbac(
+		bundle.File_deploy_scc_db_yaml,
+		bundle.File_deploy_service_account_db_yaml,
+		bundle.File_deploy_role_db_yaml,
+		bundle.File_deploy_role_binding_db_yaml)
 }
 
 // ReconcileDB choose between different types of DB
 func (r *Reconciler) ReconcileDB() error {
 	var err error
+
+	if err = r.reconcileDBRBAC(); err != nil {
+		return err
+	}
+
 	if r.NooBaa.Spec.DBType == "postgres" {
-		// this config map is required by the NooBaaPostgresDB StatefulSet,
+		// those are config maps required by the NooBaaPostgresDB StatefulSet,
 		// if the configMap was not created at this step, NooBaaPostgresDB
 		// would fail to start.
-		r.Own(r.PostgresDBConf)
-		if !util.KubeCreateSkipExisting(r.PostgresDBConf) {
-			return fmt.Errorf("could not create Postgres DB configMap %q in Namespace %q", r.PostgresDBConf.Name, r.PostgresDBConf.Namespace)
+
+		isDBInitUpdated, reconcileDbError := r.ReconcileDBConfigMap(r.PostgresDBInitDb, r.SetDesiredPostgresDBInitDb)
+		if reconcileDbError != nil {
+			return reconcileDbError
 		}
 
-		err = r.ReconcileObject(r.NooBaaPostgresDB, r.SetDesiredNooBaaDB)
+		isDBConfUpdated, reconcileDbError := r.ReconcileDBConfigMap(r.PostgresDBConf, r.SetDesiredPostgresDBConf)
+		if reconcileDbError != nil {
+			return reconcileDbError
+		}
+
+		result, reconcilePostgresError := r.reconcileObjectAndGetResult(r.NooBaaPostgresDB, r.SetDesiredNooBaaDB, false)
+		if reconcilePostgresError != nil {
+			return reconcilePostgresError
+		}
+		if !r.isObjectUpdated(result) && (isDBInitUpdated || isDBConfUpdated) {
+			r.Logger.Warn("One of the db configMap was updated but not postgres db")
+			restartError := r.RestartDbPods()
+			if restartError != nil {
+				r.Logger.Warn("Unable to restart db pods")
+			}
+
+		}
+
 		// Making sure that previous CRs without the value will deploy MongoDB
 	} else if r.NooBaa.Spec.DBType == "" || r.NooBaa.Spec.DBType == "mongodb" {
 		err = r.ReconcileObject(r.NooBaaMongoDB, r.SetDesiredNooBaaDB)
@@ -773,6 +922,56 @@ func (r *Reconciler) ReconcileDB() error {
 		err = util.NewPersistentError("UnknownDBType", "Unknown dbType is specified in NooBaa spec")
 	}
 	return err
+}
+
+// ReconcileDBConfigMap reconcile provided postgres db config map
+func (r *Reconciler) ReconcileDBConfigMap(cm *corev1.ConfigMap, desiredFunc func() error) (bool, error) {
+	r.Own(cm)
+	result, error := r.reconcileObjectAndGetResult(cm, desiredFunc, false)
+	if error != nil {
+		return false, fmt.Errorf("could not update Postgres DB configMap %q in Namespace %q", cm.Name, cm.Namespace)
+	}
+	return r.isObjectUpdated(result), nil
+}
+
+// SetDesiredPostgresDBConf fill desired postgres db config map
+func (r *Reconciler) SetDesiredPostgresDBConf() error {
+	dbConfigYaml := util.KubeObject(bundle.File_deploy_internal_configmap_postgres_db_yaml).(*corev1.ConfigMap)
+	r.PostgresDBConf.Data = dbConfigYaml.Data
+
+	overrideField := "noobaa-postgres.conf"
+	operator := r.NooBaa
+	if operator.Spec.DBConf != nil {
+		// If the user has specified a custom "dbConf" in the NooBaa CR then proceed to append that configuration
+		// to the pre-defined configuration
+		r.PostgresDBConf.Data[overrideField] = dbConfigYaml.Data[overrideField] + "\n" + *operator.Spec.DBConf
+	}
+
+	return nil
+}
+
+// SetDesiredPostgresDBInitDb fill desired postgres db init config map
+func (r *Reconciler) SetDesiredPostgresDBInitDb() error {
+	postgresDBInitDbYaml := util.KubeObject(bundle.File_deploy_internal_configmap_postgres_initdb_yaml).(*corev1.ConfigMap)
+	r.PostgresDBConf.Data = postgresDBInitDbYaml.Data
+	return nil
+}
+
+// RestartDbPods restart db pods
+func (r *Reconciler) RestartDbPods() error {
+	r.Logger.Warn("Restarting postgres db pods")
+
+	dbPodList := &corev1.PodList{}
+	dbPodSelector, _ := labels.Parse("noobaa-db=postgres")
+	if !util.KubeList(dbPodList, &client.ListOptions{Namespace: options.Namespace, LabelSelector: dbPodSelector}) {
+		return fmt.Errorf("failed to list db pods in Namespace %q", options.Namespace)
+	}
+	for _, pod := range dbPodList.Items {
+		if pod.DeletionTimestamp == nil {
+			util.KubeDeleteNoPolling(&pod)
+		}
+	}
+	return nil
 }
 
 // UpgradeSplitDB removes the old pvc and create a  new one with the same PV
@@ -1026,7 +1225,7 @@ func (r *Reconciler) UpgradeMigrateDB() error {
 			return fmt.Errorf("mongo is still alive")
 		}
 
-		if util.KubeCheck(r.ServiceDb) {
+		if util.KubeCheckQuiet(r.ServiceDb) {
 			r.Logger.Infof("UpgradeMigrateDB:: deleting mongodb service")
 
 			if err := r.Client.Delete(r.Ctx, r.ServiceDb); err != nil && !errors.IsNotFound(err) {
@@ -1110,4 +1309,51 @@ func (r *Reconciler) SetEndpointsDeploymentReplicas(replicas int32) error {
 		r.DeploymentEndpoint.Spec.Replicas = &replicas
 		return nil
 	})
+}
+
+// SetDesiredCoreAppConfig initiate the config map with predifined environment variables and their values
+func (r *Reconciler) SetDesiredCoreAppConfig() error {
+	// Reowning the ConfigMap, incase the CreateOrUpdate removed the OwnerRefernce
+	r.Own(r.CoreAppConfig)
+
+	// When adding a new env var, make sure to add it to the sts/deployment as well
+	// see "NOOBAA_DISABLE_COMPRESSION" as an example
+	DefaultConfigMapData := map[string]string{
+		"NOOBAA_DISABLE_COMPRESSION": "false",
+		"DISABLE_DEV_RANDOM_SEED":    "true",
+		"NOOBAA_LOG_LEVEL":           "default_level",
+	}
+	for key, value := range DefaultConfigMapData {
+		if _, ok := r.CoreAppConfig.Data[key]; !ok {
+			r.CoreAppConfig.Data[key] = value
+		}
+	}
+
+	if r.CoreAppConfig.Annotations == nil {
+		r.CoreAppConfig.Annotations = make(map[string]string)
+	}
+	r.CoreAppConfig.Annotations["noobaa.io/configmap-hash"] = util.GetCmDataHash(r.CoreAppConfig.Data)
+
+	return nil
+}
+
+func (r *Reconciler) findLocalStorageClass() (string, error) {
+	lsoStorageClassNames := []string{}
+	scList := &storagev1.StorageClassList{}
+	util.KubeList(scList)
+	for _, sc := range scList.Items {
+		if sc.ObjectMeta.Annotations["storageclass.kubernetes.io/is-default-class"] == "true" {
+			return sc.Name, nil
+		}
+		if sc.Provisioner == "kubernetes.io/no-provisioner" {
+			lsoStorageClassNames = append(lsoStorageClassNames, sc.Name)
+		}
+	}
+	if len(lsoStorageClassNames) == 0 {
+		return "", fmt.Errorf("Error: found no LSO storage class and no storage class was marked as default")
+	}
+	if len(lsoStorageClassNames) > 1 {
+		return "", fmt.Errorf("Error: found more than one LSO storage class and none was marked as default")
+	}
+	return lsoStorageClassNames[0], nil
 }

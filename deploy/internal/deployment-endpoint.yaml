@@ -19,6 +19,8 @@ spec:
       labels:
         noobaa-s3: noobaa
         app: noobaa
+      annotations:
+        noobaa.io/configmap-hash: ""
     spec:
       serviceAccountName: noobaa-endpoint
       volumes:
@@ -30,6 +32,13 @@ spec:
           secret:
             secretName: noobaa-s3-serving-cert
             optional: true
+        - name: oidc-token
+          projected:
+            sources:
+            - serviceAccountToken:
+                path: oidc-token
+                expirationSeconds: 3600
+                audience: api
       containers:
         - name: endpoint
           image: NOOBAA_CORE_IMAGE
@@ -38,18 +47,32 @@ spec:
             - init_endpoint
           resources:
             requests:
-              cpu: "1"
+              cpu: "999m"
               memory: "2Gi"
             limits:
-              cpu: "1"
+              cpu: "999m"
               memory: "2Gi"
           securityContext:
+            fsGroupChangePolicy: "OnRootMismatch"
+            seLinuxOptions:
+              type: "spc_t"
             capabilities:
               add: ["SETUID", "SETGID"]
           ports:
             - containerPort: 6001
             - containerPort: 6443
+            - containerPort: 7443
           env:
+            - name: NOOBAA_DISABLE_COMPRESSION
+              valueFrom:
+                configMapKeyRef:
+                  name: noobaa-config
+                  key: NOOBAA_DISABLE_COMPRESSION
+            - name: NOOBAA_LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: noobaa-config
+                  key: NOOBAA_LOG_LEVEL
             - name: MGMT_ADDR
             - name: BG_ADDR
             - name: MD_ADDR
@@ -68,10 +91,7 @@ spec:
             - name: LOCAL_N2N_AGENT
             - name: JWT_SECRET
             - name: NOOBAA_ROOT_SECRET
-            - name: NOOBAA_LOG_LEVEL
-              value: "0"
-            - name: NOOBAA_DISABLE_COMPRESSION
-              value: "false"
+            - name: NODE_EXTRA_CA_CERTS
             - name: NOOBAA_AUTH_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -101,6 +121,10 @@ spec:
               readOnly: true
             - name: s3-secret
               mountPath: /etc/s3-secret
+              readOnly: true
+            # used for aws sts endpoint type
+            - name: oidc-token
+              mountPath: /var/run/secrets/openshift/serviceaccount
               readOnly: true
           readinessProbe: # must be configured to support rolling updates
             tcpSocket:

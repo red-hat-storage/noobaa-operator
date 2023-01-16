@@ -1,0 +1,47 @@
+name: Admission Webhook Tests
+
+# Run on each new PR and each new push to existing PR
+on: [push, pull_request]
+
+jobs:
+  run-admission-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+      - uses: actions/setup-go@v2
+        with:
+          go-version: "1.18"
+
+      - name: Set environment variables
+        run: |
+          echo PATH=$PATH:$HOME/go/bin                           >> $GITHUB_ENV
+          echo OPERATOR_IMAGE=noobaa/noobaa-operator:integration >> $GITHUB_ENV
+          echo CHANGE_MINIKUBE_NONE_USER=true                    >> $GITHUB_ENV
+ 
+      - name: Deploy Dependencies
+        run: |
+          set -x
+          sudo bash .travis/install-minikube.sh
+          go get -v github.com/onsi/ginkgo/ginkgo
+          go install -v github.com/onsi/ginkgo/ginkgo
+          ginkgo version
+
+      - name: Update Kubectl Context
+        run: |
+          sudo mv /root/.kube /root/.minikube $HOME
+          sudo chown -R $USER $HOME/.kube $HOME/.minikube
+          sed "s/root/home\/$USER/g" $HOME/.kube/config > tmp; mv tmp $HOME/.kube/config
+
+      - name: Build NooBaa
+        run: |
+          make cli
+          make image
+          sudo docker tag noobaa/noobaa-operator:$(go run cmd/version/main.go) $OPERATOR_IMAGE
+
+      - name: Install NooBaa
+        run: |
+          ./build/_output/bin/noobaa-operator -n test --mini --admission --operator-image=$OPERATOR_IMAGE install
+
+      - name: Run Admission test
+        run: make test-admission

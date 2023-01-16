@@ -1,11 +1,15 @@
 package backingstore
 
 import (
+	"context"
+
 	nbv1 "github.com/noobaa/noobaa-operator/v5/pkg/apis/noobaa/v1alpha1"
 	"github.com/noobaa/noobaa-operator/v5/pkg/backingstore"
 	"github.com/noobaa/noobaa-operator/v5/pkg/util"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -24,7 +28,7 @@ func Add(mgr manager.Manager) error {
 	c, err := controller.New("noobaa-controller", mgr, controller.Options{
 		MaxConcurrentReconciles: 1,
 		Reconciler: reconcile.Func(
-			func(req reconcile.Request) (reconcile.Result, error) {
+			func(context context.Context, req reconcile.Request) (reconcile.Result, error) {
 				return backingstore.NewReconciler(
 					req.NamespacedName,
 					mgr.GetClient(),
@@ -58,8 +62,7 @@ func Add(mgr manager.Manager) error {
 	// Watch for changes on resources to trigger reconcile
 	ownerHandler := &handler.EnqueueRequestForOwner{IsController: true, OwnerType: &nbv1.BackingStore{}}
 
-	err = c.Watch(&source.Kind{Type: &nbv1.BackingStore{}}, &handler.EnqueueRequestForObject{},
-		backingStorePredicate, &logEventsPredicate)
+	err = c.Watch(&source.Kind{Type: &nbv1.BackingStore{}}, &handler.EnqueueRequestForObject{}, backingStorePredicate, &logEventsPredicate)
 	if err != nil {
 		return err
 	}
@@ -68,6 +71,20 @@ func Add(mgr manager.Manager) error {
 		return err
 	}
 	err = c.Watch(&source.Kind{Type: &corev1.PersistentVolumeClaim{}}, ownerHandler, &filterForOwnerPredicate, &logEventsPredicate)
+	if err != nil {
+		return err
+	}
+
+	// setting another handler to watch events on secrets that not necessarily owned by the Backingstore.
+	// only one OwnerReference can be a controller see:
+	// https://github.com/kubernetes-sigs/controller-runtime/blob/master/pkg/controller/controllerutil/controllerutil.go#L54
+	secretsHandler := handler.EnqueueRequestsFromMapFunc(func(obj client.Object) []reconcile.Request {
+		return backingstore.MapSecretToBackingStores(types.NamespacedName{
+			Name:      obj.GetName(),
+			Namespace: obj.GetNamespace(),
+		})
+	})
+	err = c.Watch(&source.Kind{Type: &corev1.Secret{}}, secretsHandler, logEventsPredicate)
 	if err != nil {
 		return err
 	}

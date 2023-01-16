@@ -48,13 +48,21 @@ type Client interface {
 	UpdateBucketClass(UpdateBucketClassParams) (BucketClassInfo, error)
 
 	AddExternalConnectionAPI(AddExternalConnectionParams) error
-	CheckExternalConnectionAPI(AddExternalConnectionParams) (CheckExternalConnectionReply, error)
-	EditExternalConnectionCredentialsAPI(EditExternalConnectionCredentialsParams) error
+	CheckExternalConnectionAPI(CheckExternalConnectionParams) (CheckExternalConnectionReply, error)
+	UpdateExternalConnectionAPI(UpdateExternalConnectionParams) error
 	DeleteExternalConnectionAPI(DeleteExternalConnectionParams) error
 
 	UpdateEndpointGroupAPI(UpdateEndpointGroupParams) error
 
 	RegisterToCluster() error
+	PublishToCluster(PublishToClusterParams) error
+
+	PutBucketReplicationAPI(BucketReplicationParams) error
+	ValidateReplicationAPI(BucketReplicationParams) error
+	DeleteBucketReplicationAPI(DeleteBucketReplicationParams) error
+
+	GenerateAccountKeysAPI(GenerateAccountKeysParams) error
+	ResetPasswordAPI(ResetPasswordParams) error
 }
 
 // ReadAuthAPI calls auth_api.read_auth()
@@ -347,7 +355,7 @@ func (c *RPCClient) AddExternalConnectionAPI(params AddExternalConnectionParams)
 }
 
 // CheckExternalConnectionAPI calls account_api.check_external_connection()
-func (c *RPCClient) CheckExternalConnectionAPI(params AddExternalConnectionParams) (CheckExternalConnectionReply, error) {
+func (c *RPCClient) CheckExternalConnectionAPI(params CheckExternalConnectionParams) (CheckExternalConnectionReply, error) {
 	req := &RPCMessage{API: "account_api", Method: "check_external_connection", Params: params}
 	res := &struct {
 		RPCMessage `json:",inline"`
@@ -357,9 +365,9 @@ func (c *RPCClient) CheckExternalConnectionAPI(params AddExternalConnectionParam
 	return res.Reply, err
 }
 
-// EditExternalConnectionCredentialsAPI calls account_api.edit_external_connection_credentials()
-func (c *RPCClient) EditExternalConnectionCredentialsAPI(params EditExternalConnectionCredentialsParams) error {
-	req := &RPCMessage{API: "account_api", Method: "edit_external_connection_credentials", Params: params}
+// UpdateExternalConnectionAPI calls account_api.update_external_connection()
+func (c *RPCClient) UpdateExternalConnectionAPI(params UpdateExternalConnectionParams) error {
+	req := &RPCMessage{API: "account_api", Method: "update_external_connection", Params: params}
 	return c.Call(req, nil)
 }
 
@@ -375,8 +383,44 @@ func (c *RPCClient) UpdateEndpointGroupAPI(params UpdateEndpointGroupParams) err
 	return c.Call(req, nil)
 }
 
-// RegisterToCluster calls redirector_api.RegisterToCluster()
+// RegisterToCluster calls redirector_api.register_to_cluster()
 func (c *RPCClient) RegisterToCluster() error {
 	req := &RPCMessage{API: "redirector_api", Method: "register_to_cluster"}
+	return c.Call(req, nil)
+}
+
+// PublishToCluster calls redirector_api.publish_to_cluster()
+func (c *RPCClient) PublishToCluster(params PublishToClusterParams) error {
+	req := &RPCMessage{API: "redirector_api", Method: "publish_to_cluster", Params: params}
+	return c.Call(req, nil)
+}
+
+// PutBucketReplicationAPI calls bucket_api.put_bucket_replication()
+func (c *RPCClient) PutBucketReplicationAPI(params BucketReplicationParams) error {
+	req := &RPCMessage{API: "bucket_api", Method: "put_bucket_replication", Params: params}
+	return c.Call(req, nil)
+}
+
+// ValidateReplicationAPI calls bucket_api.validate_replication()
+func (c *RPCClient) ValidateReplicationAPI(params BucketReplicationParams) error {
+	req := &RPCMessage{API: "bucket_api", Method: "validate_replication", Params: params}
+	return c.Call(req, nil)
+}
+
+// DeleteBucketReplicationAPI calls bucket_api.delete_bucket_replication()
+func (c *RPCClient) DeleteBucketReplicationAPI(params DeleteBucketReplicationParams) error {
+	req := &RPCMessage{API: "bucket_api", Method: "delete_bucket_replication", Params: params}
+	return c.Call(req, nil)
+}
+
+// GenerateAccountKeysAPI calls account_api.generate_account_keys()
+func (c *RPCClient) GenerateAccountKeysAPI(params GenerateAccountKeysParams) error {
+	req := &RPCMessage{API: "account_api", Method: "generate_account_keys", Params: params}
+	return c.Call(req, nil)
+}
+
+// ResetPasswordAPI calls account_api.reset_password()
+func (c *RPCClient) ResetPasswordAPI(params ResetPasswordParams) error {
+	req := &RPCMessage{API: "account_api", Method: "reset_password", Params: params}
 	return c.Call(req, nil)
 }

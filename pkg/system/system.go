@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/spf13/cobra"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,6 +42,7 @@ func Cmd() *cobra.Command {
 		CmdCreate(),
 		CmdDelete(),
 		CmdStatus(),
+		CmdSetDebugLevel(),
 		CmdList(),
 		CmdReconcile(),
 		CmdYaml(),
@@ -53,11 +56,13 @@ func CmdCreate() *cobra.Command {
 		Use:   "create",
 		Short: "Create a noobaa system",
 		Run:   RunCreate,
+		Args:  cobra.NoArgs,
 	}
 	cmd.Flags().String("core-resources", "", "Core resources JSON")
 	cmd.Flags().String("db-resources", "", "DB resources JSON")
 	cmd.Flags().String("endpoint-resources", "", "Endpoint resources JSON")
 	cmd.Flags().Bool("use-obc-cleanup-policy", false, "Create NooBaa system with obc cleanup policy")
+	cmd.Flags().String("default-backingstore-spec", "", "Create Noobaa System with DefaultBackingStore Spec")
 	return cmd
 }
 
@@ -67,6 +72,7 @@ func CmdDelete() *cobra.Command {
 		Use:   "delete",
 		Short: "Delete a noobaa system",
 		Run:   RunDelete,
+		Args:  cobra.NoArgs,
 	}
 	cmd.Flags().Bool("cleanup_data", false, "clean object buckets")
 	return cmd
@@ -78,6 +84,7 @@ func CmdList() *cobra.Command {
 		Use:   "list",
 		Short: "List noobaa systems",
 		Run:   RunList,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -88,6 +95,18 @@ func CmdStatus() *cobra.Command {
 		Use:   "status",
 		Short: "Status of a noobaa system",
 		Run:   RunStatus,
+		Args:  cobra.NoArgs,
+	}
+	return cmd
+}
+
+// CmdSetDebugLevel returns a CLI command
+func CmdSetDebugLevel() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "set-debug-level <level>",
+		Short: "Sets core and endpoints debug level. level can be 'warn' or 0-5",
+		Run:   RunSetDebugLevel,
+		Args:  cobra.ExactArgs(1),
 	}
 	return cmd
 }
@@ -99,6 +118,7 @@ func CmdReconcile() *cobra.Command {
 		Use:    "reconcile",
 		Short:  "Runs a reconcile attempt like noobaa-operator",
 		Run:    RunReconcile,
+		Args:   cobra.NoArgs,
 	}
 	return cmd
 }
@@ -109,6 +129,7 @@ func CmdYaml() *cobra.Command {
 		Use:   "yaml",
 		Short: "Show bundled noobaa yaml",
 		Run:   RunYaml,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -122,7 +143,11 @@ func LoadSystemDefaults() *nbv1.NooBaa {
 	sys.Finalizers = []string{nbv1.GracefulFinalizer}
 	dbType := options.DBType
 	sys.Spec.DBType = nbv1.DBTypes(dbType)
-	sys.Spec.DebugLevel = options.DebugLevel
+	sys.Spec.DisableLoadBalancerService = options.DisableLoadBalancerService
+	sys.Spec.LoadBalancerSourceSubnets.S3 = options.S3LoadBalancerSourceSubnets
+	sys.Spec.LoadBalancerSourceSubnets.STS = options.STSLoadBalancerSourceSubnets
+
+	LoadConfigMapFromFlags()
 
 	if options.NooBaaImage != "" {
 		image := options.NooBaaImage
@@ -211,6 +236,8 @@ func RunCreate(cmd *cobra.Command, args []string) {
 	dbResourcesJSON, _ := cmd.Flags().GetString("db-resources")
 	endpointResourcesJSON, _ := cmd.Flags().GetString("endpoint-resources")
 	useOBCCleanupPolicy, _ := cmd.Flags().GetBool("use-obc-cleanup-policy")
+	defaultBackingStoreSpecJSON, _ := cmd.Flags().GetString("default-backingstore-spec")
+
 	if useOBCCleanupPolicy {
 		sys.Spec.CleanupPolicy.Confirmation = nbv1.DeleteOBCConfirmation
 	}
@@ -228,6 +255,10 @@ func RunCreate(cmd *cobra.Command, args []string) {
 			}
 		}
 		util.Panic(json.Unmarshal([]byte(endpointResourcesJSON), &sys.Spec.Endpoints.Resources))
+	}
+	if defaultBackingStoreSpecJSON != "" {
+		util.Panic(json.Unmarshal([]byte(defaultBackingStoreSpecJSON), &sys.Spec.DefaultBackingStoreSpec))
+
 	}
 
 	err := CheckMongoURL(sys)
@@ -257,6 +288,10 @@ func RunDelete(cmd *cobra.Command, args []string) {
 
 	log.Infof("Notice: Deletion of External secrets should be preformed manually")
 
+	if err := SetAllowNoobaaDeletion(sys); err != nil {
+		log.Errorf("NooBaa %q failed to update cleanup policy - deletion may fail", options.SystemName)
+	}
+
 	cleanupData, _ := cmd.Flags().GetBool("cleanup_data")
 	objectBuckets := &nbv1.ObjectBucketList{}
 	obcSelector, _ := labels.Parse("noobaa-domain=" + options.SubDomainNS())
@@ -271,7 +306,12 @@ func RunDelete(cmd *cobra.Command, args []string) {
 
 		} else {
 			log.Infof("Deleting All object buckets in namespace %q", options.Namespace)
-
+			// deletion of OBCSC
+			sc := &storagev1.StorageClass{}
+			sc.Name = options.SubDomainNS()
+			if err := util.DeleteStorageClass(sc); err != nil {
+				log.Errorf("failed to delete storageclass %q", sc.Name)
+			}
 			util.RemoveFinalizer(sys, nbv1.GracefulFinalizer)
 			if !util.KubeUpdate(sys) {
 				log.Errorf("NooBaa %q failed to remove finalizer %q", options.SystemName, nbv1.GracefulFinalizer)
@@ -390,8 +430,8 @@ func RunList(cmd *cobra.Command, args []string) {
 	table := (&util.PrintTable{}).AddRow(
 		"NAMESPACE",
 		"NAME",
-		"MGMT-ENDPOINTS",
 		"S3-ENDPOINTS",
+		"STS-ENDPOINTS",
 		"IMAGE",
 		"PHASE",
 		"AGE",
@@ -401,11 +441,11 @@ func RunList(cmd *cobra.Command, args []string) {
 		table.AddRow(
 			s.Namespace,
 			s.Name,
-			fmt.Sprint(s.Status.Services.ServiceMgmt.NodePorts),
 			fmt.Sprint(s.Status.Services.ServiceS3.NodePorts),
+			fmt.Sprint(s.Status.Services.ServiceSts.NodePorts),
 			s.Status.ActualImage,
 			string(s.Status.Phase),
-			time.Since(s.CreationTimestamp.Time).Round(time.Second).String(),
+			util.HumanizeDuration(time.Since(s.CreationTimestamp.Time).Round(time.Second)),
 		)
 	}
 	fmt.Print(table.String())
@@ -552,25 +592,24 @@ func RunStatus(cmd *cobra.Command, args []string) {
 	util.KubeCheck(secret)
 
 	fmt.Println("")
-	fmt.Println("#------------------#")
-	fmt.Println("#- Mgmt Addresses -#")
-	fmt.Println("#------------------#")
-	fmt.Println("")
-
-	fmt.Println("ExternalDNS :", r.NooBaa.Status.Services.ServiceMgmt.ExternalDNS)
-	fmt.Println("ExternalIP  :", r.NooBaa.Status.Services.ServiceMgmt.ExternalIP)
-	fmt.Println("NodePorts   :", r.NooBaa.Status.Services.ServiceMgmt.NodePorts)
-	fmt.Println("InternalDNS :", r.NooBaa.Status.Services.ServiceMgmt.InternalDNS)
-	fmt.Println("InternalIP  :", r.NooBaa.Status.Services.ServiceMgmt.InternalIP)
-	fmt.Println("PodPorts    :", r.NooBaa.Status.Services.ServiceMgmt.PodPorts)
+	if options.ShowSecrets {
+		fmt.Printf("%s password : %s\n", secret.StringData["email"], secret.StringData["password"])
+	} else {
+		fmt.Printf("%s password : %s\n", secret.StringData["email"], nb.MaskedString(secret.StringData["password"]))
+	}
 
 	fmt.Println("")
-	fmt.Println("#--------------------#")
-	fmt.Println("#- Mgmt Credentials -#")
-	fmt.Println("#--------------------#")
+	fmt.Println("#-----------------#")
+	fmt.Println("#- STS Addresses -#")
+	fmt.Println("#-----------------#")
 	fmt.Println("")
-	fmt.Printf("email    : %s\n", secret.StringData["email"])
-	fmt.Printf("password : %s\n", secret.StringData["password"])
+
+	util.PrettyPrint("ExternalDNS", r.NooBaa.Status.Services.ServiceSts.ExternalDNS)
+	fmt.Println("ExternalIP  :", r.NooBaa.Status.Services.ServiceSts.ExternalIP)
+	fmt.Println("NodePorts   :", r.NooBaa.Status.Services.ServiceSts.NodePorts)
+	fmt.Println("InternalDNS :", r.NooBaa.Status.Services.ServiceSts.InternalDNS)
+	fmt.Println("InternalIP  :", r.NooBaa.Status.Services.ServiceSts.InternalIP)
+	fmt.Println("PodPorts    :", r.NooBaa.Status.Services.ServiceSts.PodPorts)
 
 	fmt.Println("")
 	fmt.Println("#----------------#")
@@ -578,7 +617,7 @@ func RunStatus(cmd *cobra.Command, args []string) {
 	fmt.Println("#----------------#")
 	fmt.Println("")
 
-	fmt.Println("ExternalDNS :", r.NooBaa.Status.Services.ServiceS3.ExternalDNS)
+	util.PrettyPrint("ExternalDNS", r.NooBaa.Status.Services.ServiceS3.ExternalDNS)
 	fmt.Println("ExternalIP  :", r.NooBaa.Status.Services.ServiceS3.ExternalIP)
 	fmt.Println("NodePorts   :", r.NooBaa.Status.Services.ServiceS3.NodePorts)
 	fmt.Println("InternalDNS :", r.NooBaa.Status.Services.ServiceS3.InternalDNS)
@@ -590,9 +629,46 @@ func RunStatus(cmd *cobra.Command, args []string) {
 	fmt.Println("#- S3 Credentials -#")
 	fmt.Println("#------------------#")
 	fmt.Println("")
-	fmt.Printf("AWS_ACCESS_KEY_ID     : %s\n", secret.StringData["AWS_ACCESS_KEY_ID"])
-	fmt.Printf("AWS_SECRET_ACCESS_KEY : %s\n", secret.StringData["AWS_SECRET_ACCESS_KEY"])
+	if options.ShowSecrets {
+		fmt.Printf("AWS_ACCESS_KEY_ID     : %s\n", secret.StringData["AWS_ACCESS_KEY_ID"])
+		fmt.Printf("AWS_SECRET_ACCESS_KEY : %s\n", secret.StringData["AWS_SECRET_ACCESS_KEY"])
+	} else {
+		fmt.Printf("AWS_ACCESS_KEY_ID     : %s\n", nb.MaskedString(secret.StringData["AWS_ACCESS_KEY_ID"]))
+		fmt.Printf("AWS_SECRET_ACCESS_KEY : %s\n", nb.MaskedString(secret.StringData["AWS_SECRET_ACCESS_KEY"]))
+	}
 	fmt.Println("")
+
+}
+
+// RunSetDebugLevel sets the system debug level
+func RunSetDebugLevel(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+	level := 0
+	if args[0] == "warn" {
+		level = -1
+	} else {
+		var err error
+		level, err = strconv.Atoi(args[0])
+		if err != nil || level < 0 || level > 5 {
+			log.Fatalf(`invalid debug-level argument. must be 'warn' or 0 to 5. %s`, cmd.UsageString())
+		}
+	}
+	nbClient := GetNBClient()
+	err := nbClient.PublishToCluster(nb.PublishToClusterParams{
+		Target:     "",
+		MethodAPI:  "debug_api",
+		MethodName: "set_debug_level",
+		RequestParams: nb.SetDebugLevelParams{
+			Module: "core",
+			Level:  level,
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("")
+	fmt.Printf("Debug level was set to %s successfully\n", args[0])
+	fmt.Println("Debug level is not persistent and is only effective for the currently running core and endpoints pods")
 }
 
 // RunReconcile runs a CLI command
@@ -881,20 +957,60 @@ func Connect(isExternal bool) (*Client, error) {
 	}, nil
 }
 
+// GetDesiredDBImage returns the desired DB image according to spec or env or default (in options)
+func GetDesiredDBImage(sys *nbv1.NooBaa) string {
+	if sys.Spec.DBImage != nil {
+		return *sys.Spec.DBImage
+	}
+
+	if os.Getenv("NOOBAA_DB_IMAGE") != "" {
+		return os.Getenv("NOOBAA_DB_IMAGE")
+	}
+
+	return options.DBImage
+}
+
 // CheckSystem checks the state of the system and initializes its status fields
 func CheckSystem(sys *nbv1.NooBaa) bool {
+	log := util.Logger()
 	found := util.KubeCheck(sys)
+
+	if ts := sys.GetDeletionTimestamp(); ts != nil {
+		log.Printf("❌ NooBaa system deleted at %v", ts)
+		return false // deleted
+	}
+
+	if util.EnsureCommonMetaFields(sys, nbv1.GracefulFinalizer) {
+		if !util.KubeUpdate(sys) {
+			log.Errorf("❌ NooBaa %q failed to add mandatory meta fields", sys.Name)
+			return false
+		}
+	}
+
 	if sys.Status.Accounts == nil {
 		sys.Status.Accounts = &nbv1.AccountsStatus{}
 	}
 	if sys.Status.Services == nil {
 		sys.Status.Services = &nbv1.ServicesStatus{}
 	}
-	// load defaults
-	// TODO: This is a temp patch it can be overriden by actually loading from the CR this is just a patch in memory
+
+	// a hack to better set the DBType in cases where DBType is not set.
+	// if dbtype is not set, try to infer it from the db image. this only update dbtype in memory
 	if sys.Spec.DBType == "" {
-		sys.Spec.DBType = "mongodb" // = defaults.DBType
+		dbImage := GetDesiredDBImage(sys)
+		if strings.Contains(dbImage, "postgres") {
+			log.Infof("dbType was not supplied. according to image (%s) setting dbType to postgres", dbImage)
+			sys.Spec.DBType = "postgres"
+		} else {
+			if strings.Contains(dbImage, "mongo") {
+				log.Infof("dbType was not supplied. according to image (%s) setting dbType to mongodb", dbImage)
+			} else {
+				log.Warnf("dbType was not supplied and it cannot be guessed from from the dbImage (%s). setting dbType to mongodb", dbImage)
+			}
+			sys.Spec.DBType = "mongodb"
+		}
 	}
+
 	return found && sys.UID != ""
 }
 
@@ -907,6 +1023,35 @@ func CheckMongoURL(sys *nbv1.NooBaa) error {
 		if !strings.Contains(sys.Spec.MongoDbURL, "mongodb://") &&
 			!strings.Contains(sys.Spec.MongoDbURL, "mongodb+srv://") {
 			return fmt.Errorf("Invalid mongo db url %s, expecting the url to start with mongodb:// or mongodb+srv://", sys.Spec.MongoDbURL)
+		}
+	}
+	return nil
+}
+
+// LoadConfigMapFromFlags loads a config-map with values from the cli flags, if provided.
+func LoadConfigMapFromFlags() {
+	if options.DebugLevel != "default_level" {
+		cm := util.KubeObject(bundle.File_deploy_internal_configmap_empty_yaml).(*corev1.ConfigMap)
+		cm.Namespace = options.Namespace
+		cm.Name = "noobaa-config"
+
+		DefaultConfigMapData := map[string]string{
+			"NOOBAA_LOG_LEVEL": options.DebugLevel,
+		}
+
+		cm.Data = DefaultConfigMapData
+
+		util.KubeCreateSkipExisting(cm)
+	}
+}
+
+// SetAllowNoobaaDeletion sets AllowNoobaaDeletion Noobaa CR field to true so the webhook won't block the deletion
+func SetAllowNoobaaDeletion(noobaa *nbv1.NooBaa) error {
+	// Explicitly allow deletion of NooBaa CR
+	if !noobaa.Spec.CleanupPolicy.AllowNoobaaDeletion {
+		noobaa.Spec.CleanupPolicy.AllowNoobaaDeletion = true
+		if !util.KubeUpdate(noobaa) {
+			return fmt.Errorf("failed to update AllowNoobaaDeletion")
 		}
 	}
 	return nil

@@ -57,7 +57,7 @@ spec:
 
 # OBC with specific BucketClass
 
-Applications that require a bucket from a specific BucketClass can create an OBC with the default StorageClass, but override the BucketClass specifically for that claim using the `spec.additionalConfig.bucketclass` property.
+Applications that require a bucket from a specific BucketClass can create an OBC with the default StorageClass, but override the BucketClass specifically for that claim using the `spec.additionalConfig.bucketclass` property. The BucketClass can exist either in the same namespace as that of OBC or it can exist in NooBaa system namespace. In case of a conflict, BucketClass that exists in the OBC namespace will take priority over the BucketClass in NooBaa system.
 
 Example:
 
@@ -76,6 +76,32 @@ spec:
   storageClassName: noobaa.noobaa.io
   additionalConfig:
     bucketclass: custom-bucket-class
+```
+
+# OBC with specific Replication Policy
+
+Applications that require a bucket to have a specific replication policy can create an OBC and add to the claim 
+the `spec.additionalConfig.replication-policy` property.
+
+/path/to/json-file.json is the path to a JSON file which defines the replication policy
+
+Example:
+
+```bash
+noobaa obc create my-bucket-claim -n noobaa --app-namespace my-app --replication-policy /path/to/json-file.json
+```
+
+```yaml
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: my-bucket-claim
+  namespace: my-app
+spec:
+  generateBucketName: my-bucket
+  storageClassName: noobaa.noobaa.io
+  additionalConfig:
+    replication-policy: [{ "rule_id": "rule-2", "destination_bucket": "first.bucket", "filter": {"prefix": "bc"}}]
 ```
 
 # Using the OBC

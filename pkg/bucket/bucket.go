@@ -2,9 +2,10 @@ package bucket
 
 import (
 	"fmt"
-	"log"
 
+	"github.com/noobaa/noobaa-operator/v5/pkg/bucketclass"
 	"github.com/noobaa/noobaa-operator/v5/pkg/nb"
+	"github.com/noobaa/noobaa-operator/v5/pkg/options"
 	"github.com/noobaa/noobaa-operator/v5/pkg/system"
 	"github.com/noobaa/noobaa-operator/v5/pkg/util"
 
@@ -62,11 +63,12 @@ func CmdList() *cobra.Command {
 		Use:   "list",
 		Short: "List NooBaa buckets",
 		Run:   RunList,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
 
-// RunCreate runs a CLI command
+// RunCreate runs a CLI command. The default backingstore will be used as the underlying storage for buckets created using the CLI
 func RunCreate(cmd *cobra.Command, args []string) {
 	log := util.Logger()
 	if len(args) != 1 || args[0] == "" {
@@ -74,7 +76,18 @@ func RunCreate(cmd *cobra.Command, args []string) {
 	}
 	bucketName := args[0]
 	nbClient := system.GetNBClient()
-	err := nbClient.CreateBucketAPI(nb.CreateBucketParams{Name: bucketName})
+
+	bucketClass, err := bucketclass.GetDefaultBucketClass(options.Namespace)
+	if err != nil {
+		log.Fatal(fmt.Errorf("Failed to get default bucketclass with error: %v", err))
+	}
+
+	tierName, err := bucketclass.CreateTieringStructure(*bucketClass, bucketName, nbClient)
+	if err != nil {
+		log.Fatal(fmt.Errorf("CreateTieringStructure for PlacementPolicy failed to create policy %q with error: %v", tierName, err))
+	}
+
+	err = nbClient.CreateBucketAPI(nb.CreateBucketParams{Name: bucketName, Tiering: tierName})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -124,18 +137,30 @@ func RunStatus(cmd *cobra.Command, args []string) {
 		fmt.Printf("  %-22s : %s\n", "Undeletable", b.Undeletable)
 	}
 	if b.NumObjects != nil {
-		fmt.Printf("  %-22s : %d\n", "Num Objects", b.NumObjects.Value)
+		if b.BucketType == "NAMESPACE" {
+			fmt.Printf("  %-22s : N/A\n", "Num Objects")
+		} else {
+			fmt.Printf("  %-22s : %d\n", "Num Objects", b.NumObjects.Value)
+		}
 	}
 	if b.DataCapacity != nil {
-		fmt.Printf("  %-22s : %s\n", "Data Size", nb.BigIntToHumanBytes(b.DataCapacity.Size))
-		fmt.Printf("  %-22s : %s\n", "Data Size Reduced", nb.BigIntToHumanBytes(b.DataCapacity.SizeReduced))
-		fmt.Printf("  %-22s : %s\n", "Data Space Avail", nb.BigIntToHumanBytes(b.DataCapacity.AvailableToUpload))
+		if b.BucketType == "NAMESPACE" {
+			fmt.Printf("  %-22s : N/A\n", "Data Size")
+			fmt.Printf("  %-22s : N/A\n", "Data Size Reduced")
+			fmt.Printf("  %-22s : N/A\n", "Data Space Avail")
+		} else {
+			fmt.Printf("  %-22s : %s\n", "Data Size", nb.BigIntToHumanBytes(b.DataCapacity.Size))
+			fmt.Printf("  %-22s : %s\n", "Data Size Reduced", nb.BigIntToHumanBytes(b.DataCapacity.SizeReduced))
+			fmt.Printf("  %-22s : %s\n", "Data Space Avail", nb.BigIntToHumanBytes(b.DataCapacity.AvailableSizeToUpload))
+			fmt.Printf("  %-22s : %s\n", "Num Objects Avail", b.DataCapacity.AvailableQuantityToUpload.ToString())
+		}
 	}
 	fmt.Printf("\n")
 }
 
 // RunList runs a CLI command
 func RunList(cmd *cobra.Command, args []string) {
+	log := util.Logger()
 	nbClient := system.GetNBClient()
 	list, err := nbClient.ListBucketsAPI()
 	if err != nil {

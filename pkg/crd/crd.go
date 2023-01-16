@@ -41,6 +41,7 @@ func CmdCreate() *cobra.Command {
 		Use:   "create",
 		Short: "Create noobaa CRDs",
 		Run:   RunCreate,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -51,6 +52,7 @@ func CmdDelete() *cobra.Command {
 		Use:   "delete",
 		Short: "Delete noobaa CRDs",
 		Run:   RunDelete,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -61,6 +63,7 @@ func CmdStatus() *cobra.Command {
 		Use:   "status",
 		Short: "Status of noobaa CRDs",
 		Run:   RunStatus,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -71,6 +74,7 @@ func CmdWait() *cobra.Command {
 		Use:   "wait",
 		Short: "Wait for CRD to be ready",
 		Run:   RunWait,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -81,6 +85,7 @@ func CmdYaml() *cobra.Command {
 		Use:   "yaml",
 		Short: "Show bundled CRDs",
 		Run:   RunYaml,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -92,6 +97,7 @@ type Crds struct {
 	BackingStore      *CRD
 	NamespaceStore    *CRD
 	BucketClass       *CRD
+	NooBaaAccount     *CRD
 	ObjectBucket      *CRD
 	ObjectBucketClaim *CRD
 }
@@ -129,21 +135,24 @@ func LoadCrds() *Crds {
 	o2 := util.KubeObject(bundle.File_deploy_crds_noobaa_io_backingstores_crd_yaml)
 	o3 := util.KubeObject(bundle.File_deploy_crds_noobaa_io_namespacestores_crd_yaml)
 	o4 := util.KubeObject(bundle.File_deploy_crds_noobaa_io_bucketclasses_crd_yaml)
-	o5 := util.KubeObject(bundle.File_deploy_obc_objectbucket_io_objectbucketclaims_crd_yaml)
-	o6 := util.KubeObject(bundle.File_deploy_obc_objectbucket_io_objectbuckets_crd_yaml)
+	o5 := util.KubeObject(bundle.File_deploy_crds_noobaa_io_noobaaaccounts_crd_yaml)
+	o6 := util.KubeObject(bundle.File_deploy_obc_objectbucket_io_objectbucketclaims_crd_yaml)
+	o7 := util.KubeObject(bundle.File_deploy_obc_objectbucket_io_objectbuckets_crd_yaml)
 	crds := &Crds{
 		NooBaa:            o1.(*CRD),
 		BackingStore:      o2.(*CRD),
 		NamespaceStore:    o3.(*CRD),
 		BucketClass:       o4.(*CRD),
-		ObjectBucketClaim: o5.(*CRD),
-		ObjectBucket:      o6.(*CRD),
+		NooBaaAccount:     o5.(*CRD),
+		ObjectBucketClaim: o6.(*CRD),
+		ObjectBucket:      o7.(*CRD),
 	}
 	crds.All = []*CRD{
 		crds.NooBaa,
 		crds.BackingStore,
 		crds.NamespaceStore,
 		crds.BucketClass,
+		crds.NooBaaAccount,
 		crds.ObjectBucketClaim,
 		crds.ObjectBucket,
 	}
