@@ -15,12 +15,17 @@ Install latest operator CLI
 ```bash
 OS="linux"
 # or
-OS="mac"
+OS="darwin"
+
+ARCH=amd64
+# or
+ARCH=arm64
 
 VERSION=$(curl -s https://api.github.com/repos/noobaa/noobaa-operator/releases/latest | jq -r '.name')
-curl -LO https://github.com/noobaa/noobaa-operator/releases/download/$VERSION/noobaa-$OS-$VERSION
-chmod +x noobaa-$OS-$VERSION
-mv noobaa-$OS-$VERSION /usr/local/bin/noobaa
+curl -LO https://github.com/noobaa/noobaa-operator/releases/download/$VERSION/noobaa-operator-$VERSION-$OS-$ARCH.tar.gz
+tar -xvzf noobaa-operator-$VERSION-$OS-$ARCH.tar.gz
+chmod +x noobaa-operator
+mv noobaa-operator /usr/local/bin/noobaa
 ```
 
 Install with Mac Homebrew:
@@ -113,9 +118,9 @@ out-of-cluster.
 ```shell
 $ noobaa version
 
-INFO[0000] CLI version: 5.9.0
-INFO[0000] noobaa-image: noobaa/noobaa-core:5.9.0
-INFO[0000] operator-image: noobaa/noobaa-operator:5.9.0
+INFO[0000] CLI version: 5.15.0
+INFO[0000] noobaa-image: noobaa/noobaa-core:5.15.0
+INFO[0000] operator-image: noobaa/noobaa-operator:5.15.0
 
 ```
 

@@ -14,9 +14,32 @@ spec:
         noobaa-operator: deployment
     spec:
       serviceAccountName: noobaa
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+      - name: oidc-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              path: oidc-token
+              expirationSeconds: 3600
+              audience: api
+      - name: socket
+        emptyDir: {}
+      - name: noobaa-ca-inject
+        configMap:
+          name: noobaa-ca-inject
+          items:
+          - key: ca-bundle.crt
+            path: tls-ca-bundle.pem
+          optional: true
       containers:
         - name: noobaa-operator
           image: NOOBAA_OPERATOR_IMAGE
+          volumeMounts:
+          - mountPath: /etc/pki/ca-trust/extracted/pem
+            name: noobaa-ca-inject
           resources:
             limits:
               cpu: "250m"
@@ -32,3 +55,25 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+          volumeMounts:
+          - mountPath: /var/run/secrets/openshift/serviceaccount
+            name: oidc-token
+          - mountPath: /var/lib/cosi
+            name: socket
+        - name: objectstorage-provisioner-sidecar
+          image: COSI_SIDECAR_IMAGE
+          args:
+          - "--v=5"
+          resources:
+            limits:
+              cpu: "100m"
+              memory: "512Mi"
+          imagePullPolicy: Always
+          env:
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          volumeMounts:
+          - mountPath: /var/lib/cosi
+            name: socket

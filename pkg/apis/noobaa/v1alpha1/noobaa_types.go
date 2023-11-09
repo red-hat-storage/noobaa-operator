@@ -7,20 +7,32 @@ import (
 	conditionsv1 "github.com/openshift/custom-resource-status/conditions/v1"
 )
 
-// Note 1: Run "operator-sdk generate k8s" to regenerate code after modifying this file
+// Note 1: Run "make gen-api" to regenerate code after modifying this file
 // Note 2: Add custom validation using kubebuilder tags: https://book.kubebuilder.io/reference/generating-crd.html
 
 func init() {
 	SchemeBuilder.Register(&NooBaa{}, &NooBaaList{})
 }
 
+// Labels are label for a given daemon
+type Labels map[string]string
+
+// LabelsSpec is the main spec label for all daemons
+type LabelsSpec map[string]Labels
+
+// Annotations are annotation for a given daemon
+type Annotations map[string]string
+
+// AnnotationsSpec is the main spec annotation for all daemons
+type AnnotationsSpec map[string]Annotations
+
 // NooBaa is the Schema for the NooBaas API
 // +k8s:openapi-gen=true
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=nb
-// +kubebuilder:printcolumn:name="Mgmt-Endpoints",type="string",JSONPath=".status.services.serviceMgmt.nodePorts",description="Management Endpoints"
 // +kubebuilder:printcolumn:name="S3-Endpoints",type="string",JSONPath=".status.services.serviceS3.nodePorts",description="S3 Endpoints"
+// +kubebuilder:printcolumn:name="Sts-Endpoints",type="string",JSONPath=".status.services.serviceSts.nodePorts",description="STS Endpoints"
 // +kubebuilder:printcolumn:name="Image",type="string",JSONPath=".status.actualImage",description="Actual Image"
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase",description="Phase"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
@@ -68,6 +80,10 @@ type NooBaaSpec struct {
 	// +optional
 	DBImage *string `json:"dbImage,omitempty"`
 
+	// DBConf (optional) overrides the default postgresql db config
+	// +optional
+	DBConf *string `json:"dbConf,omitempty"`
+
 	// DBType (optional) overrides the default type image for the db container
 	// +optional
 	// +kubebuilder:validation:Enum=mongodb;postgres
@@ -101,8 +117,25 @@ type NooBaaSpec struct {
 	// +optional
 	MongoDbURL string `json:"mongoDbURL,omitempty"`
 
+	// ExternalPgSecret (optional) holds an optional secret with a url to an extrenal Postgres DB to be used
+	// +optional
+	ExternalPgSecret *corev1.SecretReference `json:"externalPgSecret,omitempty"`
+
+	// ExternalPgSSLRequired (optional) holds an optional boolean to force ssl connections to the external Postgres DB
+	// +optional
+	ExternalPgSSLRequired bool `json:"externalPgSSLRequired,omitempty"`
+
+	// ExternalPgSSLUnauthorized (optional) holds an optional boolean to allow unauthorized connections to external Postgres DB
+	// +optional
+	ExternalPgSSLUnauthorized bool `json:"externalPgSSLUnauthorized,omitempty"`
+
+	// ExternalPgSSLSecret (optional) holds an optional secret with client key and cert used for connecting to external Postgres DB
+	// +optional
+	ExternalPgSSLSecret *corev1.SecretReference `json:"externalPgSSLSecret,omitempty"`
+
 	// DebugLevel (optional) sets the debug level
 	// +optional
+	// +kubebuilder:validation:Enum=all;nsfs;warn;default_level
 	DebugLevel int `json:"debugLevel,omitempty"`
 
 	// PVPoolDefaultStorageClass (optional) overrides the default cluster StorageClass for the pv-pool volumes.
@@ -145,6 +178,68 @@ type NooBaaSpec struct {
 
 	// Security represents security settings
 	Security SecuritySpec `json:"security,omitempty"`
+
+	// The labels-related configuration to add/set on each Pod related object.
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +nullable
+	// +optional
+	Labels LabelsSpec `json:"labels,omitempty"`
+
+	// The annotations-related configuration to add/set on each Pod related object.
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +nullable
+	// +optional
+	Annotations AnnotationsSpec `json:"annotations,omitempty"`
+
+	// DisableLoadBalancerService (optional) sets the service type to ClusterIP instead of LoadBalancer
+	// +nullable
+	// +optional
+	DisableLoadBalancerService bool `json:"disableLoadBalancerService,omitempty"`
+
+	// Deprecated: DefaultBackingStoreSpec is not supported anymore, use ManualDefaultBackingStore instead.
+	// +optional
+	DefaultBackingStoreSpec *BackingStoreSpec `json:"defaultBackingStoreSpec,omitempty"`
+
+	// ManualDefaultBackingStore (optional - default value is false) if true the default backingstore will
+	// not be reconciled by the operator and it should be manually handled by the user. It will allow the
+	// user to  delete DefaultBackingStore, user needs to delete associated buckets and update the admin
+	// account with new BackingStore in order to delete the DefaultBackingStore
+	// +nullable
+	// +optional
+	ManualDefaultBackingStore bool `json:"manualDefaultBackingStore,omitempty"`
+
+	// LoadBalancerSourceSubnets (optional) if given will allow access to the NooBaa services
+	// only from the listed subnets. This field will have no effect if DisableLoadBalancerService is set
+	// to true
+	// +optional
+	LoadBalancerSourceSubnets LoadBalancerSourceSubnetSpec `json:"loadBalancerSourceSubnets,omitempty"`
+
+	// Configuration related to autoscaling
+	// +optional
+	Autoscaler AutoscalerSpec `json:"autoscaler,omitempty"`
+}
+
+// AutoscalerSpec defines different actoscaling spec such as autoscaler type and prometheus namespace
+type AutoscalerSpec struct {
+	// Type of autoscaling (optional) for noobaa-endpoint, hpav2(default) and keda - Prometheus metrics based
+	// +kubebuilder:validation:Enum=hpav2;keda
+	// +optional
+	AutoscalerType AutoscalerTypes `json:"autoscalerType,omitempty"`
+
+	// Prometheus namespace that scrap metrics from noobaa
+	// +optional
+	PrometheusNamespace string `json:"prometheusNamespace,omitempty"`
+}
+
+// LoadBalancerSourceSubnetSpec defines the subnets that will be allowed to access the NooBaa services
+type LoadBalancerSourceSubnetSpec struct {
+	// S3 is a list of subnets that will be allowed to access the Noobaa S3 service
+	// +optional
+	S3 []string `json:"s3,omitempty"`
+
+	// STS is a list of subnets that will be allowed to access the Noobaa STS service
+	// +optional
+	STS []string `json:"sts,omitempty"`
 }
 
 // SecuritySpec is security spec to include various security items such as kms
@@ -154,6 +249,10 @@ type SecuritySpec struct {
 
 // KeyManagementServiceSpec represent various details of the KMS server
 type KeyManagementServiceSpec struct {
+	// +optional
+	EnableKeyRotation bool `json:"enableKeyRotation,omitempty"`
+	// +optional
+	Schedule          string            `json:"schedule,omitempty"`
 	ConnectionDetails map[string]string `json:"connectionDetails,omitempty"`
 	TokenSecretName   string            `json:"tokenSecretName,omitempty"`
 }
@@ -227,6 +326,10 @@ type NooBaaStatus struct {
 	// Readme is a user readable string with explanations on the system
 	// +optional
 	Readme string `json:"readme,omitempty"`
+
+	// LastKeyRotateTime is the time system ran an encryption key rotate
+	// +optional
+	LastKeyRotateTime metav1.Time `json:"lastKeyRotateTime,omitempty"`
 }
 
 // SystemPhase is a string enum type for system phases
@@ -256,27 +359,37 @@ const (
 	SystemPhaseReady SystemPhase = "Ready"
 )
 
-// ConditionType is a simple string type.
-// Types should be used from the enum below.
-type ConditionType string
-
 // These are the valid conditions types and statuses:
 const (
-	ConditionTypePhase ConditionType = "Phase"
+	ConditionTypeKMSStatus conditionsv1.ConditionType = "KMS-Status"
+	ConditionTypeKMSType   conditionsv1.ConditionType = "KMS-Type"
 )
 
-// ConditionStatus is a simple string type.
-// In addition to the generic True/False/Unknown it also can accept SystemPhase enums
-type ConditionStatus string
-
-// These are general valid condition statuses. "ConditionTrue" means a resource is in the condition.
-// "ConditionFalse" means a resource is not in the condition. "ConditionUnknown" means kubernetes
-// can't decide if a resource is in the condition or not. In the future, we could add other
-// intermediate conditions, e.g. ConditionDegraded.
+// These are NooBaa condition statuses
 const (
-	ConditionTrue    ConditionStatus = "True"
-	ConditionFalse   ConditionStatus = "False"
-	ConditionUnknown ConditionStatus = "Unknown"
+	// External KMS initialized
+	ConditionKMSInit corev1.ConditionStatus = "Init"
+
+	// The root key was synchronized from external KMS
+	ConditionKMSSync corev1.ConditionStatus = "Sync"
+
+	// The root key was rotated
+	ConditionKMSKeyRotate corev1.ConditionStatus = "KeyRotate"
+
+	// Invalid external KMS definition
+	ConditionKMSInvalid corev1.ConditionStatus = "Invalid"
+
+	// Error reading secret from external KMS
+	ConditionKMSErrorRead corev1.ConditionStatus = "ErrorRead"
+
+	// Error writing initial root key to external KMS
+	ConditionKMSErrorWrite corev1.ConditionStatus = "ErrorWrite"
+
+	// Error in data format, internal error
+	ConditionKMSErrorData corev1.ConditionStatus = "ErrorData"
+
+	// Error in data format, internal error
+	ConditionKMSErrorSecretReconcile corev1.ConditionStatus = "ErrorSecretReconcile"
 )
 
 // AccountsStatus is the status info of admin account
@@ -288,6 +401,8 @@ type AccountsStatus struct {
 type ServicesStatus struct {
 	ServiceMgmt ServiceStatus `json:"serviceMgmt"`
 	ServiceS3   ServiceStatus `json:"serviceS3"`
+	// +optional
+	ServiceSts ServiceStatus `json:"serviceSts,omitempty"`
 }
 
 // UserStatus is the status info of a user secret
@@ -362,6 +477,9 @@ const (
 // CleanupPolicySpec specifies the cleanup policy
 type CleanupPolicySpec struct {
 	Confirmation CleanupConfirmationProperty `json:"confirmation,omitempty"`
+
+	// +optional
+	AllowNoobaaDeletion bool `json:"allowNoobaaDeletion,omitempty"`
 }
 
 // CleanupConfirmationProperty is a string that specifies cleanup confirmation
@@ -376,6 +494,9 @@ const (
 
 	// DeleteOBCConfirmation represents the validation to destry obc
 	DeleteOBCConfirmation CleanupConfirmationProperty = "yes-really-destroy-obc"
+
+	// SkipTopologyConstraints is Annotation name for disabling default topology Constraints
+	SkipTopologyConstraints = "noobaa.io/skip_topology_spread_constraints"
 )
 
 // DBTypes is a string enum type for specify the types of DB that are supported.
@@ -387,4 +508,15 @@ const (
 	DBTypeMongo DBTypes = "mongodb"
 	// DBTypePostgres is postgres
 	DBTypePostgres DBTypes = "postgres"
+)
+
+// AutoscalerTypes is a string enum type for specifying the types of autoscaling supported.
+type AutoscalerTypes string
+
+// These are the valid AutoscalerTypes types:
+const (
+	// AutoscalerTypeKeda is keda
+	AutoscalerTypeKeda AutoscalerTypes = "keda"
+	// AutoscalerTypeHPAV2 is hpav2
+	AutoscalerTypeHPAV2 AutoscalerTypes = "hpav2"
 )

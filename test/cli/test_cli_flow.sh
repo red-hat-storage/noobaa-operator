@@ -6,74 +6,71 @@ export PS4='\e[36m+ ${FUNCNAME:-main}\e[0m@\e[32m${BASH_SOURCE}:\e[35m${LINENO} 
 #Also assuming aws cli is installed
 
 NAMESPACE='test'
-
-#FLOW TODO:
-# # AWS-S3 ❌
-# nb backingstore create aws-s3 aws1 --target-bucket znoobaa --access-key $AWS_ACCESS_KEY_ID --secret-key $AWS_SECRET_ACCESS_KEY ❌
-# nb backingstore create aws-s3 aws2 --target-bucket noobaa-qa --access-key $AWS_ACCESS_KEY_ID --secret-key $AWS_SECRET_ACCESS_KEY ❌
-# nb backingstore status aws1 ❌
-# nb backingstore status aws2 ❌
-# nb backingstore list ❌
-# nb status ❌
-# kubectl get backingstore ❌
-# kubectl describe backingstore ❌
-
-# # Google - TODO ❌
-# nb backingstore create azure-blob blob1 --target-blob-container jacky-container --account-name $AZURE_ACCOUNT_NAME --account-key $AZURE_ACCOUNT_KEY
-
-# # Azure - TODO ❌
-# nb backingstore create google-cloud-storage google1 --target-bucket jacky-bucket --private-key-json-file ~/Downloads/noobaa-test-1-d462775d1e1a.json
-
-# # BucketClass ❌
-# nb bucketclass create class1 --backingstores nb1 ✅
-# nb bucketclass create class2 --placement Mirror --backingstores nb1,aws1 ❌
-# nb bucketclass create class3 --placement Spread --backingstores aws1,aws2 ❌
-# nb bucketclass create class4 --backingstores nb1,nb2 ✅
-# nb bucketclass status class1 ✅
-# nb bucketclass status class2 ✅
-# nb bucketclass list ✅
-# nb status ✅
-# kubectl get bucketclass ✅
-# kubectl describe bucketclass ✅
-
-# # OBC ❌
-# nb obc create buck1 --bucketclass class1 ✅
-# nb obc create buck2 --bucketclass class2 ❌
-# nb obc create buck3 --bucketclass class3 --app-namespace default ❌
-# nb obc create buck4 --bucketclass class4 ✅
-# nb obc list ✅
-# # nb obc status buck1 ✅
-# # nb obc status buck2 ✅
-# # nb obc status buck3 ✅
-# kubectl get obc ✅
-# kubectl describe obc ✅
-# kubectl get obc,ob,secret,cm -l noobaa-obc ✅
-
-# AWS_ACCESS_KEY_ID=XXX AWS_SECRET_ACCESS_KEY=YYY aws s3 --endpoint-url XXX ls BUCKETNAME ❌
+CM=false
+RESOURCE='mini'
 
 function post_install_tests {
     aws_credentials
+    check_pv_pool_resources
     check_S3_compatible
     check_namespacestore
+    create_replication_files
     bucketclass_cycle
+    bz_2038884
     obc_cycle
+    replication_cycle
+    check_backingstore
+    # check_dbdump
+    account_cycle
     check_deletes
+    delete_replication_files
+    check_pgdb_config_override
+    test_noobaa_cr_deletion
+    test_noobaa_loadbalancer_source_subnet
+    test_multinamespace_bucketclass
+    check_default_backingstore #It deletes all the buckets and non-default accounts, creates new backingstore and attach it to default admin account and then deletes default backingstore
 }
 
 function main {
-    noobaa_install
-    post_install_tests
-    noobaa_uninstall
+    local install_external=$((RANDOM%3))
+    install_external=2
+    if [ ${install_external} -eq 0 ]
+    then
+        noobaa_install_external
+    else
+        if [ ${install_external} -eq 1 ]
+        then
+            noobaa_install_external_ssl
+        else
+            noobaa_install
+        fi
+    fi
+    if [ "${CM}" == "true" ]
+    then
+        check_core_config_map
+    else
+        post_install_tests
+    fi
+    if [ ${install_external} -eq 0 ]
+    then
+        delete_external_postgres
+    else
+        if [ ${install_external} -eq 1 ]
+        then
+            delete_external_postgres_ssl
+        fi
+    fi 
  }
 
 function usage {
     set +x
     echo -e "\nUsage: ${0} [options]"
-    echo "--namespace       -   Change the namespace (default: ${NAMESPACE})"
-    echo "--mongo-image     -   Change the mongo image"
-    echo "--noobaa-image    -   Change the noobaa image"
-    echo "--operator-image  -   Change the operator image"
-    echo -e "--help         -   print this help\n"
+    echo "--namespace             -   Change the namespace (default: ${NAMESPACE})"
+    echo "--mongo-image           -   Change the mongo image"
+    echo "--noobaa-image          -   Change the noobaa image"
+    echo "--operator-image        -   Change the operator image"
+    echo "--check_core_config_map -   Check Only core config map"
+    echo -e "--help               -   print this help\n"
     exit 1
 }
 
@@ -101,16 +98,22 @@ do
     fi
 
     case ${1} in
-        --mongo-image)      MONGO_IMAGE=${2}
-                            shift 2;;
-        --noobaa-image)     NOOBAA_IMAGE=${2}
-                            shift 2;;
-        --operator-image)   OPERATOR_IMAGE=${2}
-                            shift 2;;
-        -n|--namespace)     NAMESPACE=${2}
-                            shift 2;;
-        -h|--help)          usage;;
-        *)                  usage;;
+        --mongo-image)           MONGO_IMAGE=${2}
+                                 shift 2;;
+        --noobaa-image)          NOOBAA_IMAGE=${2}
+                                 shift 2;;
+        --operator-image)        OPERATOR_IMAGE=${2}
+                                 shift 2;;
+        -n|--namespace)          NAMESPACE=${2}
+                                 shift 2;;
+        --check_core_config_map) CM=true
+                                 shift;;
+        --dev)                   RESOURCE='dev'
+                                 shift;;
+        --mini)                  RESOURCE='mini'
+                                 shift;;      
+        -h|--help)               usage;;
+        *)                       usage;;
     esac
 done
 
