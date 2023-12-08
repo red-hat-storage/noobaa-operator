@@ -138,6 +138,16 @@ func RunUpgrade(cmd *cobra.Command, args []string) {
 		c.Deployment.Spec.Template.Spec.Containers[0].Env = operatorContainer.Env
 	}
 
+	AWSSTSARNEnv, _ := cmd.Flags().GetString("aws-sts-arn")
+	if AWSSTSARNEnv != "" {
+		operatorContainer := c.Deployment.Spec.Template.Spec.Containers[0]
+		operatorContainer.Env = append(operatorContainer.Env, corev1.EnvVar{
+			Name:  "ROLEARN",
+			Value: AWSSTSARNEnv,
+		})
+		c.Deployment.Spec.Template.Spec.Containers[0].Env = operatorContainer.Env
+	}
+
 	noDeploy, _ := cmd.Flags().GetBool("no-deploy")
 	if !noDeploy {
 		operatorContainer := c.Deployment.Spec.Template.Spec.Containers[0]
@@ -196,6 +206,16 @@ func RunInstall(cmd *cobra.Command, args []string) {
 		operatorContainer.Env = append(operatorContainer.Env, corev1.EnvVar{
 			Name:  "ENABLE_NOOBAA_ADMISSION",
 			Value: "true",
+		})
+		c.Deployment.Spec.Template.Spec.Containers[0].Env = operatorContainer.Env
+	}
+
+	AWSSTSARNEnv, _ := cmd.Flags().GetString("aws-sts-arn")
+	if AWSSTSARNEnv != "" {
+		operatorContainer := c.Deployment.Spec.Template.Spec.Containers[0]
+		operatorContainer.Env = append(operatorContainer.Env, corev1.EnvVar{
+			Name:  "ROLEARN",
+			Value: AWSSTSARNEnv,
 		})
 		c.Deployment.Spec.Template.Spec.Containers[0].Env = operatorContainer.Env
 	}
@@ -333,7 +353,7 @@ type Conf struct {
 	SAUI                 *corev1.ServiceAccount
 	Role                 *rbacv1.Role
 	RoleEndpoint         *rbacv1.Role
-	RoleUI               *rbacv1.Role
+	RoleUI               *rbacv1.ClusterRole
 	RoleBinding          *rbacv1.RoleBinding
 	RoleBindingEndpoint  *rbacv1.RoleBinding
 	ClusterRole          *rbacv1.ClusterRole
@@ -354,7 +374,7 @@ func LoadOperatorConf(cmd *cobra.Command) *Conf {
 	c.SAUI = util.KubeObject(bundle.File_deploy_service_account_ui_yaml).(*corev1.ServiceAccount)
 	c.Role = util.KubeObject(bundle.File_deploy_role_yaml).(*rbacv1.Role)
 	c.RoleEndpoint = util.KubeObject(bundle.File_deploy_role_endpoint_yaml).(*rbacv1.Role)
-	c.RoleUI = util.KubeObject(bundle.File_deploy_role_ui_yaml).(*rbacv1.Role)
+	c.RoleUI = util.KubeObject(bundle.File_deploy_role_ui_yaml).(*rbacv1.ClusterRole)
 	c.RoleBinding = util.KubeObject(bundle.File_deploy_role_binding_yaml).(*rbacv1.RoleBinding)
 	c.RoleBindingEndpoint = util.KubeObject(bundle.File_deploy_role_binding_endpoint_yaml).(*rbacv1.RoleBinding)
 	c.ClusterRole = util.KubeObject(bundle.File_deploy_cluster_role_yaml).(*rbacv1.ClusterRole)
