@@ -1,10 +1,13 @@
 package system
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,8 +19,10 @@ import (
 	"github.com/noobaa/noobaa-operator/v5/version"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,6 +45,7 @@ func Cmd() *cobra.Command {
 		CmdCreate(),
 		CmdDelete(),
 		CmdStatus(),
+		CmdSetDebugLevel(),
 		CmdList(),
 		CmdReconcile(),
 		CmdYaml(),
@@ -47,12 +53,15 @@ func Cmd() *cobra.Command {
 	return cmd
 }
 
+var ctx = context.TODO()
+
 // CmdCreate returns a CLI command
 func CmdCreate() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create a noobaa system",
 		Run:   RunCreate,
+		Args:  cobra.NoArgs,
 	}
 	cmd.Flags().String("core-resources", "", "Core resources JSON")
 	cmd.Flags().String("db-resources", "", "DB resources JSON")
@@ -67,6 +76,7 @@ func CmdDelete() *cobra.Command {
 		Use:   "delete",
 		Short: "Delete a noobaa system",
 		Run:   RunDelete,
+		Args:  cobra.NoArgs,
 	}
 	cmd.Flags().Bool("cleanup_data", false, "clean object buckets")
 	return cmd
@@ -78,6 +88,7 @@ func CmdList() *cobra.Command {
 		Use:   "list",
 		Short: "List noobaa systems",
 		Run:   RunList,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -88,6 +99,18 @@ func CmdStatus() *cobra.Command {
 		Use:   "status",
 		Short: "Status of a noobaa system",
 		Run:   RunStatus,
+		Args:  cobra.NoArgs,
+	}
+	return cmd
+}
+
+// CmdSetDebugLevel returns a CLI command
+func CmdSetDebugLevel() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "set-debug-level <level>",
+		Short: "Sets core and endpoints debug level. level can be 'warn' or 0-5",
+		Run:   RunSetDebugLevel,
+		Args:  cobra.ExactArgs(1),
 	}
 	return cmd
 }
@@ -99,6 +122,7 @@ func CmdReconcile() *cobra.Command {
 		Use:    "reconcile",
 		Short:  "Runs a reconcile attempt like noobaa-operator",
 		Run:    RunReconcile,
+		Args:   cobra.NoArgs,
 	}
 	return cmd
 }
@@ -109,6 +133,7 @@ func CmdYaml() *cobra.Command {
 		Use:   "yaml",
 		Short: "Show bundled noobaa yaml",
 		Run:   RunYaml,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -122,8 +147,19 @@ func LoadSystemDefaults() *nbv1.NooBaa {
 	sys.Finalizers = []string{nbv1.GracefulFinalizer}
 	dbType := options.DBType
 	sys.Spec.DBType = nbv1.DBTypes(dbType)
-	sys.Spec.DebugLevel = options.DebugLevel
+	sys.Spec.DisableLoadBalancerService = options.DisableLoadBalancerService
+	sys.Spec.ManualDefaultBackingStore = options.ManualDefaultBackingStore
+	sys.Spec.LoadBalancerSourceSubnets.S3 = options.S3LoadBalancerSourceSubnets
+	sys.Spec.LoadBalancerSourceSubnets.STS = options.STSLoadBalancerSourceSubnets
 
+	LoadConfigMapFromFlags()
+
+	if options.AutoscalerType != "" {
+		sys.Spec.Autoscaler.AutoscalerType = nbv1.AutoscalerTypes(options.AutoscalerType)
+	}
+	if options.PrometheusNamespace != "" {
+		sys.Spec.Autoscaler.PrometheusNamespace = options.PrometheusNamespace
+	}
 	if options.NooBaaImage != "" {
 		image := options.NooBaaImage
 		sys.Spec.Image = &image
@@ -155,6 +191,23 @@ func LoadSystemDefaults() *nbv1.NooBaa {
 		mongoDbURL := options.MongoDbURL
 		sys.Spec.MongoDbURL = mongoDbURL
 	}
+	if options.PostgresDbURL != "" {
+		sys.Spec.ExternalPgSecret = &corev1.SecretReference{
+			Name:      "noobaa-external-pg-db",
+			Namespace: sys.Namespace,
+		}
+
+		sys.Spec.ExternalPgSSLRequired = options.PostgresSSLRequired
+		sys.Spec.ExternalPgSSLUnauthorized = options.PostgresSSLSelfSigned
+
+		if options.PostgresSSLCert != "" && options.PostgresSSLKey != "" {
+			sys.Spec.ExternalPgSSLSecret = &corev1.SecretReference{
+				Name:      "noobaa-external-db-cert",
+				Namespace: sys.Namespace,
+			}
+		}
+	}
+
 	if options.PVPoolDefaultStorageClass != "" {
 		sc := options.PVPoolDefaultStorageClass
 		sys.Spec.PVPoolDefaultStorageClass = &sc
@@ -188,6 +241,103 @@ func LoadSystemDefaults() *nbv1.NooBaa {
 				Limits:   endpointResourceList,
 			}}
 	}
+	if options.DevEnv {
+		coreResourceList := corev1.ResourceList{
+			corev1.ResourceCPU:    *resource.NewScaledQuantity(int64(500), resource.Milli),
+			corev1.ResourceMemory: *resource.NewScaledQuantity(int64(1), resource.Giga),
+		}
+		dbResourceList := corev1.ResourceList{
+			corev1.ResourceCPU:    *resource.NewScaledQuantity(int64(1000), resource.Milli),
+			corev1.ResourceMemory: *resource.NewScaledQuantity(int64(2), resource.Giga),
+		}
+		endpointResourceList := corev1.ResourceList{
+			corev1.ResourceCPU:    *resource.NewScaledQuantity(int64(500), resource.Milli),
+			corev1.ResourceMemory: *resource.NewScaledQuantity(int64(500), resource.Mega),
+		}
+		sys.Spec.CoreResources = &corev1.ResourceRequirements{
+			Requests: coreResourceList,
+			Limits:   coreResourceList,
+		}
+		sys.Spec.DBResources = &corev1.ResourceRequirements{
+			Requests: dbResourceList,
+			Limits:   dbResourceList,
+		}
+		sys.Spec.Endpoints = &nbv1.EndpointsSpec{
+			MinCount: 1,
+			MaxCount: 1,
+			Resources: &corev1.ResourceRequirements{
+				Requests: endpointResourceList,
+				Limits:   endpointResourceList,
+			},
+		}
+	}
+	for _, componentName := range []string{"core", "db", "endpoints"} {
+		if viper.IsSet(fmt.Sprintf("resources.%s", componentName)) {
+			var component *corev1.ResourceRequirements
+
+			if componentName == "core" {
+				if sys.Spec.CoreResources == nil {
+					sys.Spec.CoreResources = &corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{},
+						Limits:   corev1.ResourceList{},
+					}
+				}
+				component = sys.Spec.CoreResources
+			} else if componentName == "db" {
+				if sys.Spec.DBResources == nil {
+					sys.Spec.DBResources = &corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{},
+						Limits:   corev1.ResourceList{},
+					}
+				}
+				component = sys.Spec.DBResources
+			} else if componentName == "endpoints" {
+				if sys.Spec.Endpoints == nil {
+					sys.Spec.Endpoints = &nbv1.EndpointsSpec{
+						MinCount: viper.GetInt32("resources.endpoints.minCount"),
+						MaxCount: viper.GetInt32("resources.endpoints.maxCount"),
+						Resources: &corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{},
+							Limits:   corev1.ResourceList{},
+						},
+					}
+				} else {
+					if viper.IsSet("resources.endpoints.minCount") {
+						sys.Spec.Endpoints.MinCount = viper.GetInt32("resources.endpoints.minCount")
+					}
+
+					if viper.IsSet("resources.endpoints.maxCount") {
+						sys.Spec.Endpoints.MaxCount = viper.GetInt32("resources.endpoints.maxCount")
+					}
+				}
+
+				component = sys.Spec.Endpoints.Resources
+			}
+
+			if viper.IsSet(fmt.Sprintf("resources.%s.cpuMilli", componentName)) {
+				component.Requests[corev1.ResourceCPU] = *resource.NewScaledQuantity(
+					int64(viper.GetInt(fmt.Sprintf("resources.%s.cpuMilli", componentName))),
+					resource.Milli,
+				)
+
+				component.Limits[corev1.ResourceCPU] = *resource.NewScaledQuantity(
+					int64(viper.GetInt(fmt.Sprintf("resources.%s.cpuMilli", componentName))),
+					resource.Milli,
+				)
+			}
+			if viper.IsSet(fmt.Sprintf("resources.%s.memoryMB", componentName)) {
+				component.Requests[corev1.ResourceMemory] = *resource.NewScaledQuantity(
+					int64(viper.GetInt(fmt.Sprintf("resources.%s.memoryMB", componentName))),
+					resource.Mega,
+				)
+				component.Limits[corev1.ResourceMemory] = *resource.NewScaledQuantity(
+					int64(viper.GetInt(fmt.Sprintf("resources.%s.memoryMB", componentName))),
+					resource.Mega,
+				)
+			}
+		}
+	}
+
 	return sys
 }
 
@@ -211,6 +361,7 @@ func RunCreate(cmd *cobra.Command, args []string) {
 	dbResourcesJSON, _ := cmd.Flags().GetString("db-resources")
 	endpointResourcesJSON, _ := cmd.Flags().GetString("endpoint-resources")
 	useOBCCleanupPolicy, _ := cmd.Flags().GetBool("use-obc-cleanup-policy")
+
 	if useOBCCleanupPolicy {
 		sys.Spec.CleanupPolicy.Confirmation = nbv1.DeleteOBCConfirmation
 	}
@@ -235,10 +386,68 @@ func RunCreate(cmd *cobra.Command, args []string) {
 		log.Fatalf(`❌ %s`, err)
 	}
 
+	if options.PostgresDbURL != "" {
+		if sys.Spec.MongoDbURL != "" {
+			log.Fatalf("❌ Can't use both options: postgres-url and mongodb-url, please use only one")
+		}
+		if sys.Spec.DBType != "postgres" {
+			log.Fatalf("❌ expecting the DBType to be postgres when using external PostgresDbURL, got %s", sys.Spec.DBType)
+		}
+		if (options.PostgresSSLCert != "" && options.PostgresSSLKey == "") ||
+			(options.PostgresSSLCert == "" && options.PostgresSSLKey != "") {
+			log.Fatalf("❌ Can't provide only ssl-cert or only ssl-key - please provide both!")
+		}
+		err = CheckPostgresURL(options.PostgresDbURL)
+		if err != nil {
+			log.Fatalf(`❌ %s`, err)
+		}
+		o := util.KubeObject(bundle.File_deploy_internal_secret_empty_yaml)
+		secret := o.(*corev1.Secret)
+		secret.Namespace = sys.Spec.ExternalPgSecret.Namespace
+		secret.Name = sys.Spec.ExternalPgSecret.Name
+		secret.StringData = map[string]string{
+			"db_url": options.PostgresDbURL,
+		}
+		secret.Data = nil
+		util.KubeCreateSkipExisting(secret)
+		if sys.Spec.ExternalPgSSLSecret != nil {
+			secretData := make(map[string][]byte)
+			data, err := os.ReadFile(options.PostgresSSLKey)
+			if err != nil {
+				log.Fatalf("❌ Can't open key file %q please try again, error: %s", options.PostgresSSLKey, err)
+			}
+			secretData["tls.key"] = data
+			data, err = os.ReadFile(options.PostgresSSLCert)
+			if err != nil {
+				log.Fatalf("❌ Can't open cert file %q please try again, error: %s", options.PostgresSSLKey, err)
+			}
+			secretData["tls.crt"] = data
+			o := util.KubeObject(bundle.File_deploy_internal_secret_empty_yaml)
+			secret := o.(*corev1.Secret)
+			secret.Namespace = sys.Spec.ExternalPgSSLSecret.Namespace
+			secret.Name = sys.Spec.ExternalPgSSLSecret.Name
+			secret.Data = secretData
+			util.KubeCreateSkipExisting(secret)
+		}
+	}
+
 	// TODO check PVC if exist and the system does not exist -
 	// fail and suggest to delete them first with cli system delete.
 	util.KubeCreateSkipExisting(ns)
 	util.KubeCreateSkipExisting(sys)
+}
+
+// RunUpgrade runs a CLI command
+func RunUpgrade(cmd *cobra.Command, args []string) {
+	// Template the a system CR with an upgraded core image.
+	// We currently opt to not upgrade the DB image as part of this process to prevent complications.
+	sys := util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_noobaa_cr_yaml).(*nbv1.NooBaa)
+	if options.NooBaaImage != "" {
+		image := options.NooBaaImage
+		sys.Spec.Image = &image
+		sys.Namespace = options.Namespace
+	}
+	util.KubeApply(sys)
 }
 
 // RunDelete runs a CLI command
@@ -257,13 +466,17 @@ func RunDelete(cmd *cobra.Command, args []string) {
 
 	log.Infof("Notice: Deletion of External secrets should be preformed manually")
 
+	if err := SetAllowNoobaaDeletion(sys); err != nil {
+		log.Errorf("NooBaa %q failed to update cleanup policy - deletion may fail", options.SystemName)
+	}
+
 	cleanupData, _ := cmd.Flags().GetBool("cleanup_data")
 	objectBuckets := &nbv1.ObjectBucketList{}
 	obcSelector, _ := labels.Parse("noobaa-domain=" + options.SubDomainNS())
 	util.KubeList(objectBuckets, &client.ListOptions{LabelSelector: obcSelector})
 	finalizersArray := sys.GetFinalizers()
 
-	if util.Contains(nbv1.GracefulFinalizer, finalizersArray) {
+	if util.Contains(finalizersArray, nbv1.GracefulFinalizer) {
 
 		confirm := sys.Spec.CleanupPolicy.Confirmation
 		if !cleanupData && len(objectBuckets.Items) != 0 && confirm != nbv1.DeleteOBCConfirmation {
@@ -271,7 +484,12 @@ func RunDelete(cmd *cobra.Command, args []string) {
 
 		} else {
 			log.Infof("Deleting All object buckets in namespace %q", options.Namespace)
-
+			// deletion of OBCSC
+			sc := &storagev1.StorageClass{}
+			sc.Name = options.SubDomainNS()
+			if err := util.DeleteStorageClass(sc); err != nil {
+				log.Errorf("failed to delete storageclass %q", sc.Name)
+			}
 			util.RemoveFinalizer(sys, nbv1.GracefulFinalizer)
 			if !util.KubeUpdate(sys) {
 				log.Errorf("NooBaa %q failed to remove finalizer %q", options.SystemName, nbv1.GracefulFinalizer)
@@ -282,9 +500,20 @@ func RunDelete(cmd *cobra.Command, args []string) {
 	isMongoDbURL := sys.Spec.MongoDbURL
 	util.KubeDelete(sys)
 
-	if isMongoDbURL == "" {
+	if sys.Spec.ExternalPgSecret != nil {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      sys.Spec.ExternalPgSecret.Name,
+				Namespace: sys.Spec.ExternalPgSecret.Namespace,
+			},
+		}
+		util.KubeDelete(secret)
+	} else if isMongoDbURL == "" {
 		// NoobaaDB
 		noobaaDB := util.KubeObject(bundle.File_deploy_internal_statefulset_db_yaml).(*appsv1.StatefulSet)
+		if sys.Spec.DBType == "postgres" {
+			noobaaDB = util.KubeObject(bundle.File_deploy_internal_statefulset_postgres_db_yaml).(*appsv1.StatefulSet)
+		}
 		for i := range noobaaDB.Spec.VolumeClaimTemplates {
 			t := &noobaaDB.Spec.VolumeClaimTemplates[i]
 			pvc := &corev1.PersistentVolumeClaim{
@@ -372,6 +601,12 @@ func RunDelete(cmd *cobra.Command, args []string) {
 		}
 		util.KubeDelete(obj, client.GracePeriodSeconds(0))
 	}
+	//delete keda resources
+	deleteKedaResources(options.Namespace)
+	//delete HPAV2 resources
+	if err := deleteHPAV2Resources(options.Namespace); err != nil {
+		log.Errorf("falied to delete HPAV2 Resources : %s", err)
+	}
 }
 
 // RunList runs a CLI command
@@ -390,8 +625,8 @@ func RunList(cmd *cobra.Command, args []string) {
 	table := (&util.PrintTable{}).AddRow(
 		"NAMESPACE",
 		"NAME",
-		"MGMT-ENDPOINTS",
 		"S3-ENDPOINTS",
+		"STS-ENDPOINTS",
 		"IMAGE",
 		"PHASE",
 		"AGE",
@@ -401,11 +636,11 @@ func RunList(cmd *cobra.Command, args []string) {
 		table.AddRow(
 			s.Namespace,
 			s.Name,
-			fmt.Sprint(s.Status.Services.ServiceMgmt.NodePorts),
 			fmt.Sprint(s.Status.Services.ServiceS3.NodePorts),
+			fmt.Sprint(s.Status.Services.ServiceSts.NodePorts),
 			s.Status.ActualImage,
 			string(s.Status.Phase),
-			time.Since(s.CreationTimestamp.Time).Round(time.Second).String(),
+			util.HumanizeDuration(time.Since(s.CreationTimestamp.Time).Round(time.Second)),
 		)
 	}
 	fmt.Print(table.String())
@@ -490,7 +725,9 @@ func RunSystemVersionsStatus(cmd *cobra.Command, args []string) {
 
 	if isSystemExists {
 		noobaaImage = CheckNooBaaImages(cmd, sys, args)
-		noobaaDbImage = CheckNooBaaDBImages(cmd, sys, args)
+		if sys.Spec.ExternalPgSecret == nil {
+			noobaaDbImage = CheckNooBaaDBImages(cmd, sys, args)
+		}
 		noobaaOperatorImage = CheckOperatorImage(cmd, args)
 	} else {
 		noobaaImage = options.NooBaaImage
@@ -505,7 +742,9 @@ func RunSystemVersionsStatus(cmd *cobra.Command, args []string) {
 	log.Printf("CLI version: %s\n", version.Version)
 	log.Printf("noobaa-image: %s\n", noobaaImage)
 	log.Printf("operator-image: %s\n", noobaaOperatorImage)
-	log.Printf("noobaa-db-image: %s\n", noobaaDbImage)
+	if options.PostgresDbURL == "" && sys.Spec.ExternalPgSecret == nil {
+		log.Printf("noobaa-db-image: %s\n", noobaaDbImage)
+	}
 }
 
 // RunStatus runs a CLI command
@@ -523,7 +762,7 @@ func RunStatus(cmd *cobra.Command, args []string) {
 		NooBaaDB = r.NooBaaMongoDB
 	}
 	// create the mongo db only if mongo db url is not given.
-	if r.NooBaa.Spec.MongoDbURL == "" {
+	if r.NooBaa.Spec.MongoDbURL == "" && r.NooBaa.Spec.ExternalPgSecret == nil {
 		// NoobaaDB
 		for i := range NooBaaDB.Spec.VolumeClaimTemplates {
 			t := &NooBaaDB.Spec.VolumeClaimTemplates[i]
@@ -552,25 +791,24 @@ func RunStatus(cmd *cobra.Command, args []string) {
 	util.KubeCheck(secret)
 
 	fmt.Println("")
-	fmt.Println("#------------------#")
-	fmt.Println("#- Mgmt Addresses -#")
-	fmt.Println("#------------------#")
-	fmt.Println("")
-
-	fmt.Println("ExternalDNS :", r.NooBaa.Status.Services.ServiceMgmt.ExternalDNS)
-	fmt.Println("ExternalIP  :", r.NooBaa.Status.Services.ServiceMgmt.ExternalIP)
-	fmt.Println("NodePorts   :", r.NooBaa.Status.Services.ServiceMgmt.NodePorts)
-	fmt.Println("InternalDNS :", r.NooBaa.Status.Services.ServiceMgmt.InternalDNS)
-	fmt.Println("InternalIP  :", r.NooBaa.Status.Services.ServiceMgmt.InternalIP)
-	fmt.Println("PodPorts    :", r.NooBaa.Status.Services.ServiceMgmt.PodPorts)
+	if options.ShowSecrets {
+		fmt.Printf("%s password : %s\n", secret.StringData["email"], secret.StringData["password"])
+	} else {
+		fmt.Printf("%s password : %s\n", secret.StringData["email"], nb.MaskedString(secret.StringData["password"]))
+	}
 
 	fmt.Println("")
-	fmt.Println("#--------------------#")
-	fmt.Println("#- Mgmt Credentials -#")
-	fmt.Println("#--------------------#")
+	fmt.Println("#-----------------#")
+	fmt.Println("#- STS Addresses -#")
+	fmt.Println("#-----------------#")
 	fmt.Println("")
-	fmt.Printf("email    : %s\n", secret.StringData["email"])
-	fmt.Printf("password : %s\n", secret.StringData["password"])
+
+	util.PrettyPrint("ExternalDNS", r.NooBaa.Status.Services.ServiceSts.ExternalDNS)
+	fmt.Println("ExternalIP  :", r.NooBaa.Status.Services.ServiceSts.ExternalIP)
+	fmt.Println("NodePorts   :", r.NooBaa.Status.Services.ServiceSts.NodePorts)
+	fmt.Println("InternalDNS :", r.NooBaa.Status.Services.ServiceSts.InternalDNS)
+	fmt.Println("InternalIP  :", r.NooBaa.Status.Services.ServiceSts.InternalIP)
+	fmt.Println("PodPorts    :", r.NooBaa.Status.Services.ServiceSts.PodPorts)
 
 	fmt.Println("")
 	fmt.Println("#----------------#")
@@ -578,7 +816,7 @@ func RunStatus(cmd *cobra.Command, args []string) {
 	fmt.Println("#----------------#")
 	fmt.Println("")
 
-	fmt.Println("ExternalDNS :", r.NooBaa.Status.Services.ServiceS3.ExternalDNS)
+	util.PrettyPrint("ExternalDNS", r.NooBaa.Status.Services.ServiceS3.ExternalDNS)
 	fmt.Println("ExternalIP  :", r.NooBaa.Status.Services.ServiceS3.ExternalIP)
 	fmt.Println("NodePorts   :", r.NooBaa.Status.Services.ServiceS3.NodePorts)
 	fmt.Println("InternalDNS :", r.NooBaa.Status.Services.ServiceS3.InternalDNS)
@@ -590,17 +828,54 @@ func RunStatus(cmd *cobra.Command, args []string) {
 	fmt.Println("#- S3 Credentials -#")
 	fmt.Println("#------------------#")
 	fmt.Println("")
-	fmt.Printf("AWS_ACCESS_KEY_ID     : %s\n", secret.StringData["AWS_ACCESS_KEY_ID"])
-	fmt.Printf("AWS_SECRET_ACCESS_KEY : %s\n", secret.StringData["AWS_SECRET_ACCESS_KEY"])
+	if options.ShowSecrets {
+		fmt.Printf("AWS_ACCESS_KEY_ID     : %s\n", secret.StringData["AWS_ACCESS_KEY_ID"])
+		fmt.Printf("AWS_SECRET_ACCESS_KEY : %s\n", secret.StringData["AWS_SECRET_ACCESS_KEY"])
+	} else {
+		fmt.Printf("AWS_ACCESS_KEY_ID     : %s\n", nb.MaskedString(secret.StringData["AWS_ACCESS_KEY_ID"]))
+		fmt.Printf("AWS_SECRET_ACCESS_KEY : %s\n", nb.MaskedString(secret.StringData["AWS_SECRET_ACCESS_KEY"]))
+	}
 	fmt.Println("")
+
+}
+
+// RunSetDebugLevel sets the system debug level
+func RunSetDebugLevel(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+	level := 0
+	if args[0] == "warn" {
+		level = -1
+	} else {
+		var err error
+		level, err = strconv.Atoi(args[0])
+		if err != nil || level < 0 || level > 5 {
+			log.Fatalf(`invalid debug-level argument. must be 'warn' or 0 to 5. %s`, cmd.UsageString())
+		}
+	}
+	nbClient := GetNBClient()
+	err := nbClient.PublishToCluster(nb.PublishToClusterParams{
+		Target:     "",
+		MethodAPI:  "debug_api",
+		MethodName: "set_debug_level",
+		RequestParams: nb.SetDebugLevelParams{
+			Module: "core",
+			Level:  level,
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("")
+	fmt.Printf("Debug level was set to %s successfully\n", args[0])
+	fmt.Println("Debug level is not persistent and is only effective for the currently running core and endpoints pods")
 }
 
 // RunReconcile runs a CLI command
 func RunReconcile(cmd *cobra.Command, args []string) {
 	log := util.Logger()
 	klient := util.KubeClient()
-	intervalSec := time.Duration(3)
-	util.Panic(wait.PollImmediateInfinite(intervalSec*time.Second, func() (bool, error) {
+	interval := time.Duration(3)
+	util.Panic(wait.PollUntilContextCancel(ctx, interval*time.Second, true, func(ctx context.Context) (bool, error) {
 		req := reconcile.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: options.Namespace,
@@ -612,7 +887,7 @@ func RunReconcile(cmd *cobra.Command, args []string) {
 			return false, err
 		}
 		if res.Requeue || res.RequeueAfter != 0 {
-			log.Printf("\nRetrying in %d seconds\n", intervalSec)
+			log.Printf("\nRetrying in %d seconds\n", interval)
 			return false, nil
 		}
 		return true, nil
@@ -625,9 +900,9 @@ func WaitReady() bool {
 	klient := util.KubeClient()
 
 	sysKey := client.ObjectKey{Namespace: options.Namespace, Name: options.SystemName}
-	intervalSec := time.Duration(3)
+	interval := time.Duration(3)
 
-	err := wait.PollImmediateInfinite(intervalSec*time.Second, func() (bool, error) {
+	err := wait.PollUntilContextCancel(ctx, interval*time.Second, true, func(ctx context.Context) (bool, error) {
 		sys := &nbv1.NooBaa{}
 		err := klient.Get(util.Context(), sysKey, sys)
 		if err != nil {
@@ -881,20 +1156,60 @@ func Connect(isExternal bool) (*Client, error) {
 	}, nil
 }
 
+// GetDesiredDBImage returns the desired DB image according to spec or env or default (in options)
+func GetDesiredDBImage(sys *nbv1.NooBaa) string {
+	if sys.Spec.DBImage != nil {
+		return *sys.Spec.DBImage
+	}
+
+	if os.Getenv("NOOBAA_DB_IMAGE") != "" {
+		return os.Getenv("NOOBAA_DB_IMAGE")
+	}
+
+	return options.DBImage
+}
+
 // CheckSystem checks the state of the system and initializes its status fields
 func CheckSystem(sys *nbv1.NooBaa) bool {
+	log := util.Logger()
 	found := util.KubeCheck(sys)
+
+	if ts := sys.GetDeletionTimestamp(); ts != nil {
+		log.Printf("❌ NooBaa system deleted at %v", ts)
+		return false // deleted
+	}
+
+	if util.EnsureCommonMetaFields(sys, nbv1.GracefulFinalizer) {
+		if !util.KubeUpdate(sys) {
+			log.Errorf("❌ NooBaa %q failed to add mandatory meta fields", sys.Name)
+			return false
+		}
+	}
+
 	if sys.Status.Accounts == nil {
 		sys.Status.Accounts = &nbv1.AccountsStatus{}
 	}
 	if sys.Status.Services == nil {
 		sys.Status.Services = &nbv1.ServicesStatus{}
 	}
-	// load defaults
-	// TODO: This is a temp patch it can be overriden by actually loading from the CR this is just a patch in memory
+
+	// a hack to better set the DBType in cases where DBType is not set.
+	// if dbtype is not set, try to infer it from the db image. this only update dbtype in memory
 	if sys.Spec.DBType == "" {
-		sys.Spec.DBType = "mongodb" // = defaults.DBType
+		dbImage := GetDesiredDBImage(sys)
+		if strings.Contains(dbImage, "postgres") {
+			log.Infof("dbType was not supplied. according to image (%s) setting dbType to postgres", dbImage)
+			sys.Spec.DBType = "postgres"
+		} else {
+			if strings.Contains(dbImage, "mongo") {
+				log.Infof("dbType was not supplied. according to image (%s) setting dbType to mongodb", dbImage)
+			} else {
+				log.Warnf("dbType was not supplied and it cannot be guessed from from the dbImage (%s). setting dbType to mongodb", dbImage)
+			}
+			sys.Spec.DBType = "mongodb"
+		}
 	}
+
 	return found && sys.UID != ""
 }
 
@@ -902,11 +1217,58 @@ func CheckSystem(sys *nbv1.NooBaa) bool {
 func CheckMongoURL(sys *nbv1.NooBaa) error {
 	if sys.Spec.MongoDbURL != "" {
 		if sys.Spec.DBType != "mongodb" {
-			return fmt.Errorf("Expecting the DBType to be mongodb when using external MongoDbURL, got %s", sys.Spec.DBType)
+			return fmt.Errorf("expecting the DBType to be mongodb when using external MongoDbURL, got %s", sys.Spec.DBType)
 		}
 		if !strings.Contains(sys.Spec.MongoDbURL, "mongodb://") &&
 			!strings.Contains(sys.Spec.MongoDbURL, "mongodb+srv://") {
-			return fmt.Errorf("Invalid mongo db url %s, expecting the url to start with mongodb:// or mongodb+srv://", sys.Spec.MongoDbURL)
+			return fmt.Errorf("invalid mongo db url %s, expecting the url to start with mongodb:// or mongodb+srv://", sys.Spec.MongoDbURL)
+		}
+	}
+	return nil
+}
+
+// CheckPostgresURL checks if the postgresurl structure is valid and if we use postgres as db
+func CheckPostgresURL(postgresDbURL string) error {
+	// This is temporary checks - In next PRs we will change to psql client checks instead
+	u, err := url.Parse(postgresDbURL)
+	if err != nil {
+		return fmt.Errorf("failed parsing external DB url: %q, error: %s", postgresDbURL, err)
+	}
+	_, _, err = net.SplitHostPort(u.Host)
+	if err != nil {
+		return fmt.Errorf("failed splitting host and port from external DB url: %q", postgresDbURL)
+	}
+	if !strings.Contains(postgresDbURL, "postgres://") &&
+		!strings.Contains(postgresDbURL, "postgresql://") {
+		return fmt.Errorf("invalid postgres db url %s, expecting the url to start with postgres:// or postgresql://", postgresDbURL)
+	}
+	return nil
+}
+
+// LoadConfigMapFromFlags loads a config-map with values from the cli flags, if provided.
+func LoadConfigMapFromFlags() {
+	if options.DebugLevel != "default_level" {
+		cm := util.KubeObject(bundle.File_deploy_internal_configmap_empty_yaml).(*corev1.ConfigMap)
+		cm.Namespace = options.Namespace
+		cm.Name = "noobaa-config"
+
+		DefaultConfigMapData := map[string]string{
+			"NOOBAA_LOG_LEVEL": options.DebugLevel,
+		}
+
+		cm.Data = DefaultConfigMapData
+
+		util.KubeCreateSkipExisting(cm)
+	}
+}
+
+// SetAllowNoobaaDeletion sets AllowNoobaaDeletion Noobaa CR field to true so the webhook won't block the deletion
+func SetAllowNoobaaDeletion(noobaa *nbv1.NooBaa) error {
+	// Explicitly allow deletion of NooBaa CR
+	if !noobaa.Spec.CleanupPolicy.AllowNoobaaDeletion {
+		noobaa.Spec.CleanupPolicy.AllowNoobaaDeletion = true
+		if !util.KubeUpdate(noobaa) {
+			return fmt.Errorf("failed to update AllowNoobaaDeletion")
 		}
 	}
 	return nil

@@ -7,7 +7,7 @@ import (
 	conditionsv1 "github.com/openshift/custom-resource-status/conditions/v1"
 )
 
-// Note 1: Run "operator-sdk generate k8s" to regenerate code after modifying this file
+// Note 1: Run "make gen-api" to regenerate code after modifying this file
 // Note 2: Add custom validation using kubebuilder tags: https://book.kubebuilder.io/reference/generating-crd.html
 
 func init() {
@@ -148,6 +148,7 @@ type AWSS3Spec struct {
 
 	// Secret refers to a secret that provides the credentials
 	// The secret should define AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+	// +optional
 	Secret corev1.SecretReference `json:"secret"`
 
 	// Region is the AWS region
@@ -157,6 +158,10 @@ type AWSS3Spec struct {
 	// SSLDisabled allows to disable SSL and use plain http
 	// +optional
 	SSLDisabled bool `json:"sslDisabled,omitempty"`
+
+	// AWSSTSRoleARN allows to Assume Role and use AssumeRoleWithWebIdentity
+	// +optional
+	AWSSTSRoleARN *string `json:"awsSTSRoleARN,omitempty"`
 }
 
 // S3CompatibleSpec specifies a backing store of type s3-compatible

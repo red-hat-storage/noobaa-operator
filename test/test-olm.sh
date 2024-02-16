@@ -40,6 +40,7 @@ function create_catalog() {
     echo "----> Creating CatalogSource ..."
     # kubectl delete -n olm catalogsource operatorhubio-catalog
     yq write deploy/olm/catalog-source.yaml spec.image $CATALOG_IMAGE | kubectl apply -f -
+    # yq eval ".spec.image = \"$CATALOG_IMAGE"\" deploy/olm/catalog-source.yaml
 }
 
 function create_subscription() {
@@ -62,19 +63,20 @@ function wait_for_operator() {
     done
 
     echo "----> Wait for operator to be ready ..."
-    kubectl wait pod -l noobaa-operator=deployment --for condition=ready
+    # kubectl wait pod -l noobaa-operator=deployment --for condition=ready
+    kubectl rollout status deployment noobaa-operator
 }
 
 function test_operator() {
     MINI_RESOURCES='{"requests":{"cpu":"10m","memory":"128Mi"}}'
-    ${OPERATOR_SDK} run --local --operator-flags "system create --core-resources $MINI_RESOURCES --db-resources $MINI_RESOURCES --endpoint-resources ${MINI_RESOURCES}"
+    ${NOOBAA_OPERATOR_LOCAL} --mini install
     while [ "$(kubectl get noobaa/noobaa -o jsonpath={.status.phase})" != "Ready" ]
     do
         echo -n '.'
         sleep 3
-        ${OPERATOR_SDK} run --local --operator-flags "status"
+        ${NOOBAA_OPERATOR_LOCAL} status
     done
-    ${OPERATOR_SDK} run --local --operator-flags "status"
+    ${NOOBAA_OPERATOR_LOCAL} status
 }
 
 function main() {

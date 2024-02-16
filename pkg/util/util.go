@@ -2,27 +2,32 @@ package util
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
-	monitoringv1 "github.com/coreos/prometheus-operator/pkg/apis/monitoring/v1"
-	"github.com/hashicorp/vault/api"
-	vaultApi "github.com/hashicorp/vault/api"
+	semver "github.com/coreos/go-semver/semver"
+	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	obv1 "github.com/kube-object-storage/lib-bucket-provisioner/pkg/apis/objectbucket.io/v1alpha1"
 	nbapis "github.com/noobaa/noobaa-operator/v5/pkg/apis"
 	nbv1 "github.com/noobaa/noobaa-operator/v5/pkg/apis/noobaa/v1alpha1"
@@ -32,47 +37,68 @@ import (
 	cloudcredsv1 "github.com/openshift/cloud-credential-operator/pkg/apis/cloudcredential/v1"
 	conditionsv1 "github.com/openshift/custom-resource-status/conditions/v1"
 	operv1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/cli-runtime/pkg/printers"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	apiregistration "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
+	"k8s.io/utils/ptr"
+	cosiv1 "sigs.k8s.io/container-object-storage-interface-api/apis/objectstorage/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 const (
-	oAuthWellKnownEndpoint  = "https://openshift.default.svc/.well-known/oauth-authorization-server"
-	rootSecretPath          = "NOOBAA_ROOT_SECRET_PATH"
-	ibmRegion               = "ibm-cloud.kubernetes.io/region"
-	vaultCaCert             = "VAULT_CACERT"
-	vaultClientCert         = "VAULT_CLIENT_CERT"
-	vaultClientKey          = "VAULT_CLIENT_KEY"
-	vaultAddr               = "VAULT_ADDR"
-	vaultCaPath             = "VAULT_CAPATH"
-	vaultBackendPath        = "VAULT_BACKEND_PATH"
-	kmsProvider             = "KMS_PROVIDER"
-	defaultVaultBackendPath = "secret/"
+	oAuthWellKnownEndpoint = "https://openshift.default.svc/.well-known/oauth-authorization-server"
+	ibmRegion              = "ibm-cloud.kubernetes.io/region"
+
+	gigabyte             = 1024 * 1024 * 1024
+	petabyte             = gigabyte * 1024 * 1024
+	obcMaxSizeUpperLimit = petabyte * 1023
 )
 
 // OAuth2Endpoints holds OAuth2 endpoints information.
 type OAuth2Endpoints struct {
 	AuthorizationEndpoint string `json:"authorization_endpoint"`
 	TokenEndpoint         string `json:"token_endpoint"`
+}
+
+// ValidationError is a custom error if the validation failed
+type ValidationError struct {
+	Msg string
+}
+
+// IsValidationError check if err is of type ValidationError
+func IsValidationError(err error) bool {
+	_, ok := err.(ValidationError)
+	return ok
+}
+
+// Error returns the ValidationError message
+func (e ValidationError) Error() string {
+	return e.Msg
 }
 
 var (
@@ -85,12 +111,59 @@ var (
 	InsecureHTTPTransport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
+
+	// SecureHTTPTransport is a global secure http transport
+	SecureHTTPTransport = &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
+	}
+
+	// MapStorTypeToMandatoryProperties holds a map of store type -> credentials mandatory properties
+	// note that this map holds the mandatory properties for both backingstores and namespacestores
+	MapStorTypeToMandatoryProperties = map[string][]string{
+		"aws-s3":               {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"},         // backingstores and namespacestores
+		"s3-compatible":        {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"},         // backingstores and namespacestores
+		"ibm-cos":              {"IBM_COS_ACCESS_KEY_ID", "IBM_COS_SECRET_ACCESS_KEY"}, // backingstores and namespacestores
+		"google-cloud-storage": {"GoogleServiceAccountPrivateKeyJson"},                 // backingstores and namespacestores
+		"azure-blob":           {"AccountName", "AccountKey"},                          // backingstores and namespacestores
+		"pv-pool":              {},                                                     // backingstores
+		"nsfs":                 {},                                                     // namespacestores
+	}
 )
+
+// AddToRootCAs adds a local cert file to Our SecureHttpTransport
+func AddToRootCAs(localCertFile string) error {
+	rootCAs := x509.NewCertPool()
+
+	var certFiles = []string{
+		"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+		localCertFile,
+	}
+
+	for _, certFile := range certFiles {
+		// Read in the cert file
+		certs, err := os.ReadFile(certFile)
+		if err != nil {
+			return err
+		}
+
+		// Append our cert to the system pool
+		if ok := rootCAs.AppendCertsFromPEM(certs); !ok {
+			log.Errorf("Failed to append %q to RootCAs", certFile)
+			return fmt.Errorf("failed to append %q to RootCAs", certFile)
+		}
+
+		// Trust the augmented cert pool in our client
+		log.Infof("Successfuly appended %q to RootCAs", certFile)
+	}
+	SecureHTTPTransport.TLSClientConfig.RootCAs = rootCAs
+	return nil
+}
 
 func init() {
 	Panic(apiextv1.AddToScheme(scheme.Scheme))
 	Panic(nbapis.AddToScheme(scheme.Scheme))
 	Panic(obv1.AddToScheme(scheme.Scheme))
+	Panic(cosiv1.AddToScheme(scheme.Scheme))
 	Panic(monitoringv1.AddToScheme(scheme.Scheme))
 	Panic(cloudcredsv1.AddToScheme(scheme.Scheme))
 	Panic(operv1.AddToScheme(scheme.Scheme))
@@ -98,6 +171,8 @@ func init() {
 	Panic(routev1.AddToScheme(scheme.Scheme))
 	Panic(secv1.AddToScheme(scheme.Scheme))
 	Panic(autoscalingv1.AddToScheme(scheme.Scheme))
+	Panic(kedav1alpha1.AddToScheme(scheme.Scheme))
+	Panic(apiregistration.AddToScheme(scheme.Scheme))
 }
 
 // KubeConfig loads kubernetes client config from default locations (flags, user dir, etc)
@@ -112,8 +187,24 @@ func KubeConfig() *rest.Config {
 	return lazyConfig
 }
 
+// GetKubeVersion will fetch the kubernates minor version
+func GetKubeVersion() (*semver.Version, error) {
+	var err error
+	var discClient *discovery.DiscoveryClient
+	var kubeVersionInfo *version.Info
+	if discClient, err = discovery.NewDiscoveryClientForConfig(KubeConfig()); err != nil {
+		return nil, err
+	}
+	if kubeVersionInfo, err = discClient.ServerVersion(); err != nil {
+		return nil, err
+	}
+	kubeVersion := fmt.Sprintf("%s.%s.0", kubeVersionInfo.Major, kubeVersionInfo.Minor)
+	version, err := semver.NewVersion(kubeVersion)
+	return version, err
+}
+
 // MapperProvider creates RESTMapper
-func MapperProvider(config *rest.Config) (meta.RESTMapper, error) {
+func MapperProvider(config *rest.Config, httpClient *http.Client) (meta.RESTMapper, error) {
 	return meta.NewLazyRESTMapperLoader(func() (meta.RESTMapper, error) {
 		dc, err := discovery.NewDiscoveryClientForConfig(config)
 		if err != nil {
@@ -132,6 +223,7 @@ func MapperProvider(config *rest.Config) (meta.RESTMapper, error) {
 				g.Name == "ceph.rook.io" ||
 				g.Name == "autoscaling" ||
 				g.Name == "batch" ||
+				g.Name == "keda.sh" ||
 				strings.HasSuffix(g.Name, ".k8s.io") {
 				return true
 			}
@@ -146,7 +238,7 @@ func MapperProvider(config *rest.Config) (meta.RESTMapper, error) {
 func KubeClient() client.Client {
 	if lazyClient == nil {
 		config := KubeConfig()
-		mapper, _ := MapperProvider(config)
+		mapper, _ := MapperProvider(config, nil)
 		var err error
 		lazyClient, err = client.New(config, client.Options{Mapper: mapper, Scheme: scheme.Scheme})
 		if err != nil {
@@ -156,7 +248,7 @@ func KubeClient() client.Client {
 	return lazyClient
 }
 
-// KubeObject loads a text yaml/json to a kubernets object.
+// KubeObject loads a text yaml/json to a kubernetes object.
 func KubeObject(text string) runtime.Object {
 	// Decode text (yaml/json) to kube api object
 	deserializer := serializer.NewCodecFactory(scheme.Scheme).UniversalDeserializer()
@@ -171,13 +263,14 @@ func KubeObject(text string) runtime.Object {
 
 // KubeApply will check if the object exists and will create/update accordingly
 // and report the object status.
-func KubeApply(obj runtime.Object) bool {
+func KubeApply(obj client.Object) bool {
 	klient := KubeClient()
 	objKey := ObjectKey(obj)
 	gvk := obj.GetObjectKind().GroupVersionKind()
-	clone := obj.DeepCopyObject()
+	clone := obj.DeepCopyObject().(client.Object)
 	err := klient.Get(ctx, objKey, clone)
 	if err == nil {
+		obj.SetResourceVersion(clone.GetResourceVersion())
 		err = klient.Update(ctx, obj)
 		if err == nil {
 			log.Printf("✅ Updated: %s %q\n", gvk.Kind, objKey.Name)
@@ -199,6 +292,11 @@ func KubeApply(obj runtime.Object) bool {
 		log.Printf("❌ Conflict: %s %q: %s\n", gvk.Kind, objKey.Name, err)
 		return false
 	}
+	statusErr, ok := err.(*errors.StatusError)
+	if ok {
+		log.Printf("❌ Status Error: %s %q: %s\n", gvk.Kind, objKey.Name, statusErr.ErrStatus.Message)
+		return false
+	}
 	Panic(err)
 	return false
 }
@@ -207,11 +305,11 @@ func KubeApply(obj runtime.Object) bool {
 // return true on success
 // if the object exists return skipOrFail parameter
 // return false on failure
-func kubeCreateSkipOrFailExisting(obj runtime.Object, skipOrFail bool) bool {
+func kubeCreateSkipOrFailExisting(obj client.Object, skipOrFail bool) bool {
 	klient := KubeClient()
 	objKey := ObjectKey(obj)
 	gvk := obj.GetObjectKind().GroupVersionKind()
-	clone := obj.DeepCopyObject()
+	clone := obj.DeepCopyObject().(client.Object)
 	err := klient.Get(ctx, objKey, clone)
 	if err == nil {
 		log.Printf("✅ Already Exists: %s %q\n", gvk.Kind, objKey.Name)
@@ -245,30 +343,35 @@ func kubeCreateSkipOrFailExisting(obj runtime.Object, skipOrFail bool) bool {
 		log.Printf("❌ Invalid: %s %q: %s\n", gvk.Kind, objKey.Name, err)
 		return false
 	}
+	statusErr, ok := err.(*errors.StatusError)
+	if ok {
+		log.Printf("❌ Status Error: %s %q: %s\n", gvk.Kind, objKey.Name, statusErr.ErrStatus.Message)
+		return false
+	}
 	Panic(err)
 	return false
 }
 
 // KubeCreateFailExisting will check if the object exists and will create/skip accordingly
 // and report the object status.
-func KubeCreateFailExisting(obj runtime.Object) bool {
+func KubeCreateFailExisting(obj client.Object) bool {
 	return kubeCreateSkipOrFailExisting(obj, false)
 }
 
 // KubeCreateSkipExisting will try to create an object
 // returns true of the object exist or was created
 // returns false otherwise
-func KubeCreateSkipExisting(obj runtime.Object) bool {
+func KubeCreateSkipExisting(obj client.Object) bool {
 	return kubeCreateSkipOrFailExisting(obj, true)
 }
 
 // KubeCreateOptional will check if the object exists and will create/skip accordingly
 // It detects the situation of a missing CRD and reports it as an optional feature.
-func KubeCreateOptional(obj runtime.Object) bool {
+func KubeCreateOptional(obj client.Object) bool {
 	klient := KubeClient()
 	objKey := ObjectKey(obj)
 	gvk := obj.GetObjectKind().GroupVersionKind()
-	clone := obj.DeepCopyObject()
+	clone := obj.DeepCopyObject().(client.Object)
 	err := klient.Get(ctx, objKey, clone)
 	if err == nil {
 		log.Printf("✅ Already Exists: %s %q\n", gvk.Kind, objKey.Name)
@@ -307,7 +410,7 @@ func KubeCreateOptional(obj runtime.Object) bool {
 }
 
 // KubeDelete deletes an object and reports the object status.
-func KubeDelete(obj runtime.Object, opts ...client.DeleteOption) bool {
+func KubeDelete(obj client.Object, opts ...client.DeleteOption) bool {
 	klient := KubeClient()
 	objKey := ObjectKey(obj)
 	gvk := obj.GetObjectKind().GroupVersionKind()
@@ -324,10 +427,15 @@ func KubeDelete(obj runtime.Object, opts ...client.DeleteOption) bool {
 	} else if errors.IsNotFound(err) {
 		return true
 	}
+	statusErr, ok := err.(*errors.StatusError)
+	if ok {
+		log.Printf("❌ Status Error: %s %q: %s\n", gvk.Kind, objKey.Name, statusErr.ErrStatus.Message)
+		return false
+	}
 
 	time.Sleep(10 * time.Millisecond)
 
-	err = wait.PollImmediateInfinite(time.Second, func() (bool, error) {
+	err = wait.PollUntilContextCancel(ctx, time.Second, true, func(ctx context.Context) (bool, error) {
 		err := klient.Delete(ctx, obj, opts...)
 		if err == nil {
 			if !deleted {
@@ -357,8 +465,29 @@ func KubeDelete(obj runtime.Object, opts ...client.DeleteOption) bool {
 	return deleted
 }
 
+// KubeDeleteNoPolling deletes an object without waiting for acknowledgement the object got deleted
+func KubeDeleteNoPolling(obj client.Object, opts ...client.DeleteOption) bool {
+	klient := KubeClient()
+	objKey := ObjectKey(obj)
+	gvk := obj.GetObjectKind().GroupVersionKind()
+	deleted := false
+
+	err := klient.Delete(ctx, obj, opts...)
+	if err == nil {
+		deleted = true
+		log.Printf("🗑️  Deleting: %s %q\n", gvk.Kind, objKey.Name)
+	} else if errors.IsConflict(err) {
+		log.Printf("🗑️  Conflict (OK): %s %q: %s\n", gvk.Kind, objKey.Name, err)
+	} else if errors.IsNotFound(err) {
+		return true
+	}
+
+	Panic(err)
+	return (deleted)
+}
+
 // KubeDeleteAllOf deletes an list of objects and reports the status.
-func KubeDeleteAllOf(obj runtime.Object, opts ...client.DeleteAllOfOption) bool {
+func KubeDeleteAllOf(obj client.Object, opts ...client.DeleteAllOfOption) bool {
 	klient := KubeClient()
 	gvk := obj.GetObjectKind().GroupVersionKind()
 	deleted := false
@@ -375,7 +504,7 @@ func KubeDeleteAllOf(obj runtime.Object, opts ...client.DeleteAllOfOption) bool 
 }
 
 // KubeUpdate updates an object and reports the object status.
-func KubeUpdate(obj runtime.Object) bool {
+func KubeUpdate(obj client.Object) bool {
 	klient := KubeClient()
 	objKey := ObjectKey(obj)
 	gvk := obj.GetObjectKind().GroupVersionKind()
@@ -396,12 +525,17 @@ func KubeUpdate(obj runtime.Object) bool {
 		log.Printf("❌ Not Found: %s %q\n", gvk.Kind, objKey.Name)
 		return false
 	}
+	statusErr, ok := err.(*errors.StatusError)
+	if ok {
+		log.Printf("❌ Status Error: %s %q: %s\n", gvk.Kind, objKey.Name, statusErr.ErrStatus.Message)
+		return false
+	}
 	Panic(err)
 	return false
 }
 
 // KubeCheck checks if the object exists and reports the object status.
-func KubeCheck(obj runtime.Object) bool {
+func KubeCheck(obj client.Object) bool {
 	name, kind, err := KubeGet(obj)
 	if err == nil {
 		SecretResetStringDataFromData(obj)
@@ -426,7 +560,7 @@ func KubeCheck(obj runtime.Object) bool {
 
 // KubeCheckOptional checks if the object exists and reports the object status.
 // It detects the situation of a missing CRD and reports it as an optional feature.
-func KubeCheckOptional(obj runtime.Object) bool {
+func KubeCheckOptional(obj client.Object) bool {
 	name, kind, err := KubeGet(obj)
 	if err == nil {
 		log.Printf("✅ (Optional) Exists: %s %q\n", kind, name)
@@ -450,7 +584,7 @@ func KubeCheckOptional(obj runtime.Object) bool {
 
 // KubeCheckQuiet checks if the object exists fills the given object if found.
 // returns true if the object was found. It does not print any status
-func KubeCheckQuiet(obj runtime.Object) bool {
+func KubeCheckQuiet(obj client.Object) bool {
 	_, _, err := KubeGet(obj)
 	if err == nil {
 		return true
@@ -465,9 +599,9 @@ func KubeCheckQuiet(obj runtime.Object) bool {
 	return false
 }
 
-// KubeGet gets a runtime.Object, fills the given object and returns the name and kind
+// KubeGet gets a client.Object, fills the given object and returns the name and kind
 // returns error on failure
-func KubeGet(obj runtime.Object) (name string, kind string, err error) {
+func KubeGet(obj client.Object) (name string, kind string, err error) {
 	klient := KubeClient()
 	objKey := ObjectKey(obj)
 	name = objKey.Name
@@ -478,7 +612,7 @@ func KubeGet(obj runtime.Object) (name string, kind string, err error) {
 }
 
 // KubeList returns a list of objects.
-func KubeList(list runtime.Object, options ...client.ListOption) bool {
+func KubeList(list client.ObjectList, options ...client.ListOption) bool {
 	klient := KubeClient()
 	gvk := list.GetObjectKind().GroupVersionKind()
 	err := klient.List(ctx, list, options...)
@@ -525,7 +659,7 @@ func RemoveFinalizer(obj metav1.Object, finalizer string) bool {
 
 // AddFinalizer adds the finalizer to the object if it doesn't contains it already
 func AddFinalizer(obj metav1.Object, finalizer string) bool {
-	if !Contains(finalizer, obj.GetFinalizers()) {
+	if !Contains(obj.GetFinalizers(), finalizer) {
 		finalizers := append(obj.GetFinalizers(), finalizer)
 		obj.SetFinalizers(finalizers)
 		return true
@@ -557,14 +691,32 @@ func GetPodLogs(pod corev1.Pod) (map[string]io.ReadCloser, error) {
 
 	containerMap := make(map[string]io.ReadCloser)
 	for _, container := range allContainers {
-		podLogOpts := corev1.PodLogOptions{Container: container.Name}
-		req := clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &podLogOpts)
-		podLogs, err := req.Stream(ctx)
-		if err != nil {
-			log.Printf(`Could not read logs %s container %s, reason: %s\n`, pod.Name, container.Name, err)
-			continue
+		getPodLogOpts := func(pod *corev1.Pod, logOpts *corev1.PodLogOptions, nameSuffix *string) {
+			req := clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, logOpts)
+
+			podLogs, err := req.Stream(ctx)
+			if err != nil {
+				// do not warn about lack of additional previous logs, i.e. when nameSuffix is set
+				if nameSuffix == nil {
+					log.Printf(`Could not read logs %s container %s, reason: %s`, pod.Name, container.Name, err)
+				}
+				return
+			}
+			mapKey := container.Name
+			if nameSuffix != nil {
+				mapKey += "-" + *nameSuffix
+			}
+			containerMap[mapKey] = podLogs
 		}
-		containerMap[container.Name] = podLogs
+
+		// retrieve logs from a current instantiation of pod containers
+		podLogOpts := corev1.PodLogOptions{Container: container.Name}
+		getPodLogOpts(&pod, &podLogOpts, nil)
+
+		// retrieve logs from a previous instantiation of pod containers
+		prevPodLogOpts := corev1.PodLogOptions{Container: container.Name, Previous: true}
+		previousSuffix := "previous"
+		getPodLogOpts(&pod, &prevPodLogOpts, &previousSuffix)
 	}
 	return containerMap, nil
 }
@@ -630,7 +782,7 @@ func GetContainerStatusLine(cont *corev1.ContainerStatus) string {
 	return s
 }
 
-// Panic is conviniently calling panic only if err is not nil
+// Panic is conveniently calling panic only if err is not nil
 func Panic(err error) {
 	if err != nil {
 		reason := errors.ReasonForError(err)
@@ -650,8 +802,8 @@ func IgnoreError(err error) {
 }
 
 // InitLogger initializes the logrus logger with defaults
-func InitLogger() {
-	logrus.SetLevel(logrus.DebugLevel)
+func InitLogger(lvl logrus.Level) {
+	logrus.SetLevel(lvl)
 	logrus.SetFormatter(&logrus.TextFormatter{
 		// FullTimestamp: true,
 	})
@@ -736,9 +888,8 @@ func SecretResetStringDataFromData(obj runtime.Object) {
 }
 
 // ObjectKey returns the objects key (namespace + name)
-func ObjectKey(obj runtime.Object) client.ObjectKey {
-	objKey, err := client.ObjectKeyFromObject(obj)
-	Panic(err)
+func ObjectKey(obj client.Object) client.ObjectKey {
+	objKey := client.ObjectKeyFromObject(obj)
 	return objKey
 }
 
@@ -871,13 +1022,41 @@ func IsAWSPlatform() bool {
 	return isAWS
 }
 
-// IsAzurePlatform returns true if this cluster is running on Azure
-func IsAzurePlatform() bool {
+// IsSTSClusterBS returns true if it is running on an STS cluster
+func IsSTSClusterBS(bs *nbv1.BackingStore) bool {
+	if bs.Spec.Type == nbv1.StoreTypeAWSS3 {
+		return bs.Spec.AWSS3.AWSSTSRoleARN != nil
+	}
+	return false
+}
+
+// IsSTSClusterNS returns true if it is running on an STS cluster
+func IsSTSClusterNS(ns *nbv1.NamespaceStore) bool {
+	if ns.Spec.Type == nbv1.NSStoreTypeAWSS3 {
+		return ns.Spec.AWSS3.AWSSTSRoleARN != nil
+	}
+	return false
+}
+
+// IsAzurePlatformNonGovernment returns true if this cluster is running on Azure and also not on azure government\DOD cloud
+func IsAzurePlatformNonGovernment() bool {
 	nodesList := &corev1.NodeList{}
 	if ok := KubeList(nodesList); !ok || len(nodesList.Items) == 0 {
 		Panic(fmt.Errorf("failed to list kubernetes nodes"))
 	}
-	isAzure := strings.HasPrefix(nodesList.Items[0].Spec.ProviderID, "azure")
+	const regionLabel string = "topology.kubernetes.io/region"
+	node := nodesList.Items[0]
+	isAzure := strings.HasPrefix(node.Spec.ProviderID, "azure")
+	if isAzure {
+		nodeLabels := node.GetLabels()
+		region, ok := nodeLabels[regionLabel]
+		if !ok {
+			log.Warnf("did not find the expected label %q on node %q to determine azure region", regionLabel, node.Name)
+		} else if strings.HasPrefix(region, "usgov") || strings.HasPrefix(region, "usdod") {
+			log.Infof("identified the region [%q] as an Azure gov/DOD region", region)
+			return false
+		}
+	}
 	return isAzure
 }
 
@@ -899,7 +1078,7 @@ func IsIBMPlatform() bool {
 	}
 	isIBM := strings.HasPrefix(nodesList.Items[0].Spec.ProviderID, "ibm")
 	if isIBM {
-		// Incase of Satellite cluster is deplyed in user provided infrastructure
+		// In case of Satellite cluster is deployed in user provided infrastructure
 		if strings.Contains(nodesList.Items[0].Spec.ProviderID, "/sat-") {
 			isIBM = false
 		}
@@ -910,8 +1089,11 @@ func IsIBMPlatform() bool {
 // GetIBMRegion returns the cluster's region in IBM Cloud
 func GetIBMRegion() (string, error) {
 	nodesList := &corev1.NodeList{}
-	if ok := KubeList(nodesList); !ok || len(nodesList.Items) == 0 {
-		return "", fmt.Errorf("failed to list kubernetes nodes")
+	if ok := KubeList(nodesList, client.HasLabels{ibmRegion}); !ok {
+		return "", fmt.Errorf("failed to list Kubernetes nodes with the IBM region label")
+	}
+	if len(nodesList.Items) == 0 {
+		return "", fmt.Errorf("no Kubernetes nodes with the IBM region label found")
 	}
 	labels := nodesList.Items[0].GetLabels()
 	region := labels[ibmRegion]
@@ -922,6 +1104,8 @@ func GetIBMRegion() (string, error) {
 func GetAWSRegion() (string, error) {
 	// parse the node name to get AWS region according to this:
 	// https://docs.aws.amazon.com/en_pv/vpc/latest/userguide/vpc-dns.html#vpc-dns-hostnames
+	// The list of regions can be found here:
+	// https://docs.aws.amazon.com/general/latest/gr/rande.html
 	var mapValidAWSRegions = map[string]string{
 		"compute-1":      "us-east-1",
 		"ec2":            "us-east-1",
@@ -931,21 +1115,30 @@ func GetAWSRegion() (string, error) {
 		"us-west-2":      "us-west-2",
 		"ca-central-1":   "ca-central-1",
 		"eu-central-1":   "eu-central-1",
+		"eu-central-2":   "eu-central-2",
 		"eu-west-1":      "eu-west-1",
 		"eu-west-2":      "eu-west-2",
 		"eu-west-3":      "eu-west-3",
 		"eu-north-1":     "eu-north-1",
+		"eu-south-1":     "eu-south-1",
+		"eu-south-2":     "eu-south-2",
 		"ap-east-1":      "ap-east-1",
 		"ap-northeast-1": "ap-northeast-1",
 		"ap-northeast-2": "ap-northeast-2",
 		"ap-northeast-3": "ap-northeast-3",
 		"ap-southeast-1": "ap-southeast-1",
 		"ap-southeast-2": "ap-southeast-2",
+		"ap-southeast-3": "ap-southeast-3",
+		"ap-southeast-4": "ap-southeast-4",
 		"ap-south-1":     "ap-south-1",
+		"ap-south-2":     "ap-south-2",
 		"me-south-1":     "me-south-1",
+		"me-central-1":   "me-central-1",
 		"sa-east-1":      "sa-east-1",
 		"us-gov-west-1":  "us-gov-west-1",
 		"us-gov-east-1":  "us-gov-east-1",
+		"af-south-1":     "af-south-1",
+		"il-central-1":   "il-central-1",
 	}
 	nodesList := &corev1.NodeList{}
 	if ok := KubeList(nodesList); !ok || len(nodesList.Items) == 0 {
@@ -969,7 +1162,29 @@ func IsValidS3BucketName(name string) bool {
 	return validBucketNameRegex.MatchString(name)
 }
 
-// GetFlagStringOrPrompt returns flag value but if empty will promtp to read from stdin
+// GetFlagIntOrPrompt returns flag value but if empty will prompt to read from stdin
+func GetFlagIntOrPrompt(cmd *cobra.Command, flag string) int {
+	val, _ := cmd.Flags().GetInt(flag)
+	if val != -1 {
+		return val
+	}
+	fmt.Printf("Enter %s: ", flag)
+	_, err := fmt.Scan(&val)
+
+	if err != nil {
+		if strings.Contains(err.Error(), "expected integer") {
+			log.Fatalf(`❌ The flag %s must be an integer`, flag)
+		}
+	}
+
+	Panic(err)
+	if val == -1 {
+		log.Fatalf(`❌ Missing %s %s`, flag, cmd.UsageString())
+	}
+	return val
+}
+
+// GetFlagStringOrPrompt returns flag value but if empty will prompt to read from stdin
 func GetFlagStringOrPrompt(cmd *cobra.Command, flag string) string {
 	str, _ := cmd.Flags().GetString(flag)
 	if str != "" {
@@ -993,7 +1208,7 @@ func GetFlagStringOrPromptPassword(cmd *cobra.Command, flag string) string {
 		return str
 	}
 	fmt.Printf("Enter %s: ", flag)
-	bytes, err := terminal.ReadPassword(0)
+	bytes, err := term.ReadPassword(0)
 	Panic(err)
 	str = string(bytes)
 	fmt.Printf("[got %d characters]\n", len(str))
@@ -1026,7 +1241,7 @@ func DiscoverOAuthEndpoints() (*OAuth2Endpoints, error) {
 		return nil, err
 	}
 
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -1152,17 +1367,33 @@ func WriteYamlFile(name string, obj runtime.Object, moreObjects ...runtime.Objec
 	return nil
 }
 
-// Contains checks if string array arr contains string s
-func Contains(s string, arr []string) bool {
-	for _, b := range arr {
-		if b == s {
+// Contains is a generic function
+// that receives a slice and an element from comparable type (sould be from the same type)
+// and returns true if the slice contains the element, otherwise false
+func Contains[T comparable](arr []T, item T) bool {
+	return ContainsAny(
+		arr,
+		item,
+		func(a, b T) bool {
+			return a == b
+		},
+	)
+}
+
+// ContainsAny is a generic function
+// that receives a slice, an element and a function to compare
+// and returns true if the function executed on the item and the slice return true
+func ContainsAny[T any](arr []T, item T, eq func(T, T) bool) bool {
+	for _, element := range arr {
+		if eq(element, item) {
 			return true
 		}
 	}
+
 	return false
 }
 
-// GetEnvVariable is looknig for env variable called name in env and return a pointer to the variable
+// GetEnvVariable is looking for env variable called name in env and return a pointer to the variable
 func GetEnvVariable(env *[]corev1.EnvVar, name string) *corev1.EnvVar {
 	for i := range *env {
 		e := &(*env)[i]
@@ -1226,6 +1457,26 @@ func MergeVolumeMountList(existing, template *[]corev1.VolumeMount) {
 	}
 }
 
+// GetCmDataHash calculates a Hash string representing an array of key value strings
+func GetCmDataHash(input map[string]string) string {
+	b := new(bytes.Buffer)
+
+	keys := make([]string, 0, len(input))
+	for k := range input {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		// Convert each key/value pair in the map to a string
+		fmt.Fprintf(b, "%s=\"%s\"\n", k, input[k])
+	}
+
+	sha256Bytes := sha256.Sum256(b.Bytes())
+	sha256Hex := hex.EncodeToString(sha256Bytes[:])
+	return sha256Hex
+}
+
 // MergeEnvArrays takes two Env variables arrays and merge them into the first
 func MergeEnvArrays(envA, envB *[]corev1.EnvVar) {
 	existingEnvs := make(map[string]bool)
@@ -1239,6 +1490,48 @@ func MergeEnvArrays(envA, envB *[]corev1.EnvVar) {
 			*envA = append(*envA, item)
 		}
 	}
+}
+
+// HumanizeDuration humanizes time.Duration output to a meaningful value - will show days/years
+func HumanizeDuration(duration time.Duration) string {
+	const (
+		oneDay  = time.Minute * 60 * 24
+		oneYear = 365 * oneDay
+	)
+	if duration < oneDay {
+		return duration.String()
+	}
+
+	var builder strings.Builder
+
+	if duration >= oneYear {
+		years := duration / oneYear
+		fmt.Fprintf(&builder, "%dy", years)
+		duration -= years * oneYear
+	}
+
+	days := duration / oneDay
+	duration -= days * oneDay
+	fmt.Fprintf(&builder, "%dd%s", days, duration)
+
+	return builder.String()
+}
+
+// IsStringArrayUnorderedEqual checks if two string arrays has the same members
+func IsStringArrayUnorderedEqual(stringsArrayA, stringsArrayB []string) bool {
+	if len(stringsArrayA) != len(stringsArrayB) {
+		return false
+	}
+	existingStrings := make(map[string]bool)
+	for _, item := range stringsArrayA {
+		existingStrings[item] = true
+	}
+	for _, item := range stringsArrayB {
+		if !existingStrings[item] {
+			return false
+		}
+	}
+	return true
 }
 
 // EnsureCommonMetaFields ensures that the resource has all mandatory meta fields
@@ -1274,353 +1567,606 @@ func GetWatchNamespace() (string, error) {
 	if !found {
 		return "", fmt.Errorf("%s must be set", WatchNamespaceEnvVar)
 	}
-	if len(ns) == 0 {
-		return "", fmt.Errorf("%s must not be empty", WatchNamespaceEnvVar)
-	}
+
 	return ns, nil
 }
 
-///////////////////////////////////
-/////////// VAULT UTILS ///////////
-///////////////////////////////////
+// DeleteStorageClass deletes storage class
+func DeleteStorageClass(sc *storagev1.StorageClass) error {
+	log.Infof("storageclass %v found, deleting..", sc.Name)
+	if !KubeDelete(sc) {
+		return fmt.Errorf("storageclass %q failed to delete", sc)
+	}
+	log.Infof("deleted storageclass %v successfully", sc.Name)
+	return nil
+}
 
-// VerifyExternalSecretsDeletion checks if noobaa is on un-installation process
-// if true, deletes secrets from external KMS
-func VerifyExternalSecretsDeletion(kms nbv1.KeyManagementServiceSpec, namespace string, uid string) error {
+// LoadBucketReplicationJSON loads the bucket replication from a json file
+func LoadBucketReplicationJSON(replicationJSONFilePath string) (string, error) {
 
-	if len(kms.ConnectionDetails) == 0 {
-		log.Infof("deleting root key locally")
+	logrus.Infof("loading bucket replication %v", replicationJSONFilePath)
+	bytes, err := os.ReadFile(replicationJSONFilePath)
+	if err != nil {
+		return "", fmt.Errorf("Failed to read file %q: %v", replicationJSONFilePath, err)
+	}
+	var replicationJSON interface{}
+	err = json.Unmarshal(bytes, &replicationJSON)
+	if err != nil {
+		return "", fmt.Errorf("Failed to parse json file %q: %v", replicationJSONFilePath, err)
+	}
+
+	logrus.Infof("✅ Successfully loaded bucket replication %v", string(bytes))
+
+	return string(bytes), nil
+}
+
+// NoobaaStatus returns true if NooBaa condition type and status matches
+// returns false otherwise
+func NoobaaStatus(nb *nbv1.NooBaa, t conditionsv1.ConditionType, status corev1.ConditionStatus) bool {
+	for _, cond := range nb.Status.Conditions {
+		log.Printf("condition type %v status %v", cond.Type, cond.Status)
+		if cond.Type == t && cond.Status == status {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateQuotaConfig maxSize and maxObjects value of obc or bucketclass
+func ValidateQuotaConfig(name string, maxSize string, maxObjects string) error {
+
+	// Positive number
+	if maxObjects != "" {
+		obcMaxObjectsInt, err := strconv.ParseInt(maxObjects, 10, 32)
+		if err != nil {
+			return ValidationError{
+				Msg: fmt.Sprintf("ob %q validation error: failed to parse maxObjects %v, %v", name, maxObjects, err),
+			}
+		}
+		if obcMaxObjectsInt < 0 {
+			return ValidationError{
+				Msg: fmt.Sprintf("ob %q validation error: invalid maxObjects value. O or any positive number ", name),
+			}
+		}
+	}
+
+	//Valid range 0, 1G - 1023P
+	if maxSize != "" {
+		quantity, err := resource.ParseQuantity(maxSize)
+		if err != nil {
+			log.Errorf("failed to parse quantity: %v", maxSize)
+			return err
+		}
+		obcMaxSizeValue := quantity.Value()
+		if obcMaxSizeValue != 0 && (obcMaxSizeValue < gigabyte || obcMaxSizeValue > obcMaxSizeUpperLimit) {
+			return ValidationError{
+				Msg: fmt.Sprintf("ob %q validation error: invalid obcMaxSizeValue value: min 1Gi, max 1023Pi, 0 to remove quota", name),
+			}
+		}
+	}
+
+	return nil
+}
+
+//
+// Test shared utilities
+//
+
+// NooBaaCondStatus waits for requested NooBaa CR KMS condition status
+// returns false if timeout
+func NooBaaCondStatus(noobaa *nbv1.NooBaa, s corev1.ConditionStatus) bool {
+	return NooBaaCondition(noobaa, nbv1.ConditionTypeKMSStatus, s)
+}
+
+// NooBaaCondition waits for requested NooBaa CR KMS condition type & status
+// returns false if timeout
+func NooBaaCondition(noobaa *nbv1.NooBaa, t conditionsv1.ConditionType, s corev1.ConditionStatus) bool {
+	found := false
+
+	timeout := 120 // seconds
+	for i := 0; i < timeout; i++ {
+		_, _, err := KubeGet(noobaa)
+		Panic(err)
+
+		if NoobaaStatus(noobaa, t, s) {
+			found = true
+			break
+		}
+		time.Sleep(time.Second)
+	}
+
+	return found
+}
+
+// GetAvailabeKubeCli will check which k8s cli command is availabe in the system: oc or kubectl
+// returns one of: "oc" or "kubectl"
+func GetAvailabeKubeCli() string {
+	kubeCommand := "kubectl"
+	cmd := exec.Command(kubeCommand)
+	err := cmd.Run()
+	if err == nil {
+		log.Printf("✅ kubectl exists - will use it for diagnostics\n")
+	} else {
+		log.Printf("❌ Could not find kubectl, will try to use oc instead, error: %s\n", err)
+		kubeCommand = "oc"
+		cmd = exec.Command(kubeCommand)
+		err = cmd.Run()
+		if err == nil {
+			log.Printf("✅ oc exists - will use it for diagnostics\n")
+		} else {
+			log.Fatalf("❌ Could not find both kubectl and oc, will stop running diagnostics, error: %s", err)
+		}
+	}
+	return kubeCommand
+}
+
+// GetEndpointByBackingStoreType returns the endpoint url the of the backing store if it is relevant to the type
+func GetEndpointByBackingStoreType(bs *nbv1.BackingStore) (string, error) {
+	var endpoint string
+	switch bs.Spec.Type {
+	case nbv1.StoreTypeAWSS3:
+		awsS3 := bs.Spec.AWSS3
+		u := url.URL{
+			Scheme: "https",
+			Host:   "s3.amazonaws.com",
+		}
+		if awsS3.SSLDisabled {
+			u.Scheme = "http"
+		}
+		if awsS3.Region != "" {
+			u.Host = fmt.Sprintf("s3.%s.amazonaws.com", awsS3.Region)
+		}
+		endpoint = u.String()
+	case nbv1.StoreTypeS3Compatible:
+		endpoint = bs.Spec.S3Compatible.Endpoint
+	case nbv1.StoreTypeIBMCos:
+		endpoint = bs.Spec.IBMCos.Endpoint
+	case nbv1.StoreTypeAzureBlob:
+		endpoint = "https://blob.core.windows.net"
+	case nbv1.StoreTypeGoogleCloudStorage:
+		endpoint = "https://www.googleapis.com"
+	case nbv1.StoreTypePVPool:
+		return endpoint, fmt.Errorf("%q type does not have endpoint parameter %q", bs.Spec.Type, bs.Name)
+	default:
+		return endpoint, fmt.Errorf("failed to get endpoint url from backingstore %q", bs.Name)
+	}
+	return endpoint, nil
+}
+
+// GetEndpointByNamespaceStoreType returns the endpoint url the of the backing store if it is relevant to the type
+func GetEndpointByNamespaceStoreType(ns *nbv1.NamespaceStore) (string, error) {
+	var endpoint string
+	switch ns.Spec.Type {
+	case nbv1.NSStoreTypeAWSS3:
+		awsS3 := ns.Spec.AWSS3
+		u := url.URL{
+			Scheme: "https",
+			Host:   "s3.amazonaws.com",
+		}
+		if awsS3.SSLDisabled {
+			u.Scheme = "http"
+		}
+		if awsS3.Region != "" {
+			u.Host = fmt.Sprintf("s3.%s.amazonaws.com", awsS3.Region)
+		}
+		endpoint = u.String()
+	case nbv1.NSStoreTypeS3Compatible:
+		endpoint = ns.Spec.S3Compatible.Endpoint
+	case nbv1.NSStoreTypeIBMCos:
+		endpoint = ns.Spec.IBMCos.Endpoint
+	case nbv1.NSStoreTypeAzureBlob:
+		endpoint = "https://blob.core.windows.net"
+	case nbv1.NSStoreTypeGoogleCloudStorage:
+		endpoint = "https://www.googleapis.com"
+	case nbv1.NSStoreTypeNSFS:
+		return endpoint, fmt.Errorf("%q type does not have endpoint parameter %q", ns.Spec.Type, ns.Name)
+	default:
+		return endpoint, fmt.Errorf("failed to get endpoint url from backingstore %q", ns.Name)
+	}
+	return endpoint, nil
+}
+
+// GetBackingStoreSecretByType returns the secret reference of the backing store if it is relevant to the type
+func GetBackingStoreSecretByType(bs *nbv1.BackingStore) (*corev1.SecretReference, error) {
+	var secretRef corev1.SecretReference
+	switch bs.Spec.Type {
+	case nbv1.StoreTypeAWSS3:
+		secretRef = bs.Spec.AWSS3.Secret
+	case nbv1.StoreTypeS3Compatible:
+		secretRef = bs.Spec.S3Compatible.Secret
+	case nbv1.StoreTypeIBMCos:
+		secretRef = bs.Spec.IBMCos.Secret
+	case nbv1.StoreTypeAzureBlob:
+		secretRef = bs.Spec.AzureBlob.Secret
+	case nbv1.StoreTypeGoogleCloudStorage:
+		secretRef = bs.Spec.GoogleCloudStorage.Secret
+	case nbv1.StoreTypePVPool:
+		secretRef = bs.Spec.PVPool.Secret
+	default:
+		return nil, fmt.Errorf("failed to get secret reference from backingstore %q", bs.Name)
+	}
+	return &secretRef, nil
+}
+
+// GetBackingStoreSecret returns the secret and adding the namespace if it is missing
+func GetBackingStoreSecret(bs *nbv1.BackingStore) (*corev1.SecretReference, error) {
+	secretRef, err := GetBackingStoreSecretByType(bs)
+	if err != nil {
+		return nil, err
+	}
+	if secretRef.Namespace == "" {
+		secretRef.Namespace = bs.Namespace
+	}
+	return secretRef, nil
+}
+
+// SetBackingStoreSecretRef setting a backingstore secret reference to the provided one
+func SetBackingStoreSecretRef(bs *nbv1.BackingStore, ref *corev1.SecretReference) error {
+	switch bs.Spec.Type {
+	case nbv1.StoreTypeAWSS3:
+		bs.Spec.AWSS3.Secret = *ref
+		return nil
+	case nbv1.StoreTypeS3Compatible:
+		bs.Spec.S3Compatible.Secret = *ref
+		return nil
+	case nbv1.StoreTypeIBMCos:
+		bs.Spec.IBMCos.Secret = *ref
+		return nil
+	case nbv1.StoreTypeAzureBlob:
+		bs.Spec.AzureBlob.Secret = *ref
+		return nil
+	case nbv1.StoreTypeGoogleCloudStorage:
+		bs.Spec.GoogleCloudStorage.Secret = *ref
+		return nil
+	case nbv1.StoreTypePVPool:
+		bs.Spec.PVPool.Secret = *ref
+		return nil
+	default:
+		return fmt.Errorf("failed to set backingstore %q secret reference", bs.Name)
+	}
+}
+
+// GetBackingStoreTargetBucket returns the target bucket of the backing store if it is relevant to the type
+func GetBackingStoreTargetBucket(bs *nbv1.BackingStore) (string, error) {
+	switch bs.Spec.Type {
+	case nbv1.StoreTypeAWSS3:
+		return bs.Spec.AWSS3.TargetBucket, nil
+	case nbv1.StoreTypeS3Compatible:
+		return bs.Spec.S3Compatible.TargetBucket, nil
+	case nbv1.StoreTypeIBMCos:
+		return bs.Spec.IBMCos.TargetBucket, nil
+	case nbv1.StoreTypeAzureBlob:
+		return bs.Spec.AzureBlob.TargetBlobContainer, nil
+	case nbv1.StoreTypeGoogleCloudStorage:
+		return bs.Spec.GoogleCloudStorage.TargetBucket, nil
+	case nbv1.StoreTypePVPool:
+		return "", nil
+	default:
+		return "", fmt.Errorf("failed to get backingstore %q target bucket", bs.Name)
+	}
+}
+
+// GetNamespaceStoreSecretByType returns the secret reference of the namespace store if it is relevant to the type
+func GetNamespaceStoreSecretByType(ns *nbv1.NamespaceStore) (*corev1.SecretReference, error) {
+	var secretRef corev1.SecretReference
+	switch ns.Spec.Type {
+	case nbv1.NSStoreTypeAWSS3:
+		secretRef = ns.Spec.AWSS3.Secret
+	case nbv1.NSStoreTypeS3Compatible:
+		secretRef = ns.Spec.S3Compatible.Secret
+	case nbv1.NSStoreTypeIBMCos:
+		secretRef = ns.Spec.IBMCos.Secret
+	case nbv1.NSStoreTypeAzureBlob:
+		secretRef = ns.Spec.AzureBlob.Secret
+	case nbv1.NSStoreTypeGoogleCloudStorage:
+		secretRef = ns.Spec.GoogleCloudStorage.Secret
+	case nbv1.NSStoreTypeNSFS:
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("failed to get namespacestore %q secret", ns.Name)
+	}
+
+	return &secretRef, nil
+}
+
+// GetNamespaceStoreSecret returns the secret and adding the namespace if it is missing
+func GetNamespaceStoreSecret(ns *nbv1.NamespaceStore) (*corev1.SecretReference, error) {
+	secretRef, err := GetNamespaceStoreSecretByType(ns)
+	if err != nil {
+		return nil, err
+	}
+	if secretRef != nil && secretRef.Namespace == "" {
+		secretRef.Namespace = ns.Namespace
+	}
+	return secretRef, nil
+}
+
+// SetNamespaceStoreSecretRef setting a namespacestore secret reference to the provided one
+func SetNamespaceStoreSecretRef(ns *nbv1.NamespaceStore, ref *corev1.SecretReference) error {
+	switch ns.Spec.Type {
+	case nbv1.NSStoreTypeAWSS3:
+		ns.Spec.AWSS3.Secret = *ref
+		return nil
+	case nbv1.NSStoreTypeS3Compatible:
+		ns.Spec.S3Compatible.Secret = *ref
+		return nil
+	case nbv1.NSStoreTypeIBMCos:
+		ns.Spec.IBMCos.Secret = *ref
+		return nil
+	case nbv1.NSStoreTypeAzureBlob:
+		ns.Spec.AzureBlob.Secret = *ref
+		return nil
+	case nbv1.NSStoreTypeGoogleCloudStorage:
+		ns.Spec.GoogleCloudStorage.Secret = *ref
+		return nil
+	case nbv1.NSStoreTypeNSFS:
+		return nil
+	default:
+		return fmt.Errorf("failed to set namespacestore %q secret reference", ns.Name)
+	}
+}
+
+// GetNamespaceStoreTargetBucket returns the target bucket of the namespace store if it is relevant to the type
+func GetNamespaceStoreTargetBucket(ns *nbv1.NamespaceStore) (string, error) {
+	switch ns.Spec.Type {
+	case nbv1.NSStoreTypeAWSS3:
+		return ns.Spec.AWSS3.TargetBucket, nil
+	case nbv1.NSStoreTypeS3Compatible:
+		return ns.Spec.S3Compatible.TargetBucket, nil
+	case nbv1.NSStoreTypeIBMCos:
+		return ns.Spec.IBMCos.TargetBucket, nil
+	case nbv1.NSStoreTypeAzureBlob:
+		return ns.Spec.AzureBlob.TargetBlobContainer, nil
+	case nbv1.NSStoreTypeGoogleCloudStorage:
+		return ns.Spec.GoogleCloudStorage.TargetBucket, nil
+	case nbv1.NSStoreTypeNSFS:
+		return "", nil
+	default:
+		return "", fmt.Errorf("failed to ger namespacestore %q target bucket", ns.Name)
+	}
+}
+
+// GetSecretFromSecretReference search and retruns a secret obj from a provided secret reference
+func GetSecretFromSecretReference(secretRef *corev1.SecretReference) (*corev1.Secret, error) {
+	if secretRef == nil || secretRef.Name == "" {
+		return nil, nil
+	}
+
+	o := KubeObject(bundle.File_deploy_internal_secret_empty_yaml)
+	secret := o.(*corev1.Secret)
+
+	secret.Name = secretRef.Name
+	secret.Namespace = secretRef.Namespace
+
+	if !KubeCheck(secret) {
+		return nil, fmt.Errorf(`❌ Could not get Secret %q in namespace %q`, secret.Name, secret.Namespace)
+	}
+
+	return secret, nil
+}
+
+// CheckForIdenticalSecretsCreds search and returns a secret name with identical credentials in the provided secret
+// the credentials to compare stored in mandatoryProp
+func CheckForIdenticalSecretsCreds(secret *corev1.Secret, storeTypeStr string) *corev1.Secret {
+	mandatoryProp, ok := MapStorTypeToMandatoryProperties[storeTypeStr]
+	if !ok {
+		log.Errorf("❌  failed to map store type %q to mandatory properties", storeTypeStr)
+	}
+	if secret == nil || len(mandatoryProp) == 0 {
 		return nil
 	}
+	nsList := &nbv1.NamespaceStoreList{
+		TypeMeta: metav1.TypeMeta{Kind: "NamespaceStoreList"},
+	}
+	bsList := &nbv1.BackingStoreList{
+		TypeMeta: metav1.TypeMeta{Kind: "BackingStoreList"},
+	}
+	KubeList(bsList, &client.ListOptions{Namespace: secret.Namespace})
+	KubeList(nsList, &client.ListOptions{Namespace: secret.Namespace})
 
-	if !IsVaultKMS(kms.ConnectionDetails[kmsProvider]) {
-		log.Errorf("Unsupported KMS provider %v", kms.ConnectionDetails[kmsProvider])
-		return fmt.Errorf("Unsupported KMS provider %v", kms.ConnectionDetails[kmsProvider])
-	}
-
-	c, err := InitVaultClient(kms.ConnectionDetails, kms.TokenSecretName, namespace)
-	if err != nil {
-		log.Errorf("deleting root key externally failed: init vault client: %v", err)
-		return err
-	}
-
-	secretPath, err := BuildExternalSecretPath(c, kms, uid)
-	if err != nil {
-		log.Errorf("deleting root key externally failed: %v", err)
-		return err
-	}
-
-	err = DeleteSecret(c, secretPath)
-	if err != nil {
-		log.Errorf("deleting root key externally failed: %v", err)
-		return err
-	}
-
-	return nil
-}
-
-// InitVaultClient inits the secret store
-func InitVaultClient(config map[string]string, tokenSecretName string, namespace string) (*vaultApi.Client, error) {
-	// set TLS configurations
-	vaultClientConfig := vaultApi.DefaultConfig()
-	tlsConfig, err := GetVaultTLSConfig(config, namespace)
-	if err != nil {
-		return nil, fmt.Errorf(`❌ Could not init vault tls config %q in namespace %q`, config, namespace)
-	}
-	err = vaultClientConfig.ConfigureTLS(tlsConfig)
-	if err != nil {
-		return nil, fmt.Errorf(`❌ Could not configure tls for vault %q in namespace %q`, config, namespace)
-	}
-	client, err := vaultApi.NewClient(vaultClientConfig)
-	if err != nil {
-		return nil, err
-	}
-	addr := strings.TrimSuffix(config[vaultAddr], "\n")
-	err = client.SetAddress(addr)
-	if err != nil {
-		return nil, err
-	}
-
-	secret := KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret)
-	secret.Namespace = namespace
-	secret.Name = tokenSecretName
-
-	if !KubeCheck(secret) {
-		return nil, fmt.Errorf(`❌ Could not find secret %q in namespace %q`, secret.Name, secret.Namespace)
-	}
-
-	token := secret.StringData["token"]
-	trimmedToken := strings.TrimSuffix(token, "\n")
-	client.SetToken(trimmedToken)
-
-	// set namespace
-	vaultNamespace := config["VAULT_NAMESPACE"]
-	if vaultNamespace != "" {
-		client.SetNamespace(vaultNamespace)
-	}
-	return client, nil
-}
-
-// GetVaultTLSConfig returns tlsConfig if given
-func GetVaultTLSConfig(config map[string]string, namespace string) (*api.TLSConfig, error) {
-	tlsConfig := &api.TLSConfig{}
-	secret := KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret)
-	secret.Namespace = namespace
-
-	if tlsServerName := config["VAULT_TLS_SERVER_NAME"]; tlsServerName != "" {
-		tlsConfig.TLSServerName = strings.TrimSuffix(tlsServerName, "\n")
-	}
-	if tlsSkipVerify := config["VAULT_SKIP_VERIFY"]; tlsSkipVerify == "true" {
-		tlsConfig.Insecure = true
-		err := os.Setenv("VAULT_SKIP_VERIFY", "true")
-		if err != nil {
-			return nil, fmt.Errorf("can not set env var %v %v", "VAULT_SKIP_VERIFY", "true")
-		}
-	}
-
-	if caCertSecretName := config[vaultCaCert]; caCertSecretName != "" {
-		secret.Name = caCertSecretName
-		if !KubeCheckOptional(secret) {
-			return nil, fmt.Errorf(`❌ Could not find secret %q in namespace %q`, secret.Name, secret.Namespace)
-		}
-		caFileAddr, err := writeCrtsToFile(caCertSecretName, namespace, secret.Data["cert"], vaultCaCert)
-		if err != nil {
-			return nil, fmt.Errorf("can not write crt %v to file %v", vaultCaCert, err)
-		}
-		tlsConfig.CACert = caFileAddr
-	}
-
-	if clientCertSecretName := config[vaultClientCert]; clientCertSecretName != "" {
-		secret.Name = clientCertSecretName
-		if !KubeCheckOptional(secret) {
-			return nil, fmt.Errorf(`❌ Could not find secret %q in namespace %q`, secret.Name, secret.Namespace)
-		}
-		clientCertFileAddr, err := writeCrtsToFile(clientCertSecretName, namespace, secret.Data["cert"], vaultClientCert)
-		if err != nil {
-			return nil, fmt.Errorf("can not write crt %v to file %v", vaultClientCert, err)
-		}
-		tlsConfig.ClientCert = clientCertFileAddr
-
-	}
-	if clientKeySecretName := config[vaultClientKey]; clientKeySecretName != "" {
-		secret.Name = clientKeySecretName
-		if !KubeCheckOptional(secret) {
-			return nil, fmt.Errorf(`❌ Could not find secret %q in namespace %q`, secret.Name, secret.Namespace)
-		}
-		clientKeyFileAddr, err := writeCrtsToFile(clientKeySecretName, namespace, secret.Data["key"], vaultClientKey)
-		if err != nil {
-			return nil, fmt.Errorf("can not write crt %v to file %v", vaultClientKey, err)
-		}
-		tlsConfig.ClientKey = clientKeyFileAddr
-	}
-	return tlsConfig, nil
-}
-
-// PutSecret writes the secret to the secrets store
-func PutSecret(client *vaultApi.Client, secretName, secretValue, secretPath string, backendPath string) error {
-
-	// Build Secret
-	data := make(map[string]interface{})
-	v2, err := isKV2(client, backendPath)
-	if err != nil {
-		return err
-	}
-	if v2 {
-		data["data"] = map[string]interface{}{secretName: secretValue}
-	} else {
-		data[secretName] = secretValue
-	}
-
-	_, err = client.Logical().Write(secretPath, data)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-// GetSecret reads the secret to the secrets store
-func GetSecret(client *vaultApi.Client, secretName, secretPath string, backendPath string) (string, error) {
-	secret, err := client.Logical().Read(secretPath)
-	if err != nil {
-		return "", err
-	}
-	if secret == nil {
-		return "", nil
-	}
-	v2, err := isKV2(client, backendPath)
-	if err != nil {
-		return "", err
-	}
-	if v2 {
-		rootKey, ok := secret.Data["data"].(map[string]interface{})
-		// data property does not exist in secret (in kv2 a secret may exist but have deletion timestamp)
-		if !ok {
-			return "", nil
-		}
-		rootKeyData := rootKey[secretName]
-		if rootKeyData != nil {
-			if rootKeyStr, ok := rootKeyData.(string); ok {
-				return rootKeyStr, nil
+	for _, bs := range bsList.Items {
+		if bs.Spec.Type != nbv1.StoreTypePVPool {
+			secretRef, err := GetBackingStoreSecret(&bs)
+			if err != nil {
+				log.Errorf("%s", err)
 			}
-		}
-	} else {
-		rootKey := secret.Data[secretName]
-		if rootKey != nil {
-			if rootKeyStr, ok := rootKey.(string); ok {
-				return rootKeyStr, nil
+			if secretRef != nil {
+				usedSecret, err := GetSecretFromSecretReference(secretRef)
+				if err != nil {
+					log.Errorf("%s", err)
+				}
+				if usedSecret != nil && usedSecret.Name != secret.Name && string(bs.Spec.Type) == storeTypeStr {
+					found := true
+					for _, key := range mandatoryProp {
+						found = found && MapAlternateKeysValue(usedSecret.StringData, key) == secret.StringData[key]
+					}
+					if found {
+						return usedSecret
+					}
+				}
 			}
 		}
 	}
-	log.Infof("get secret: found other secrets in external KMS path, but not path: %v, secret name: %v", backendPath, backendPath)
-	return "", nil
-}
 
-// DeleteSecret deletes the secret from the secrets store
-func DeleteSecret(client *vaultApi.Client, secretPath string) error {
-	_, err := client.Logical().Delete(secretPath)
-	if err != nil {
-		log.Infof("DeleteSecret: err %+v", err)
-		return err
+	for _, ns := range nsList.Items {
+		if ns.Spec.Type != nbv1.NSStoreTypeNSFS {
+			secretRef, err := GetNamespaceStoreSecret(&ns)
+			if err != nil {
+				log.Errorf("%s", err)
+			}
+			if secretRef != nil {
+				usedSecret, err := GetSecretFromSecretReference(secretRef)
+				if err != nil {
+					log.Errorf("%s", err)
+				}
+				if usedSecret != nil && usedSecret.Name != secret.Name && string(ns.Spec.Type) == storeTypeStr {
+					found := true
+					for _, key := range mandatoryProp {
+						found = found && MapAlternateKeysValue(usedSecret.StringData, key) == secret.StringData[key]
+					}
+					if found {
+						return usedSecret
+					}
+				}
+			}
+		}
 	}
-	log.Infof("DeleteSecret: deletion from secret path %+v succeded", secretPath)
-
 	return nil
 }
 
-func isKV2(client *vaultApi.Client, backend string) (bool, error) {
-	if backend == "" {
-		backend = defaultVaultBackendPath
-	}
-	if !strings.HasSuffix(backend, "/") {
-		backend += "/"
-	}
-	mounts, err := client.Sys().ListMounts()
-	if err != nil {
-		return false, err
-	}
-	kvBackend, ok := mounts[backend]
+// SetOwnerReference setting a owner reference of owner to dependent metadata with the field of blockOwnerDeletion: true
+// controllerutil.SetOwnerReference is doing the same thing but without blockOwnerDeletion: true
+// If a reference to the same object already exists, it'll return an AlreadyOwnedError. see:
+// https://github.com/kubernetes-sigs/controller-runtime/blob/master/pkg/controller/controllerutil/controllerutil.go#L93
+func SetOwnerReference(owner, dependent metav1.Object, scheme *runtime.Scheme) error {
+	// Validate the owner.
+	ro, ok := owner.(runtime.Object)
 	if !ok {
-		return false, fmt.Errorf("can not find backend path %v in vault", backend)
+		return fmt.Errorf("%T is not a runtime.Object, cannot call SetControllerReference", owner)
 	}
-	if len(kvBackend.Options) > 0 && kvBackend.Options["version"] == "2" {
-		return true, nil
+	if err := validateOwner(owner, dependent); err != nil {
+		return err
 	}
-	return false, nil
-}
-
-// BuildExternalSecretPath builds a string that specifies the root key secret path
-func BuildExternalSecretPath(client *vaultApi.Client, kms nbv1.KeyManagementServiceSpec, uid string) (string, error) {
-	secretPath := ""
-	backendPath := kms.ConnectionDetails[vaultBackendPath]
-	if backendPath != "" {
-		secretPath += backendPath
-		if !strings.HasSuffix(backendPath, "/") {
-			secretPath += "/"
-		}
-	} else {
-		secretPath += defaultVaultBackendPath
-	}
-
-	v2, err := isKV2(client, backendPath)
+	// Create a new ref.
+	gvk, err := apiutil.GVKForObject(ro, scheme)
 	if err != nil {
-		return "", err
+		return err
 	}
-	if v2 {
-		secretPath += "data/"
+	ref := metav1.OwnerReference{
+		APIVersion:         gvk.GroupVersion().String(),
+		Kind:               gvk.Kind,
+		Name:               owner.GetName(),
+		UID:                owner.GetUID(),
+		BlockOwnerDeletion: ptr.To[bool](true),
 	}
-	secretPath += rootSecretPath
-	secretPath += "/rootkeyb64-" + uid
-	return secretPath, nil
+
+	owners := dependent.GetOwnerReferences()
+	if idx := indexOwnerRef(owners, ref); idx == -1 {
+		owners = append(owners, ref)
+	} else {
+		return &controllerutil.AlreadyOwnedError{
+			Object: dependent,
+			Owner:  ref,
+		}
+	}
+	dependent.SetOwnerReferences(owners)
+	return nil
 }
 
-// IsVaultKMS return true if kms provider is vault
-func IsVaultKMS(provider string) bool {
-	return provider == "vault"
-}
-
-// ValidateConnectionDetails return error if kms connection details are faulty
-func ValidateConnectionDetails(config map[string]string, tokenSecretName string, namespace string) error {
-	// validate auth token
-	if tokenSecretName == "" {
-		return fmt.Errorf("kms token is missing")
-	}
-	secret := KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret)
-	secret.Namespace = namespace
-	secret.Name = tokenSecretName
-
-	if !KubeCheck(secret) {
-		return fmt.Errorf(`❌ Could not find secret %q in namespace %q`, secret.Name, secret.Namespace)
-	}
-
-	token, ok := secret.StringData["token"]
-	if !ok || token == "" {
-		return fmt.Errorf("kms token in token secret is missing")
-	}
-	// validate connection details
-	providerType := config[kmsProvider]
-	if IsVaultKMS(providerType) {
-		return ValidateVaultConnectionDetails(config, tokenSecretName, namespace)
-	}
-	return fmt.Errorf("Unsupported kms type: %v", providerType)
-}
-
-// ValidateVaultConnectionDetails return error if vault connection details are faulty
-func ValidateVaultConnectionDetails(config map[string]string, tokenName string, namespace string) error {
-	if addr, ok := config[vaultAddr]; !ok || addr == "" {
-		return fmt.Errorf("failed to validate vault connection details: vault address is missing")
-	}
-	if capPath, ok := config[vaultCaPath]; ok && capPath != "" {
-		// We do not support a directory with multiple CA since we fetch a k8s Secret and read its content
-		// So we operate with a single CA only
-		return fmt.Errorf("failed to validate vault connection details: multiple CA is unsupported")
-	}
-	secret := KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret)
-	secret.Namespace = namespace
-
-	vaultTLSConnectionDetailsMap := map[string]string{vaultCaCert: "cert",
-		vaultClientCert: "cert", vaultClientKey: "key"}
-
-	for tlsOption, fieldInSecret := range vaultTLSConnectionDetailsMap {
-		tlsOptionSecretName, ok := config[tlsOption]
-		if ok && tlsOptionSecretName != "" {
-			secret.Name = tlsOptionSecretName
-			if !KubeCheckOptional(secret) {
-				return fmt.Errorf(`❌ Could not find secret %q in namespace %q`, secret.Name, secret.Namespace)
-			}
-			if tlsOptionValue, ok := secret.Data[fieldInSecret]; !ok || len(tlsOptionValue) == 0 {
-				return fmt.Errorf("failed to validate vault connection details: vault %v is missing in secret %q in namespace %q",
-					tlsOption, secret.Name, secret.Namespace)
-			}
+func validateOwner(owner, object metav1.Object) error {
+	ownerNs := owner.GetNamespace()
+	if ownerNs != "" {
+		objNs := object.GetNamespace()
+		if objNs == "" {
+			return fmt.Errorf("cluster-scoped resource must not have a namespace-scoped owner, owner's namespace %s", ownerNs)
+		}
+		if ownerNs != objNs {
+			return fmt.Errorf("cross-namespace owner references are disallowed, owner's namespace %s, object's namespace %s", owner.GetNamespace(), object.GetNamespace())
 		}
 	}
 	return nil
 }
 
-func writeCrtsToFile(secretName string, namespace string, secretValue []byte, envVarName string) (string, error) {
-	// check here first the env variable
-	if envVar, found := os.LookupEnv(envVarName); found && envVar != "" {
-		return envVar, nil
+// indexOwnerRef returns the index of the owner reference in the slice if found, or -1.
+func indexOwnerRef(ownerReferences []metav1.OwnerReference, ref metav1.OwnerReference) int {
+	for index, r := range ownerReferences {
+		if referSameObject(r, ref) {
+			return index
+		}
 	}
+	return -1
+}
 
-	// Generate a temp file
-	file, err := ioutil.TempFile("", "")
+// Returns true if a and b point to the same object.
+func referSameObject(a, b metav1.OwnerReference) bool {
+	aGV, err := schema.ParseGroupVersion(a.APIVersion)
 	if err != nil {
-		return "", fmt.Errorf("failed to generate temp file for k8s secret %q content, %v", secretName, err)
+		return false
 	}
 
-	// Write into a file
-	err = ioutil.WriteFile(file.Name(), secretValue, 0444)
+	bGV, err := schema.ParseGroupVersion(b.APIVersion)
 	if err != nil {
-		return "", fmt.Errorf("failed to write k8s secret %q content to a file %v", secretName, err)
+		return false
 	}
 
-	// update the env var with the path
-	envVarValue := file.Name()
-	envVarKey := envVarName
+	return aGV.Group == bGV.Group && a.Kind == b.Kind && a.Name == b.Name
+}
 
-	err = os.Setenv(envVarKey, envVarValue)
-	if err != nil {
-		return "", fmt.Errorf("can not set env var %v %v", envVarKey, envVarValue)
+// IsOwnedByNoobaa receives an array of owner references and returns true if one of them is of a noobaa resource
+func IsOwnedByNoobaa(ownerReferences []metav1.OwnerReference) bool {
+	for _, ownerRef := range ownerReferences {
+		if strings.Contains(ownerRef.APIVersion, "noobaa") {
+			return true
+		}
 	}
-	return envVarValue, nil
+	return false
+}
+
+// PrettyPrint the string array in multiple lines, if length greater than 1
+func PrettyPrint(key string, strArray []string) {
+	if len(strArray) > 1 {
+		fmt.Printf("%s : [ %s,\n", key, strArray[0])
+		for indx, i := range strArray[1:] {
+			if indx != len(strArray)-2 {
+				fmt.Printf("\t\t%s,\n", i)
+			} else {
+				fmt.Printf("\t\t%s ]\n", i)
+			}
+		}
+	} else {
+		fmt.Printf("%s : %s\n", key, strArray)
+	}
+}
+
+// MapAlternateKeysValue scans the map, returning the alternative key name's value if present
+// the canonical key name value otherwise
+// used to map values from secrets using alternative names
+func MapAlternateKeysValue(stringData map[string]string, key string) string {
+	alternativeNames := map[string][]string{
+		"AWS_ACCESS_KEY_ID":     {"aws_access_key_id", "AccessKey"},
+		"AWS_SECRET_ACCESS_KEY": {"aws_secret_access_key", "SecretKey"},
+	}
+
+	if stringData[key] == "" {
+		for _, altKey := range alternativeNames[key] {
+			if stringData[altKey] != "" {
+				return stringData[altKey]
+			}
+		}
+	}
+
+	return stringData[key]
+}
+
+// FilterSlice takes in a slice and a filter function which
+// must return false for the all the elements that need to be
+// renoved from the slice
+func FilterSlice[V any](slice []V, f func(V) bool) []V {
+	var r []V
+	for _, v := range slice {
+		if f(v) {
+			r = append(r, v)
+		}
+	}
+	return r
+}
+
+// IsTestEnv checks for TEST_ENV env var existance and equality
+// to true and returns true or false accordingly
+func IsTestEnv() bool {
+	testEnv, ok := os.LookupEnv("TEST_ENV")
+	if ok && testEnv == "true" {
+		return true
+	}
+	return false
+}
+
+// IsDevEnv checks for DEV_ENV env var existance and equality
+// to true and returns true or false accordingly
+func IsDevEnv() bool {
+	devEnv, ok := os.LookupEnv("DEV_ENV")
+	if ok && devEnv == "true" {
+		return true
+	}
+	return false
 }

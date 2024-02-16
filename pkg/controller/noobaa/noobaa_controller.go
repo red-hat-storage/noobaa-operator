@@ -1,6 +1,8 @@
 package noobaa
 
 import (
+	"context"
+
 	nbv1 "github.com/noobaa/noobaa-operator/v5/pkg/apis/noobaa/v1alpha1"
 	"github.com/noobaa/noobaa-operator/v5/pkg/nb"
 	"github.com/noobaa/noobaa-operator/v5/pkg/options"
@@ -13,6 +15,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -27,7 +30,7 @@ type NotificationSource struct {
 }
 
 // Start will setup s.Queue field
-func (s *NotificationSource) Start(handler handler.EventHandler, q workqueue.RateLimitingInterface, predicates ...predicate.Predicate) error {
+func (s *NotificationSource) Start(context context.Context, handler handler.EventHandler, q workqueue.RateLimitingInterface, predicates ...predicate.Predicate) error {
 	s.Queue = q
 	return nil
 }
@@ -41,7 +44,7 @@ func Add(mgr manager.Manager) error {
 	c, err := controller.New("noobaa-controller", mgr, controller.Options{
 		MaxConcurrentReconciles: 1,
 		Reconciler: reconcile.Func(
-			func(req reconcile.Request) (reconcile.Result, error) {
+			func(context context.Context, req reconcile.Request) (reconcile.Result, error) {
 				return system.NewReconciler(
 					req.NamespacedName,
 					mgr.GetClient(),
@@ -72,46 +75,55 @@ func Add(mgr manager.Manager) error {
 	)
 
 	// Watch for changes on resources to trigger reconcile
-	ownerHandler := &handler.EnqueueRequestForOwner{IsController: true, OwnerType: &nbv1.NooBaa{}}
+	ownerHandler := handler.EnqueueRequestForOwner(
+		mgr.GetScheme(),
+		mgr.GetRESTMapper(),
+		&nbv1.NooBaa{},
+		handler.OnlyControllerOwner(),
+	)
 
-	err = c.Watch(&source.Kind{Type: &nbv1.NooBaa{}}, &handler.EnqueueRequestForObject{},
+	err = c.Watch(source.Kind(mgr.GetCache(), &nbv1.NooBaa{}), &handler.EnqueueRequestForObject{},
 		noobaaPredicate, &logEventsPredicate)
 	if err != nil {
 		return err
 	}
-	err = c.Watch(&source.Kind{Type: &appsv1.StatefulSet{}}, ownerHandler, &filterForOwnerPredicate, &logEventsPredicate)
+	err = c.Watch(source.Kind(mgr.GetCache(), &appsv1.StatefulSet{}), ownerHandler, &filterForOwnerPredicate, &logEventsPredicate)
 	if err != nil {
 		return err
 	}
-	err = c.Watch(&source.Kind{Type: &corev1.Service{}}, ownerHandler, &filterForOwnerPredicate, &logEventsPredicate)
+	err = c.Watch(source.Kind(mgr.GetCache(), &corev1.Service{}), ownerHandler, &filterForOwnerPredicate, &logEventsPredicate)
 	if err != nil {
 		return err
 	}
-	err = c.Watch(&source.Kind{Type: &corev1.Pod{}}, ownerHandler, &filterForOwnerPredicate, &logEventsPredicate)
+	err = c.Watch(source.Kind(mgr.GetCache(), &corev1.Pod{}), ownerHandler, &filterForOwnerPredicate, &logEventsPredicate)
 	if err != nil {
 		return err
 	}
-	err = c.Watch(&source.Kind{Type: &appsv1.Deployment{}}, ownerHandler, &filterForOwnerPredicate, &logEventsPredicate)
+	err = c.Watch(source.Kind(mgr.GetCache(), &appsv1.Deployment{}), ownerHandler, &filterForOwnerPredicate, &logEventsPredicate)
+	if err != nil {
+		return err
+	}
+	err = c.Watch(source.Kind(mgr.GetCache(), &corev1.ConfigMap{}), ownerHandler, &filterForOwnerPredicate, &logEventsPredicate)
 	if err != nil {
 		return err
 	}
 
-	storageClassHandler := handler.EnqueueRequestsFromMapFunc{
-		ToRequests: handler.ToRequestsFunc(func(mo handler.MapObject) []reconcile.Request {
-			sc, ok := mo.Object.(*storagev1.StorageClass)
-			if !ok || sc.Provisioner != options.ObjectBucketProvisionerName() {
-				return nil
-			}
-			return []reconcile.Request{{
-				NamespacedName: types.NamespacedName{
-					Name:      options.SystemName,
-					Namespace: options.Namespace,
-				},
-			}}
-		}),
-	}
+	storageClassHandler := handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, mo client.Object) []reconcile.Request {
+		sc, ok := mo.(*storagev1.StorageClass)
+		if !ok || sc.Provisioner != options.ObjectBucketProvisionerName() {
+			return nil
+		}
+		return []reconcile.Request{{
+			NamespacedName: types.NamespacedName{
+				Name:      options.SystemName,
+				Namespace: options.Namespace,
+			},
+		}}
+	},
+	)
+
 	// Watch for StorageClass changes to trigger reconcile and recreate it when deleted
-	err = c.Watch(&source.Kind{Type: &storagev1.StorageClass{}}, &storageClassHandler, &logEventsPredicate)
+	err = c.Watch(source.Kind(mgr.GetCache(), &storagev1.StorageClass{}), storageClassHandler, &logEventsPredicate)
 	if err != nil {
 		return err
 	}

@@ -2,10 +2,13 @@ package install
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/noobaa/noobaa-operator/v5/pkg/backingstore"
 	"github.com/noobaa/noobaa-operator/v5/pkg/bucketclass"
 	"github.com/noobaa/noobaa-operator/v5/pkg/crd"
+	"github.com/noobaa/noobaa-operator/v5/pkg/namespacestore"
+	"github.com/noobaa/noobaa-operator/v5/pkg/noobaaaccount"
 	"github.com/noobaa/noobaa-operator/v5/pkg/obc"
 	"github.com/noobaa/noobaa-operator/v5/pkg/operator"
 	"github.com/noobaa/noobaa-operator/v5/pkg/options"
@@ -20,6 +23,7 @@ func CmdInstall() *cobra.Command {
 		Use:   "install",
 		Short: "Install the operator and create the noobaa system",
 		Run:   RunInstall,
+		Args:  cobra.NoArgs,
 	}
 	cmd.Flags().Bool("use-obc-cleanup-policy", false, "Create NooBaa system with obc cleanup policy")
 	cmd.AddCommand(
@@ -34,6 +38,7 @@ func CmdYaml() *cobra.Command {
 		Use:   "yaml",
 		Short: "Show install yaml, expected usage \"noobaa install 1> install.yaml\"",
 		Run:   RunYaml,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -53,12 +58,26 @@ func RunYaml(cmd *cobra.Command, args []string) {
 	log.Println("✅ Done dumping installation yaml")
 }
 
+// CmdUpgrade returns a CLI command
+func CmdUpgrade() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "upgrade --noobaa-image <noobaa-image-path-and-tag> --operator-image <operator-image-path-and-tag>",
+		Short: "Upgrade the system, its components and CRDS",
+		Long:  "The command should be used in conjunction with the global flags --noobaa-image and " + 
+		"--operator-image to upgrade the system and its components to the desired versions.",
+		Run:   RunUpgrade,
+		Args:  cobra.NoArgs,
+	}
+	return cmd
+}
+
 // CmdUninstall returns a CLI command
 func CmdUninstall() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "uninstall",
 		Short: "Uninstall the operator and delete the system",
 		Run:   RunUninstall,
+		Args:  cobra.NoArgs,
 	}
 	cmd.Flags().Bool("cleanup", false, "Enable deletion of Namespace and CRD's")
 	cmd.Flags().Bool("cleanup_data", false, "Clean object buckets")
@@ -71,6 +90,7 @@ func CmdStatus() *cobra.Command {
 		Use:   "status",
 		Short: "Status of the operator and the system",
 		Run:   RunStatus,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -100,9 +120,50 @@ func RunInstall(cmd *cobra.Command, args []string) {
 	}
 }
 
+// RunUpgrade runs a CLI command
+func RunUpgrade(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+	log.Printf("System versions prior to upgrade:\n")
+	system.RunSystemVersionsStatus(cmd, args)
+	log.Printf("Namespace: %s\n", options.Namespace)
+	log.Printf("CRD upgrade:")
+	crd.RunUpgrade(cmd, args)
+	log.Printf("\nOperator upgrade:")
+	operator.RunUpgrade(cmd, args)
+	log.Printf("\nSystem apply:")
+	system.RunUpgrade(cmd, args)
+	log.Printf("")
+	util.PrintThisNoteWhenFinishedApplyingAndStartWaitLoop()
+	log.Printf("\nWaiting for the system to be ready...")
+	// Sleep to let the system get out of its old Ready state
+	time.Sleep(3 * time.Second)
+	if system.WaitReady() {
+		log.Printf("\n\n")
+		RunStatus(cmd, args)
+	}
+}
+
 // RunUninstall runs a CLI command
 func RunUninstall(cmd *cobra.Command, args []string) {
 	log := util.Logger()
+	cleanup, _ := cmd.Flags().GetBool("cleanup")
+
+	if cleanup {
+		var decision string
+
+		for {
+			log.Printf("--cleanup removes the CRDs and affecting all noobaa instances, are you sure? y/n ")
+			fmt.Scanln(&decision)
+
+			if decision == "y" {
+				log.Printf("Will remove CRD (cluster scope)")
+				break
+			} else if decision == "n" {
+				return
+			}
+		}
+	}
+
 	system.RunSystemVersionsStatus(cmd, args)
 	log.Printf("Namespace: %s", options.Namespace)
 	log.Printf("")
@@ -112,7 +173,6 @@ func RunUninstall(cmd *cobra.Command, args []string) {
 	log.Printf("Operator Delete:")
 	operator.RunUninstall(cmd, args)
 	log.Printf("")
-	cleanup, _ := cmd.Flags().GetBool("cleanup")
 	if cleanup {
 		log.Printf("CRD Delete:")
 		crd.RunDelete(cmd, args)
@@ -151,11 +211,25 @@ func RunStatus(cmd *cobra.Command, args []string) {
 	backingstore.RunList(cmd, args)
 	fmt.Println("")
 
+	fmt.Println("#--------------------#")
+	fmt.Println("#- Namespace Stores -#")
+	fmt.Println("#--------------------#")
+	fmt.Println("")
+	namespacestore.RunList(cmd, args)
+	fmt.Println("")
+
 	fmt.Println("#------------------#")
 	fmt.Println("#- Bucket Classes -#")
 	fmt.Println("#------------------#")
 	fmt.Println("")
 	bucketclass.RunList(cmd, args)
+	fmt.Println("")
+
+	fmt.Println("#-------------------#")
+	fmt.Println("#- NooBaa Accounts -#")
+	fmt.Println("#-------------------#")
+	fmt.Println("")
+	noobaaaccount.RunList(cmd, args)
 	fmt.Println("")
 
 	fmt.Println("#-----------------#")

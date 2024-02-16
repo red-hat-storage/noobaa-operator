@@ -1,0 +1,96 @@
+name: Admission Webhook Tests
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  run-admission-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout noobaa-operator
+        uses: actions/checkout@v4
+        with:
+          repository: "noobaa/noobaa-operator"
+          path: "noobaa-operator"
+
+      - name: Setup Go on runner
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.20"
+
+      - name: Set environment variables
+        run: |
+          echo PATH=$PATH:$HOME/go/bin                           >> $GITHUB_ENV
+          echo OPERATOR_IMAGE=noobaa/noobaa-operator:integration >> $GITHUB_ENV
+          echo CHANGE_MINIKUBE_NONE_USER=true                    >> $GITHUB_ENV
+
+      - name: Deploy dependencies
+        run: |
+          set -x
+          cd ./noobaa-operator
+          sudo bash .travis/install-minikube.sh
+          go get -v github.com/onsi/ginkgo/ginkgo
+          go install -v github.com/onsi/ginkgo/ginkgo
+          ginkgo version
+
+      - name: Change settings for k8s and minikube
+        run: |
+          sudo mv /root/.kube /root/.minikube $HOME
+          sudo chown -R $USER $HOME/.kube $HOME/.minikube
+          sed "s/root/home\/$USER/g" $HOME/.kube/config > tmp; mv tmp $HOME/.kube/config
+
+      - name: Build operator image
+        run: |
+          set -x
+          cd ./noobaa-operator
+          make cli
+          make image
+          sudo docker tag noobaa/noobaa-operator:$(go run cmd/version/main.go) $OPERATOR_IMAGE
+
+      - name: Install noobaa system
+        run: |
+          cd ./noobaa-operator
+          ./build/_output/bin/noobaa-operator crd create -n test
+          ./build/_output/bin/noobaa-operator operator install --operator-image=$OPERATOR_IMAGE --admission --test-env -n test
+          ./build/_output/bin/noobaa-operator system create \
+          --db-resources='{ "limits": {"cpu": "80m","memory": "1G"}, "requests": {"cpu": "80m","memory": "1G"}}' \
+          --core-resources='{ "limits": {"cpu": "80m","memory": "1G"}, "requests": {"cpu": "80m","memory": "1G"}}' \
+          --endpoint-resources='{ "limits": {"cpu": "80m","memory": "1G"}, "requests": {"cpu": "80m","memory": "1G"}}' \
+          -n test
+          ./build/_output/bin/noobaa-operator status -n test
+
+      - name: Wait for phase Ready in the backingstore pod
+        run: |
+          cd ./noobaa-operator
+          ./.travis/number_of_pods_in_system.sh --namespace test --pods 5
+          kubectl wait --for=condition=available backingstore/noobaa-default-backing-store --timeout=10m -n test
+
+      - name: Run Admission test
+        run: |
+          set -x
+          cd ./noobaa-operator
+          make test-admission
+
+      - name: Collect logs
+        if: ${{ failure() }}
+        run: |
+          set -x
+          cd ./noobaa-operator
+          kubectl get events --sort-by='.metadata.creationTimestamp' -A > logs_kubectl_events.txt
+          ./build/_output/bin/noobaa-operator diagnostics collect --db-dump --dir=admission-tests-logs -n test
+          mv logs_kubectl_events.txt ./admission-tests-logs
+
+      - name: Save logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: admission-tests-logs
+          path: noobaa-operator/admission-tests-logs
+
+        # Uncomment this step in case where you want to connect to the VM of this workflow using SSH.
+        # Pay attention that this workflow was configured with a timeout, and you might change it for this step.
+        # - name: Setup tmate session
+        #   if: ${{ failure() }}
+        #   uses: mxschmitt/action-tmate@v3
