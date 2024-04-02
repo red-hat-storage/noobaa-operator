@@ -871,7 +871,7 @@ func (r *Reconciler) prepareAWSBackingStore() error {
 				*result.Credentials.SessionToken,
 			),
 			HTTPClient: &http.Client{
-				Transport: util.SecureHTTPTransport,
+				Transport: util.GlobalCARefreshingTransport,
 				Timeout:   10 * time.Second,
 			},
 			Region: &region,
@@ -884,7 +884,7 @@ func (r *Reconciler) prepareAWSBackingStore() error {
 				"",
 			),
 			HTTPClient: &http.Client{
-				Transport: util.SecureHTTPTransport,
+				Transport: util.GlobalCARefreshingTransport,
 				Timeout:   10 * time.Second,
 			},
 			Region: &region,
@@ -1134,7 +1134,7 @@ func (r *Reconciler) prepareIBMBackingStore() error {
 			"",
 		),
 		HTTPClient: &http.Client{
-			Transport: util.SecureHTTPTransport,
+			Transport: util.GlobalCARefreshingTransport,
 			Timeout:   10 * time.Second,
 		},
 		Region: &location,
@@ -1218,7 +1218,7 @@ func (r *Reconciler) prepareCephBackingStore() error {
 		Timeout:   10 * time.Second,
 	}
 	if r.ApplyCAsToPods != "" {
-		client.Transport = util.SecureHTTPTransport
+		client.Transport = util.GlobalCARefreshingTransport
 	}
 
 	s3Config := &aws.Config{

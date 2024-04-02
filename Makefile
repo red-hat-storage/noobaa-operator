@@ -24,8 +24,8 @@ else
 GOBIN=$(shell go env GOBIN)
 endif
 
-CONTROLLER_GEN_VERSION=v0.12.0
-DEEPCOPY_GEN_VERSION=v0.27.0
+CONTROLLER_GEN_VERSION=v0.14.0
+DEEPCOPY_GEN_VERSION=v0.29.3
 
 GO_LINUX ?= GOOS=linux GOARCH=amd64
 GOHOSTOS ?= $(shell go env GOHOSTOS)
@@ -239,6 +239,11 @@ test-kms-tls-token: vendor
 	ginkgo -v pkg/util/kms/test/tls-token
 	@echo "✅ test-kms-tls-token"
 .PHONY: test-kms-tls-token
+
+test-kms-azure-vault: vendor
+	ginkgo -v pkg/util/kms/test/azure-vault
+	@echo "✅ test-kms-azure-vault"
+.PHONY: test-kms-azure-vault
 
 test-kms-ibm-kp: vendor
 	ginkgo -v pkg/util/kms/test/ibm-kp

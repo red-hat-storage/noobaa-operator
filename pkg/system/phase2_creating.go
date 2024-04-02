@@ -27,6 +27,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -69,7 +70,7 @@ func (r *Reconciler) ReconcilePhaseCreating() error {
 	if err := r.ReconcileObject(r.ServiceS3, r.SetDesiredServiceS3); err != nil {
 		return err
 	}
-	if err := r.ReconcileObjectOptional(r.RouteS3, nil); err != nil {
+	if err := r.ReconcileObjectOptional(r.RouteS3, r.SetDesiredRouteS3); err != nil {
 		return err
 	}
 	if err := r.ReconcileObject(r.ServiceSts, r.SetDesiredServiceSts); err != nil {
@@ -226,6 +227,15 @@ func (r *Reconciler) SetDesiredServiceS3() error {
 	}
 	r.ServiceS3.Spec.Selector["noobaa-s3"] = r.Request.Name
 	r.ServiceS3.Labels["noobaa-s3-svc"] = "true"
+	return nil
+}
+
+// SetDesiredRouteS3 updates the RouteS3 as desired for reconciling
+func (r *Reconciler) SetDesiredRouteS3() error {
+	r.RouteS3.Spec.TLS.InsecureEdgeTerminationPolicy = "Allow"
+	if r.NooBaa.Spec.DenyHTTP {
+		r.RouteS3.Spec.TLS.InsecureEdgeTerminationPolicy = "None"
+	}
 	return nil
 }
 
@@ -559,6 +569,39 @@ func (r *Reconciler) SetDesiredCoreApp() error {
 					ReadOnly:  true,
 				}}
 				util.MergeVolumeMountList(&c.VolumeMounts, &secretVolumeMounts)
+			}
+		case "noobaa-log-processor":
+			if c.Image != r.NooBaa.Status.ActualImage {
+				coreImageChanged = true
+				c.Image = r.NooBaa.Status.ActualImage
+			}
+			// adding the missing Env variable from default container
+			util.MergeEnvArrays(&c.Env, &r.DefaultCoreApp.Env)
+			r.setDesiredCoreEnv(c)
+
+			if r.NooBaa.Spec.LogResources != nil {
+				c.Resources = *r.NooBaa.Spec.LogResources
+			} else {
+				var reqCPU, reqMem resource.Quantity
+				reqCPU, _ = resource.ParseQuantity("200m")
+				reqMem, _ = resource.ParseQuantity("500Mi")
+
+				logResourceList := corev1.ResourceList{
+					corev1.ResourceCPU:    reqCPU,
+					corev1.ResourceMemory: reqMem,
+				}
+				c.Resources = corev1.ResourceRequirements{
+					Requests: logResourceList,
+					Limits:   logResourceList,
+				}
+			}
+			if util.KubeCheckQuiet(r.CaBundleConf) {
+				configMapVolumeMounts := []corev1.VolumeMount{{
+					Name:      r.CaBundleConf.Name,
+					MountPath: "/etc/pki/ca-trust/extracted/pem",
+					ReadOnly:  true,
+				}}
+				util.MergeVolumeMountList(&c.VolumeMounts, &configMapVolumeMounts)
 			}
 		}
 	}
@@ -1567,7 +1610,9 @@ func (r *Reconciler) HasUpgradeDbContainerFailed(dbPod *corev1.Pod) string {
 			if dbPod.Status.InitContainerStatuses[i].State.Waiting != nil {
 				return dbPod.Status.InitContainerStatuses[i].State.Waiting.Reason
 			}
-			return dbPod.Status.InitContainerStatuses[i].State.String()
+			if dbPod.Status.InitContainerStatuses[i].State.Running != nil {
+				return "Running"
+			}
 		}
 	}
 	return "NotFound"
@@ -1636,6 +1681,8 @@ func (r *Reconciler) UpgradePostgresDB() error {
 				*r.NooBaa.Spec.DBImage, os.Getenv("NOOBAA_DB_IMAGE"))
 			return nil
 		}
+		r.Recorder.Eventf(r.NooBaa, corev1.EventTypeNormal, "DbUpgrade",
+			"Configuring DB pod to run dbdump of PostgreSQL data")
 		r.Logger.Infof("UpgradePostgresDB: setting phase to %s", nbv1.UpgradePhasePrepare)
 		phase = nbv1.UpgradePhasePrepare
 		r.NooBaa.Status.BeforeUpgradeDbImage = &oldImage
@@ -1652,8 +1699,11 @@ func (r *Reconciler) UpgradePostgresDB() error {
 		r.Logger.Infof("UpgradePostgresDB: restarting DB pods after updating pod's init contatiner for db-dump")
 		restartError := r.RestartDbPods() // make sure new pods will start
 		if restartError != nil {
-			r.Logger.Warn("UpgradePostgresDB: Unable to restart db pods")
+			r.Logger.Warnf("UpgradePostgresDB: Unable to restart db pods %v", restartError)
+			return restartError
 		}
+		r.Recorder.Eventf(r.NooBaa, corev1.EventTypeNormal, "DbUpgrade",
+			"Starting dump. Start running DB dump in version 12 format")
 		phase = nbv1.UpgradePhaseUpgrade
 
 	case nbv1.UpgradePhaseUpgrade:
@@ -1679,7 +1729,7 @@ func (r *Reconciler) UpgradePostgresDB() error {
 			hasInitContainerFailed = true
 			break
 		}
-		r.Logger.Infof("UpgradePostgresDB: upgrade-db container didn't fail and finished dumping the old data")
+		r.Logger.Infof("UpgradePostgresDB: upgrade-db container didn't fail and finished dumping the old data [status=%s]", status)
 		if err = r.ReconcileSetDbImageAndInitCode(GetDesiredDBImage(r.NooBaa), "/init/upgradedb.sh", false); err != nil {
 			r.Logger.Errorf("UpgradePostgresDB: got error on postgres STS reconcile %v", err)
 			break
@@ -1689,6 +1739,8 @@ func (r *Reconciler) UpgradePostgresDB() error {
 		if restartError != nil {
 			r.Logger.Warn("UpgradePostgresDB: Unable to restart db pods")
 		}
+		r.Recorder.Eventf(r.NooBaa, corev1.EventTypeNormal, "DbUpgrade",
+			"Finished dump. Start running upgrade of DB data from version 12 format to version 15")
 		phase = nbv1.UpgradePhaseClean
 
 	case nbv1.UpgradePhaseClean:
@@ -1715,7 +1767,7 @@ func (r *Reconciler) UpgradePostgresDB() error {
 			hasInitContainerFailed = true
 			break
 		}
-		r.Logger.Infof("UpgradePostgresDB: upgrade-db container didn't fail and finished moving data to new version")
+		r.Logger.Infof("UpgradePostgresDB: upgrade-db container didn't fail and finished moving data to new version [status=%s]", status)
 		if dbPod.Status.Phase != "Running" && dbPod.ObjectMeta.DeletionTimestamp == nil {
 			r.Logger.Infof("UpgradePostgresDB: upgrade-db is not yet running, phase is: %s and deletion time stamp is %v",
 				dbPod.Status.Phase, dbPod.ObjectMeta.DeletionTimestamp)
@@ -1731,6 +1783,8 @@ func (r *Reconciler) UpgradePostgresDB() error {
 			r.Logger.Errorf("UpgradePostgresDB::got error on endpoints deployment reconcile %v", err)
 			return err
 		}
+		r.Recorder.Eventf(r.NooBaa, corev1.EventTypeNormal, "DbUpgrade",
+			"Finished data upgrade after upgrade of data to PostgreSQL 15 format")
 		phase = nbv1.UpgradePhaseFinished
 
 	case nbv1.UpgradePhaseReverting:
@@ -1757,6 +1811,7 @@ func (r *Reconciler) UpgradePostgresDB() error {
 			hasInitContainerFailed = true
 			break
 		}
+		r.Logger.Infof("UpgradePostgresDB: upgrade-db container didn't fail and finished reverting data to old version [status=%s]", status)
 		if err = r.ReconcileObject(r.NooBaaPostgresDB, r.removeUpgradeContainer); err != nil {
 			r.Logger.Errorf("UpgradePostgresDB: got error on postgres STS reconcile %v", err)
 			return err

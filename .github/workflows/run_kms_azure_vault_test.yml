@@ -1,8 +1,8 @@
-name: KMS Test - DEV Vault, Token Auth
+name: KMS Test - Azure Vault
 on: [push, pull_request, workflow_dispatch]
 
 jobs:
-  run-kms-dev-test:
+  run-azure-vault-test:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     concurrency:
@@ -22,11 +22,10 @@ jobs:
 
       - name: Deploy Dependencies
         run: |
-          set -x 
+          set -x
           bash .travis/install-5nodes-kind-cluster.sh
-          bash .travis/install-dev-vault.sh
           go get -v github.com/onsi/ginkgo/ginkgo
-          go install -v github.com/onsi/ginkgo/ginkgo
+          go install -mod=mod -v github.com/onsi/ginkgo/ginkgo
           ginkgo version
 
       - name: Build NooBaa
@@ -36,9 +35,9 @@ jobs:
           docker tag noobaa/noobaa-operator:$(go run cmd/version/main.go) $OPERATOR_IMAGE
           docker push $OPERATOR_IMAGE
 
-      - name: Install NooBaa & Vault
+      - name: Install NooBaa
         run: |
-          bash  .travis/install-dev-kms-noobaa.sh
+          bash  .travis/install-noobaa-pull-azure-parameters.sh
 
-      - name: Run KMS DEV test
-        run: make test-kms-dev
+      - name: Run KMS Azure test
+        run: make test-kms-azure-vault
