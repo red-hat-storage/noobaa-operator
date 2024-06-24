@@ -18,59 +18,55 @@ spec:
         app: noobaa
         noobaa-db: postgres
     spec:
-      serviceAccountName: noobaa
-      initContainers:
-      #----------------#
-      # INIT CONTAINER #
-      #----------------#
-      - name: init
-        image: NOOBAA_CORE_IMAGE
-        command:
-        - /noobaa_init_files/noobaa_init.sh
-        - init_postgres
-        resources:
-          requests:
-            cpu: "500m"
-            memory: "500Mi"
-          limits:
-            cpu: "500m"
-            memory: "500Mi"
-        volumeMounts:
-        - name: db
-          mountPath: /var/lib/pgsql
+      serviceAccountName: noobaa-db
       containers:
-      #--------------------#
-      # Postgres CONTAINER #
-      #--------------------#
-      - name: db
-        image: NOOBAA_DB_IMAGE
-        env:
-          - name: POSTGRESQL_DATABASE
-            value: nbcore
-          - name: POSTGRESQL_USER
-          - name: POSTGRESQL_PASSWORD
-        imagePullPolicy: "IfNotPresent"
-        ports:
-          - containerPort: 5432
-        resources:
-          requests:
-            cpu: "2"
-            memory: "4Gi"
-          limits:
-            cpu: "2"
-            memory: "4Gi"
-        volumeMounts:
-          - name: db
-            mountPath: /var/lib/pgsql
-          - name: noobaa-postgres-config-volume
-            mountPath: /opt/app-root/src/postgresql-cfg
+        #--------------------#
+        # Postgres CONTAINER #
+        #--------------------#
+        - name: db
+          image: NOOBAA_DB_IMAGE
+          env:
+            - name: POSTGRESQL_DATABASE
+              value: nbcore
+            - name: LC_COLLATE
+              value: C
+            - name: POSTGRESQL_USER
+              valueFrom:
+                secretKeyRef:
+                  key: user
+                  name: noobaa-db
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: noobaa-db
+          imagePullPolicy: "IfNotPresent"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+          ports:
+            - containerPort: 5432
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "4Gi"
+            limits:
+              cpu: "500m"
+              memory: "4Gi"
+          volumeMounts:
+            - name: db
+              mountPath: /var/lib/pgsql
+            - name: noobaa-postgres-config-volume
+              mountPath: /opt/app-root/src/postgresql-cfg
       volumes:
-      - name: noobaa-postgres-config-volume
-        configMap:
-          name: noobaa-postgres-config
-      securityContext: 
+        - name: noobaa-postgres-config-volume
+          configMap:
+            name: noobaa-postgres-config
+      securityContext:
         runAsUser: 10001
         runAsGroup: 0
+        fsGroup: 0
+        fsGroupChangePolicy: "OnRootMismatch"
   volumeClaimTemplates:
     - metadata:
         name: db

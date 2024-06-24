@@ -1,6 +1,8 @@
 package obc
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -19,6 +21,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 )
 
+var ctx = context.TODO()
+
 // Cmd returns a CLI command
 func Cmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -27,6 +31,7 @@ func Cmd() *cobra.Command {
 	}
 	cmd.AddCommand(
 		CmdCreate(),
+		CmdRegenerate(),
 		CmdDelete(),
 		CmdStatus(),
 		CmdList(),
@@ -47,8 +52,32 @@ func CmdCreate() *cobra.Command {
 		"Set bucket class to specify the bucket policy")
 	cmd.Flags().String("app-namespace", "",
 		"Set the namespace of the application where the OBC should be created")
+	cmd.Flags().Int("gid", -1,
+		"Set the GID for the NSFS account config")
+	cmd.Flags().Int("uid", -1,
+		"Set the UID for the NSFS account config")
+	cmd.Flags().String("distinguished-name", "",
+		"Set the distinguished name for the NSFS account config")
 	cmd.Flags().String("path", "",
-		"Set path to specify inner directory in namespace store target path - can be used only while specifing a namespace bucketclass")
+		"Set path to specify inner directory in namespace store target path, or in the case of NSFS - filesystem mount point (can be used only when specifying a namespace bucketclass)")
+	cmd.Flags().String("replication-policy", "",
+		"Set the json file path that contains replication rules")
+	cmd.Flags().String("max-objects", "",
+		"Set quota max objects quantity config to requested bucket")
+	cmd.Flags().String("max-size", "",
+		"Set quota max size config to requested bucket")
+	return cmd
+}
+
+// CmdRegenerate returns a CLI command
+func CmdRegenerate() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "regenerate <bucket-claim-name>",
+		Short: "Regenerate OBC S3 Credentials",
+		Run:   RunRegenerate,
+	}
+	cmd.Flags().String("app-namespace", "",
+		"Set the namespace of the application where the OBC should be regenerated")
 	return cmd
 }
 
@@ -60,7 +89,7 @@ func CmdDelete() *cobra.Command {
 		Run:   RunDelete,
 	}
 	cmd.Flags().String("app-namespace", "",
-		"Set the namespace of the application where the OBC should be created")
+		"Set the namespace of the application where the OBC should be deleted")
 	return cmd
 }
 
@@ -82,6 +111,7 @@ func CmdList() *cobra.Command {
 		Use:   "list",
 		Short: "List OBC's",
 		Run:   RunList,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -98,9 +128,27 @@ func RunCreate(cmd *cobra.Command, args []string) {
 	exact, _ := cmd.Flags().GetBool("exact")
 	bucketClassName, _ := cmd.Flags().GetString("bucketclass")
 	path, _ := cmd.Flags().GetString("path")
+	replicationPolicy, _ := cmd.Flags().GetString("replication-policy")
 	appNamespace, _ := cmd.Flags().GetString("app-namespace")
 	if appNamespace == "" {
 		appNamespace = options.Namespace
+	}
+	maxSize, _ := cmd.Flags().GetString("max-size")
+	maxObjects, _ := cmd.Flags().GetString("max-objects")
+	gid, _ := cmd.Flags().GetInt("gid")
+	uid, _ := cmd.Flags().GetInt("uid")
+	distinguishedName, _ := cmd.Flags().GetString("distinguished-name")
+
+	if distinguishedName != "" && (gid > -1 || uid > -1) {
+		log.Fatalf(`❌ NSFS account config cannot include both distinguished name and UID/GID`)
+	}
+
+	if (gid > -1 && uid == -1) || (gid == -1 && uid > -1) {
+		log.Fatalf(`❌ NSFS account config must include both UID and GID as positive integers`)
+	}
+
+	if bucketClassName == "" && ( gid > -1 || uid > -1 || distinguishedName != "" ) {
+		log.Fatalf(`❌ NSFS account config cannot be set without an NSFS bucketclass`)
 	}
 
 	o := util.KubeObject(bundle.File_deploy_obc_objectbucket_v1alpha1_objectbucketclaim_cr_yaml)
@@ -143,8 +191,49 @@ func RunCreate(cmd *cobra.Command, args []string) {
 		}
 		obc.Spec.AdditionalConfig["bucketclass"] = bucketClassName
 		obc.Spec.AdditionalConfig["path"] = path
+		obc.Spec.AdditionalConfig["replicationPolicy"] = bucketClass.Spec.ReplicationPolicy
+
 	} else if path != "" {
 		log.Fatalf(`❌ Could not create OBC %q with inner path while missing namespace bucketclass`, obc.Name)
+	}
+
+	if replicationPolicy != "" {
+		replication, err := util.LoadConfigurationJSON(replicationPolicy)
+		if err != nil {
+			log.Fatalf(`❌ %q`, err)
+		}
+		obc.Spec.AdditionalConfig["replicationPolicy"] = replication
+	}
+
+	if gid > -1 {
+		var nsfsAccountConfig nbv1.AccountNsfsConfig
+		nsfsAccountConfig.GID = &gid
+		nsfsAccountConfig.UID = &uid
+		nsfsAccountConfig.NsfsOnly = true
+		marshalledCfg, _ := json.Marshal(nsfsAccountConfig)
+		obc.Spec.AdditionalConfig["nsfsAccountConfig"] = string(marshalledCfg)
+	}
+
+	if distinguishedName != "" {
+		var nsfsAccountConfig nbv1.AccountNsfsConfig
+		nsfsAccountConfig.DistinguishedName = distinguishedName
+		nsfsAccountConfig.GID = nil
+		nsfsAccountConfig.UID = nil
+		nsfsAccountConfig.NsfsOnly = true
+		marshalledCfg, _ := json.Marshal(nsfsAccountConfig)
+		obc.Spec.AdditionalConfig["nsfsAccountConfig"] = string(marshalledCfg)
+	}
+
+	if maxSize != "" {
+		obc.Spec.AdditionalConfig["maxSize"] = maxSize
+	}
+	if maxObjects != "" {
+		obc.Spec.AdditionalConfig["maxObjects"] = maxObjects
+	}
+
+	err := ValidateOBC(obc, true)
+	if err != nil {
+		log.Fatalf(`❌ Could not create OBC %q in namespace %q validation failed %q`, obc.Name, obc.Namespace, err)
 	}
 
 	if !util.KubeCreateFailExisting(obc) {
@@ -160,6 +249,66 @@ func RunCreate(cmd *cobra.Command, args []string) {
 		log.Printf("")
 		RunStatus(cmd, args)
 	}
+}
+
+// RunRegenerate runs a CLI command
+func RunRegenerate(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+
+	if len(args) != 1 || args[0] == "" {
+		log.Fatalf(`❌ Missing expected arguments: <bucket-claim-name> %s`, cmd.UsageString())
+	}
+
+	var decision string
+	log.Printf("You are about to regenerate an OBC's security credentials.")
+	log.Printf("This will invalidate all connections between S3 clients and NooBaa which are connected using the current credentials.")
+	log.Printf("are you sure? y/n")
+
+	for {
+		fmt.Scanln(&decision)
+		if decision == "y" {
+			break
+		} else if decision == "n" {
+			return
+		}
+	}
+
+	appNamespace, _ := cmd.Flags().GetString("app-namespace")
+	if appNamespace == "" {
+		appNamespace = options.Namespace
+	}
+
+	name := args[0]
+
+	obc := util.KubeObject(bundle.File_deploy_obc_objectbucket_v1alpha1_objectbucketclaim_cr_yaml).(*nbv1.ObjectBucketClaim)
+	ob := util.KubeObject(bundle.File_deploy_obc_objectbucket_v1alpha1_objectbucket_cr_yaml).(*nbv1.ObjectBucket)
+	obc.Name = name
+	obc.Namespace = appNamespace
+
+	if !util.KubeCheck(obc) {
+		log.Fatalf(`❌ Could not find OBC %q in namespace %q`,
+			obc.Name, obc.Namespace)
+	}
+
+	if obc.Spec.ObjectBucketName != "" {
+		ob.Name = obc.Spec.ObjectBucketName
+	} else {
+		ob.Name = fmt.Sprintf("ob-%s-%s", appNamespace, name)
+	}
+
+	if !util.KubeCheck(ob) {
+		log.Fatalf(`❌ Could not find OB %q`, ob.Name)
+	}
+
+	accountName := ob.Spec.AdditionalState["account"]
+
+	err := GenerateAccountKeys(name, accountName, appNamespace)
+	if err != nil {
+		log.Fatalf(`❌ Could not regenerate credentials for %q: %v`, name, err)
+	}
+
+	RunStatus(cmd, args)
+
 }
 
 // RunDelete runs a CLI command
@@ -280,8 +429,13 @@ func RunStatus(cmd *cobra.Command, args []string) {
 	credsEnv := ""
 	for k, v := range secret.StringData {
 		if v != "" {
-			fmt.Printf("  %-22s : %s\n", k, v)
-			credsEnv += k + "=" + v + " "
+			if options.ShowSecrets {
+				fmt.Printf("  %-22s : %s\n", k, v)
+				credsEnv += k + "=" + v + " "
+			} else {
+				fmt.Printf("  %-22s : %s\n", k, nb.MaskedString(v))
+				credsEnv += k + "=" + string(nb.MaskedString(v)) + " "
+			}
 		}
 	}
 	fmt.Printf("\n")
@@ -306,7 +460,8 @@ func RunStatus(cmd *cobra.Command, args []string) {
 		if b.DataCapacity != nil {
 			fmt.Printf("  %-22s : %s\n", "Data Size", nb.BigIntToHumanBytes(b.DataCapacity.Size))
 			fmt.Printf("  %-22s : %s\n", "Data Size Reduced", nb.BigIntToHumanBytes(b.DataCapacity.SizeReduced))
-			fmt.Printf("  %-22s : %s\n", "Data Space Avail", nb.BigIntToHumanBytes(b.DataCapacity.AvailableToUpload))
+			fmt.Printf("  %-22s : %s\n", "Data Space Avail", nb.BigIntToHumanBytes(b.DataCapacity.AvailableSizeToUpload))
+			fmt.Printf("  %-22s : %s\n", "Num Objects Avail", b.DataCapacity.AvailableQuantityToUpload.ToString())
 		}
 		fmt.Printf("\n")
 	}
@@ -364,9 +519,9 @@ func WaitReady(obc *nbv1.ObjectBucketClaim) bool {
 	log := util.Logger()
 	klient := util.KubeClient()
 
-	intervalSec := time.Duration(3)
+	interval := time.Duration(3)
 
-	err := wait.PollImmediateInfinite(intervalSec*time.Second, func() (bool, error) {
+	err := wait.PollUntilContextCancel(ctx, interval*time.Second, true, func(ctx context.Context) (bool, error) {
 		err := klient.Get(util.Context(), util.ObjectKey(obc), obc)
 		if err != nil {
 			log.Printf("⏳ Failed to get OBC: %s", err)
@@ -401,4 +556,60 @@ func CheckPhase(obc *nbv1.ObjectBucketClaim) {
 	default:
 		log.Printf("⏳ OBC %q Phase is %q", obc.Name, obc.Status.Phase)
 	}
+}
+
+// GenerateAccountKeys regenerate noobaa OBC account S3 keys
+func GenerateAccountKeys(name, accountName, appNamespace string) error {
+	log := util.Logger()
+
+	if accountName == "" {
+		log.Fatalf(`❌  account name cannot be empty.\n`)
+	}
+
+	var accessKeys nb.S3AccessKeys
+
+	sysClient, err := system.Connect(true)
+	if err != nil {
+		return err
+	}
+
+	// Checking that we can find the secret before we are calling the RPC to change the credentials.
+	secret := util.KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret)
+	secret.Namespace = appNamespace
+	secret.Name = name
+	if !util.KubeCheckQuiet(secret) {
+		log.Fatalf(`❌  Could not find secret: %s, will not regenerate keys.`, secret.Name)
+	}
+
+	err = sysClient.NBClient.GenerateAccountKeysAPI(nb.GenerateAccountKeysParams{
+		Email: accountName,
+	})
+	if err != nil {
+		return err
+	}
+
+	// GenerateAccountKeysAPI have no replay so we need to read the account in order to get the new credentials
+	accountInfo, err := sysClient.NBClient.ReadAccountAPI(nb.ReadAccountParams{
+		Email: accountName,
+	})
+	if err != nil {
+		return err
+	}
+
+	accessKeys = accountInfo.AccessKeys[0]
+
+	secret.StringData = map[string]string{}
+	secret.StringData["AWS_ACCESS_KEY_ID"] = string(accessKeys.AccessKey)
+	secret.StringData["AWS_SECRET_ACCESS_KEY"] = string(accessKeys.SecretKey)
+
+	//If we will not be able to update the secret we will print the credentials as they already been changed by the RPC
+	if !util.KubeUpdate(secret) {
+		log.Printf(`❌  Please write the new credentials for OBC %s:`, name)
+		fmt.Printf("\nAWS_ACCESS_KEY_ID     : %s\n", string(accessKeys.AccessKey))
+		fmt.Printf("AWS_SECRET_ACCESS_KEY : %s\n\n", string(accessKeys.SecretKey))
+		log.Fatalf(`❌  Failed to update the secret %s with the new accessKeys`, secret.Name)
+	}
+
+	log.Printf("✅ Successfully regenerate s3 credentials for the OBC %q", name)
+	return nil
 }
