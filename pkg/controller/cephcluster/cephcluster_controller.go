@@ -1,7 +1,10 @@
 package cephcluster
 
 import (
+	"context"
+
 	nbv1 "github.com/noobaa/noobaa-operator/v5/pkg/apis/noobaa/v1alpha1"
+
 	"github.com/noobaa/noobaa-operator/v5/pkg/nb"
 	"github.com/noobaa/noobaa-operator/v5/pkg/system"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
@@ -40,8 +43,8 @@ func Add(mgr manager.Manager) error {
 	logEventsPredicate := util.LogEventsPredicate{}
 
 	// Watch for cephcluster resource changes
-	err = c.Watch(&source.Kind{Type: &cephv1.CephCluster{}}, &handler.EnqueueRequestForObject{},
-		&CephCapacityChangedPredicate{}, &logEventsPredicate)
+	err = c.Watch(source.Kind[client.Object](mgr.GetCache(), &cephv1.CephCluster{}, &handler.EnqueueRequestForObject{},
+		&CephCapacityChangedPredicate{}, &logEventsPredicate))
 	if err != nil {
 		return err
 	}
@@ -50,9 +53,17 @@ func Add(mgr manager.Manager) error {
 }
 
 // React to cephcluster capacity changes
-func doReconcile(req reconcile.Request) (reconcile.Result, error) {
+func doReconcile(context context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := logrus.WithField("cephcluster", req.Namespace+"/"+req.Name)
 	res := reconcile.Result{}
+
+	nooBaa := nbv1.NooBaa{}
+	nooBaa.Name = options.SystemName
+	nooBaa.Namespace = req.Namespace
+	if !system.CheckSystem(&nooBaa) {
+		log.Infof("NooBaa not found or already deleted. Skip reconcile.")
+		return res, nil
+	}
 
 	cephCluster := cephv1.CephCluster{}
 	cephCluster.Name = req.Name

@@ -3,11 +3,11 @@ package olm
 import (
 	"encoding/json"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"strings"
 
+	obAPI "github.com/kube-object-storage/lib-bucket-provisioner/pkg/provisioner/api"
 	nbv1 "github.com/noobaa/noobaa-operator/v5/pkg/apis/noobaa/v1alpha1"
 	"github.com/noobaa/noobaa-operator/v5/pkg/bundle"
 	"github.com/noobaa/noobaa-operator/v5/pkg/crd"
@@ -16,11 +16,14 @@ import (
 	"github.com/noobaa/noobaa-operator/v5/pkg/util"
 	"github.com/noobaa/noobaa-operator/v5/version"
 
-	"github.com/blang/semver"
+	"github.com/blang/semver/v4"
 	operv1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	"github.com/spf13/cobra"
+	admissionv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/cli-runtime/pkg/printers"
 	sigyaml "sigs.k8s.io/yaml"
@@ -28,6 +31,22 @@ import (
 
 type unObj = map[string]interface{}
 type unArr = []interface{}
+
+const (
+	// OBCOwned is the value owned for the obc-crd flag
+	OBCOwned string = "owned"
+	// OBCRequired is the default value for the obc-crd flag
+	OBCRequired string = "required"
+	// OBCNone is the value none for the obc-crd flag
+	OBCNone string = "none"
+)
+
+type generateCSVParams struct {
+	IsForODF  bool
+	OBCMode   string
+	SkipRange string
+	Replaces  string
+}
 
 // Cmd returns a CLI command
 func Cmd() *cobra.Command {
@@ -53,8 +72,14 @@ func CmdCatalog() *cobra.Command {
 		Use:   "catalog",
 		Short: "Create OLM catalog dir",
 		Run:   RunCatalog,
+		Args:  cobra.NoArgs,
 	}
 	cmd.Flags().String("dir", "./build/_output/olm", "The output dir for the OLM package")
+	cmd.Flags().Bool("odf", false, "Build package according to ODF requirements")
+	cmd.Flags().String("obc-crd", OBCRequired, "Determine if the OB/OBC CRDs are required, owned, or none")
+	cmd.Flags().String("csv-name", "", "File name for the CSV YAML")
+	cmd.Flags().String("skip-range", "", "set the olm.skipRange annotation in the CSV")
+	cmd.Flags().String("replaces", "", "set the replaces property in the CSV")
 	return cmd
 }
 
@@ -64,6 +89,7 @@ func CmdCSV() *cobra.Command {
 		Use:   "csv",
 		Short: "Print CSV yaml",
 		Run:   RunCSV,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -74,6 +100,7 @@ func CmdHubInstall() *cobra.Command {
 		Use:   "install",
 		Short: "Install noobaa-operator from operatorhub.io",
 		Run:   RunHubInstall,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -84,6 +111,7 @@ func CmdHubUninstall() *cobra.Command {
 		Use:   "uninstall",
 		Short: "Uninstall noobaa-operator from operatorhub.io",
 		Run:   RunHubUninstall,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -94,6 +122,7 @@ func CmdHubStatus() *cobra.Command {
 		Use:   "status",
 		Short: "Status of noobaa-operator from operatorhub.io",
 		Run:   RunHubStatus,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -104,6 +133,7 @@ func CmdLocalInstall() *cobra.Command {
 		Use:   "local-install",
 		Short: "Install noobaa-operator from local OLM catalog",
 		Run:   RunLocalInstall,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -114,6 +144,7 @@ func CmdLocalUninstall() *cobra.Command {
 		Use:   "local-uninstall",
 		Short: "Uninstall noobaa-operator from local OLM catalog",
 		Run:   RunLocalUninstall,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -126,12 +157,34 @@ func RunCatalog(cmd *cobra.Command, args []string) {
 	if dir == "" {
 		log.Fatalf(`Missing required flag: --dir: %s`, cmd.UsageString())
 	}
+
 	if !strings.HasSuffix(dir, "/") {
 		dir += "/"
 	}
-	versionDir := dir + version.Version + "/"
 
 	opConf := operator.LoadOperatorConf(cmd)
+
+	var versionDir string
+
+	forODF, _ := cmd.Flags().GetBool("odf")
+	obcMode, _ := cmd.Flags().GetString("obc-crd")
+	if obcMode != OBCOwned && obcMode != OBCRequired && obcMode != OBCNone {
+		log.Fatalf(`Invalid value for --obc-crd: %s. should be [%s|%s|%s]`, obcMode, OBCOwned, OBCRequired, OBCNone)
+	}
+
+	skipRange, _ := cmd.Flags().GetString("skip-range")
+	replaces, _ := cmd.Flags().GetString("replaces")
+	csvParams := &generateCSVParams{
+		IsForODF:  forODF,
+		OBCMode:   obcMode,
+		SkipRange: skipRange,
+		Replaces:  replaces,
+	}
+	if forODF {
+		versionDir = dir
+	} else {
+		versionDir = dir + version.Version + "/"
+	}
 
 	pkgBytes, err := sigyaml.Marshal(unObj{
 		"packageName":    "noobaa-operator",
@@ -143,11 +196,24 @@ func RunCatalog(cmd *cobra.Command, args []string) {
 	})
 	util.Panic(err)
 
+	csvFileName, _ := cmd.Flags().GetString("csv-name")
+	if csvFileName == "" {
+		csvFileName = versionDir + "noobaa-operator.v" + version.Version + ".clusterserviceversion.yaml"
+	} else {
+		csvFileName = versionDir + csvFileName
+	}
+
 	util.Panic(os.MkdirAll(versionDir, 0755))
-	util.Panic(ioutil.WriteFile(dir+"noobaa-operator.package.yaml", pkgBytes, 0644))
-	util.Panic(util.WriteYamlFile(versionDir+"noobaa-operator.v"+version.Version+".clusterserviceversion.yaml", GenerateCSV(opConf)))
+	if !forODF {
+		util.Panic(os.WriteFile(dir+"noobaa-operator.package.yaml", pkgBytes, 0644))
+	}
+	util.Panic(util.WriteYamlFile(csvFileName, GenerateCSV(opConf, csvParams)))
+	// The CA configmap is needed prior to the operator startup to prevent a certificate injection race condition
+	util.Panic(util.WriteYamlFile(
+		versionDir+"noobaa-operator.ca-bundle-configmap.yaml",
+		util.KubeObject(bundle.File_deploy_internal_configmap_ca_inject_yaml)))
 	crd.ForEachCRD(func(c *crd.CRD) {
-		if c.Spec.Group == nbv1.SchemeGroupVersion.Group {
+		if c.Spec.Group == nbv1.SchemeGroupVersion.Group || (csvParams.OBCMode == OBCOwned && c.Spec.Group == obAPI.Domain) {
 			util.Panic(util.WriteYamlFile(versionDir+c.Name+".crd.yaml", c))
 		}
 	})
@@ -156,18 +222,19 @@ func RunCatalog(cmd *cobra.Command, args []string) {
 // RunCSV runs a CLI command
 func RunCSV(cmd *cobra.Command, args []string) {
 	opConf := operator.LoadOperatorConf(cmd)
-	csv := GenerateCSV(opConf)
+	csv := GenerateCSV(opConf, nil)
 	p := printers.YAMLPrinter{}
 	util.Panic(p.PrintObj(csv, os.Stdout))
 }
 
 // GenerateCSV creates the CSV
-func GenerateCSV(opConf *operator.Conf) *operv1.ClusterServiceVersion {
+func GenerateCSV(opConf *operator.Conf, csvParams *generateCSVParams) *operv1.ClusterServiceVersion {
 	almExamples, err := json.Marshal([]runtime.Object{
 		util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_noobaa_cr_yaml),
 		util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_backingstore_cr_yaml),
 		util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_namespacestore_cr_yaml),
 		util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_bucketclass_cr_yaml),
+		util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_noobaaaccount_cr_yaml),
 	})
 	util.Panic(err)
 
@@ -176,8 +243,13 @@ func GenerateCSV(opConf *operator.Conf) *operv1.ClusterServiceVersion {
 	csv.Name = "noobaa-operator.v" + version.Version
 	csv.Namespace = options.Namespace
 	csv.Annotations["containerImage"] = options.OperatorImage
+	// this annotation hides the operator in OCP console
 	// csv.Annotations["createdAt"] = ???
 	csv.Annotations["alm-examples"] = string(almExamples)
+	csv.Annotations["operators.openshift.io/infrastructure-features"] = "ֿ'[\"disconnected\"]'"
+	// annotation for OpenShift AWS STS cluster
+	csv.Annotations["features.operators.openshift.io/token-auth-aws"] = "true"
+	csv.Annotations["capabilities"] = "Seamless Upgrades"
 	csv.Spec.Version.Version = semver.MustParse(version.Version)
 	csv.Spec.Description = bundle.File_deploy_olm_description_md
 	csv.Spec.Icon[0].Data = bundle.File_deploy_olm_noobaa_icon_base64
@@ -186,6 +258,11 @@ func GenerateCSV(opConf *operator.Conf) *operv1.ClusterServiceVersion {
 		operv1.StrategyDeploymentPermissions{
 			ServiceAccountName: opConf.SA.Name,
 			Rules:              opConf.ClusterRole.Rules,
+		})
+	csv.Spec.InstallStrategy.StrategySpec.ClusterPermissions = append(csv.Spec.InstallStrategy.StrategySpec.ClusterPermissions,
+		operv1.StrategyDeploymentPermissions{
+			ServiceAccountName: opConf.SAUI.Name,
+			Rules:              opConf.RoleUI.Rules,
 		})
 	csv.Spec.InstallStrategy.StrategySpec.Permissions = []operv1.StrategyDeploymentPermissions{}
 	csv.Spec.InstallStrategy.StrategySpec.Permissions = append(csv.Spec.InstallStrategy.StrategySpec.Permissions,
@@ -198,12 +275,62 @@ func GenerateCSV(opConf *operator.Conf) *operv1.ClusterServiceVersion {
 			ServiceAccountName: opConf.SAEndpoint.Name,
 			Rules:              opConf.RoleEndpoint.Rules,
 		})
+	csv.Spec.InstallStrategy.StrategySpec.Permissions = append(csv.Spec.InstallStrategy.StrategySpec.Permissions,
+		operv1.StrategyDeploymentPermissions{
+			ServiceAccountName: opConf.SACore.Name,
+			Rules:              opConf.RoleCore.Rules,
+		})
 	csv.Spec.InstallStrategy.StrategySpec.DeploymentSpecs = []operv1.StrategyDeploymentSpec{}
 	csv.Spec.InstallStrategy.StrategySpec.DeploymentSpecs = append(csv.Spec.InstallStrategy.StrategySpec.DeploymentSpecs,
 		operv1.StrategyDeploymentSpec{
 			Name: opConf.Deployment.Name,
 			Spec: opConf.Deployment.Spec,
 		})
+
+	if csvParams != nil {
+		if csvParams.IsForODF {
+			// add annotations to hide the operator in OCP console
+			csv.Annotations["operators.operatorframework.io/operator-type"] = "non-standalone"
+
+			// add env vars for noobaa-core and noobaa-db images
+			operatorContainer := &csv.Spec.InstallStrategy.StrategySpec.DeploymentSpecs[0].Spec.Template.Spec.Containers[0]
+			operatorContainer.Env = append(operatorContainer.Env,
+				corev1.EnvVar{
+					Name:  "NOOBAA_CORE_IMAGE",
+					Value: options.NooBaaImage,
+				},
+				corev1.EnvVar{
+					Name:  "NOOBAA_DB_IMAGE",
+					Value: options.DBImage,
+				},
+				corev1.EnvVar{
+					Name:  "NOOBAA_PSQL_12_IMAGE",
+					Value: options.Psql12Image,
+				},
+				corev1.EnvVar{
+					Name:  "ENABLE_NOOBAA_ADMISSION",
+					Value: "true",
+				})
+
+			csv.Spec.InstallStrategy.StrategySpec.DeploymentSpecs[0].Spec.Template.Spec.Tolerations = []corev1.Toleration{
+				{
+					Key:      "node.ocs.openshift.io/storage",
+					Effect:   corev1.TaintEffectNoSchedule,
+					Operator: corev1.TolerationOpEqual,
+					Value:    "true",
+				},
+			}
+		}
+
+		if csvParams.Replaces != "" {
+			csv.Spec.Replaces = csvParams.Replaces
+		}
+
+		if csvParams.SkipRange != "" {
+			csv.Annotations[operv1.SkipRangeAnnotationKey] = csvParams.SkipRange
+		}
+	}
+
 	csv.Spec.CustomResourceDefinitions.Owned = []operv1.CRDDescription{}
 	csv.Spec.CustomResourceDefinitions.Required = []operv1.CRDDescription{}
 	crdDescriptions := map[string]string{
@@ -574,13 +701,41 @@ func GenerateCSV(opConf *operator.Conf) *operv1.ClusterServiceVersion {
 				operv1.APIResourceReference{Name: "statefulsets.apps", Kind: "StatefulSet", Version: "v1"},
 			},
 		}
+
 		if c.Spec.Group == nbv1.SchemeGroupVersion.Group {
 			csv.Spec.CustomResourceDefinitions.Owned = append(csv.Spec.CustomResourceDefinitions.Owned, crdDesc)
+		} else if c.Spec.Group == obAPI.Domain {
+			if csvParams != nil && csvParams.OBCMode == OBCOwned {
+				csv.Spec.CustomResourceDefinitions.Owned = append(csv.Spec.CustomResourceDefinitions.Owned, crdDesc)
+			} else if csvParams == nil || csvParams.OBCMode == OBCRequired {
+				csv.Spec.CustomResourceDefinitions.Required = append(csv.Spec.CustomResourceDefinitions.Required, crdDesc)
+			} // else OBCMode == OBCNone, do nothing
 		} else {
 			csv.Spec.CustomResourceDefinitions.Required = append(csv.Spec.CustomResourceDefinitions.Required, crdDesc)
 		}
 	})
 
+	aw := util.KubeObject(bundle.File_deploy_internal_admission_webhook_yaml).(*admissionv1.ValidatingWebhookConfiguration)
+	vaw := aw.Webhooks[0]
+
+	webhookDefinition := operv1.WebhookDescription{
+		Type:                    operv1.ValidatingAdmissionWebhook,
+		AdmissionReviewVersions: vaw.AdmissionReviewVersions,
+		ContainerPort:           443,
+		TargetPort: &intstr.IntOrString{
+			Type:   intstr.Int,
+			IntVal: 8080,
+			StrVal: "8080",
+		},
+		DeploymentName: "noobaa-operator",
+		FailurePolicy:  vaw.FailurePolicy,
+		MatchPolicy:    vaw.MatchPolicy,
+		GenerateName:   vaw.Name,
+		Rules:          vaw.Rules,
+		SideEffects:    vaw.SideEffects,
+		WebhookPath:    vaw.ClientConfig.Service.Path,
+	}
+	csv.Spec.WebhookDefinitions = append(csv.Spec.WebhookDefinitions, webhookDefinition)
 	return csv
 }
 
