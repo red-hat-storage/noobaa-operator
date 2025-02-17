@@ -13,10 +13,43 @@ spec:
         app: noobaa
         noobaa-operator: deployment
     spec:
+        # Notice that changing the serviceAccountName would need to update existing AWS STS role trust policy for customers
       serviceAccountName: noobaa
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+      # This service account token can be used to provide identity outside the cluster.
+      # For example, this token can be used with AssumeRoleWithWebIdentity to authenticate with AWS using IAM OIDC provider and STS.
+      - name: bound-sa-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              path: token
+              # For testing purposes change the audience to api
+              audience: openshift
+      # SHOULD BE RETURNED ONCE COSI IS BACK
+      # - name: socket
+      #   emptyDir: {}
+      - name: ocp-injected-ca-bundle
+        configMap:
+          name: ocp-injected-ca-bundle
+          items:
+          - key: ca-bundle.crt
+            path: ca-bundle.crt
+          optional: true
       containers:
         - name: noobaa-operator
           image: NOOBAA_OPERATOR_IMAGE
+          volumeMounts:
+          - name: bound-sa-token
+            mountPath: /var/run/secrets/openshift/serviceaccount
+            readOnly: true
+          - name: ocp-injected-ca-bundle
+            mountPath: /etc/ocp-injected-ca-bundle
+          # SHOULD BE RETURNED ONCE COSI IS BACK
+          # - name: socket
+          #   mountPath: /var/lib/cosi
           resources:
             limits:
               cpu: "250m"
@@ -32,3 +65,21 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+        # SHOULD BE RETURNED ONCE COSI IS BACK
+        # - name: objectstorage-provisioner-sidecar
+        #   image: COSI_SIDECAR_IMAGE
+        #   args:
+        #   - "--v=5"
+        #   resources:
+        #     limits:
+        #       cpu: "100m"
+        #       memory: "512Mi"
+        #   imagePullPolicy: Always
+        #   env:
+        #   - name: POD_NAMESPACE
+        #     valueFrom:
+        #       fieldRef:
+        #         fieldPath: metadata.namespace
+        #   volumeMounts:
+        #   - mountPath: /var/lib/cosi
+        #     name: socket

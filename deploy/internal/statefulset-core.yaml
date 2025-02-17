@@ -18,8 +18,11 @@ spec:
         app: noobaa
         noobaa-core: noobaa
         noobaa-mgmt: noobaa
+      annotations:
+        noobaa.io/configmap-hash: ""
     spec:
-      serviceAccountName: noobaa
+    # Notice that changing the serviceAccountName would need to update existing AWS STS role trust policy for customers
+      serviceAccountName: noobaa-core
       volumes:
         - name: logs
           emptyDir: {}
@@ -27,10 +30,22 @@ spec:
           secret:
             secretName: noobaa-mgmt-serving-cert
             optional: true
-        - name: s3-secret
+        - name: noobaa-server
           secret:
-            secretName: noobaa-s3-serving-cert
+            secretName: noobaa-server
             optional: true
+        # This service account token can be used to provide identity outside the cluster.
+        # For example, this token can be used with AssumeRoleWithWebIdentity to authenticate with AWS using IAM OIDC provider and STS.
+        - name: bound-sa-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  # For testing purposes change the audience to api
+                  audience: openshift
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 0
       containers:
         #----------------#
         # CORE CONTAINER #
@@ -43,15 +58,18 @@ spec:
             - name: mgmt-secret
               mountPath: /etc/mgmt-secret
               readOnly: true
-            - name: s3-secret
-              mountPath: /etc/s3-secret
+            - name: noobaa-server
+              mountPath: /etc/noobaa-server
+              readOnly: true
+            - name: bound-sa-token
+              mountPath: /var/run/secrets/openshift/serviceaccount
               readOnly: true
           resources:
             requests:
-              cpu: "1"
+              cpu: "999m"
               memory: "4Gi"
             limits:
-              cpu: "1"
+              cpu: "999m"
               memory: "4Gi"
           ports:
             - containerPort: 8080
@@ -61,37 +79,47 @@ spec:
             - containerPort: 8446
             - containerPort: 60100
           env:
-            - name: MONGODB_URL
-              value: "mongodb://noobaa-db-0.noobaa-db/nbcore"
+            - name: NOOBAA_DISABLE_COMPRESSION
+              valueFrom:
+                configMapKeyRef:
+                  name: noobaa-config
+                  key: NOOBAA_DISABLE_COMPRESSION
+            - name: DISABLE_DEV_RANDOM_SEED
+              valueFrom:
+                configMapKeyRef:
+                  name: noobaa-config
+                  key: DISABLE_DEV_RANDOM_SEED
+            - name: NOOBAA_LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: noobaa-config
+                  key: NOOBAA_LOG_LEVEL
+            - name: RESTRICT_RESOURCE_DELETION
+              value: "false"
+            - name: NOOBAA_LOG_COLOR
+              valueFrom:
+                configMapKeyRef:
+                  name: noobaa-config
+                  key: NOOBAA_LOG_COLOR
             - name: POSTGRES_HOST
               value: "noobaa-db-pg-0.noobaa-db-pg"
+            - name: POSTGRES_PORT
             - name: POSTGRES_DBNAME
               value: nbcore
             - name: POSTGRES_USER
             - name: POSTGRES_PASSWORD
+            - name: POSTGRES_CONNECTION_STRING
+            - name: POSTGRES_SSL_REQUIRED
+            - name: POSTGRES_SSL_UNAUTHORIZED
+            - name: GUARANTEED_LOGS_PATH
             - name: DB_TYPE
-              value: mongodb
+              value: postgres
             - name: CONTAINER_PLATFORM
               value: KUBERNETES
-            - name: NOOBAA_LOG_LEVEL
-              value: "0"
-            - name: NOOBAA_DISABLE_COMPRESSION
-              value: "false"
-            - name: JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: noobaa-server
-                  key: jwt
-            - name: SERVER_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: noobaa-server
-                  key: server_secret
             - name: NOOBAA_ROOT_SECRET
+            - name: NODE_EXTRA_CA_CERTS
             - name: AGENT_PROFILE
               value: VALUE_AGENT_PROFILE
-            - name: DISABLE_DEV_RANDOM_SEED
-              value: "true"
             - name: OAUTH_AUTHORIZATION_ENDPOINT
               value: ""
             - name: OAUTH_TOKEN_ENDPOINT
@@ -100,8 +128,45 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.serviceAccountName
-            - name: container_dbg
-              value: "" # any non-empty value will set the container to dbg mode
+            - name: CONTAINER_CPU_REQUEST
+              valueFrom:
+                resourceFieldRef:
+                  resource: requests.cpu
+            - name: CONTAINER_MEM_REQUEST
+              valueFrom:
+                resourceFieldRef:
+                  resource: requests.memory
+            - name: CONTAINER_CPU_LIMIT
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.cpu
+            - name: CONTAINER_MEM_LIMIT
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+        - name: noobaa-log-processor
+          image: NOOBAA_CORE_IMAGE
+          command:
+            [
+              "/root/node_modules/noobaa-core/src/deploy/NVA_build/noobaa_logs.sh",
+            ]
+          volumeMounts:
+            - name: logs
+              mountPath: /log
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "500Mi"
+            limits:
+              cpu: "200m"
+              memory: "500Mi"
+          ports:
+            - containerPort: 5140
+            - containerPort: 6514
+          env:
             - name: CONTAINER_CPU_REQUEST
               valueFrom:
                 resourceFieldRef:

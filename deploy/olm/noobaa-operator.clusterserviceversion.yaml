@@ -11,6 +11,7 @@ metadata:
     description: NooBaa is an object data service for hybrid and multi cloud environments.
     support: Red Hat
     alm-examples: placeholder
+    operators.openshift.io/infrastructure-features: '["disconnected"]'
   name: placeholder
   namespace: placeholder
 spec:
@@ -59,7 +60,7 @@ spec:
     type: SingleNamespace
   - supported: false
     type: MultiNamespace
-  - supported: false
+  - supported: true
     type: AllNamespaces
   install:
     strategy: deployment

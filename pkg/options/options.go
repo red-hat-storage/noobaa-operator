@@ -14,6 +14,7 @@ func Cmd() *cobra.Command {
 		Use:   "options",
 		Short: "Print the list of global flags",
 		Run:   RunOptions,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -29,7 +30,7 @@ const (
 	// ContainerImageRepo is the repo of the default image url
 	ContainerImageRepo = "noobaa-core"
 	// ContainerImageTag is the tag of the default image url
-	ContainerImageTag = "5.8.0-20210519"
+	ContainerImageTag = "master-20240520"
 	// ContainerImageSemverLowerBound is the lower bound for supported image versions
 	ContainerImageSemverLowerBound = "5.0.0"
 	// ContainerImageSemverUpperBound is the upper bound for supported image versions
@@ -47,6 +48,9 @@ const (
 
 	// SystemName is a constant as we want just a single system per namespace
 	SystemName = "noobaa"
+
+	// ServiceServingCertCAFile points to OCP root CA to be added to the default root CA list
+	ServiceServingCertCAFile = "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt"
 )
 
 // Namespace is the target namespace for locating the noobaa system
@@ -59,21 +63,20 @@ var Namespace = "noobaa"
 // it can be overridden for testing or different registry locations.
 var OperatorImage = "noobaa/noobaa-operator:" + version.Version
 
+// CosiSideCarImage is the container image url built from https://github.com/kubernetes-sigs/container-object-storage-interface-provisioner-sidecar
+var CosiSideCarImage = "gcr.io/k8s-staging-sig-storage/objectstorage-sidecar/objectstorage-sidecar:v20221117-v0.1.0-22-g0e67387"
+
 // NooBaaImage is the container image url built from https://github.com/noobaa/noobaa-core
 // it can be overridden for testing or different registry locations.
 var NooBaaImage = ContainerImage
 
 // DBImage is the default db image url
 // it can be overridden for testing or different registry locations.
-var DBImage = "centos/mongodb-36-centos7"
+var DBImage = "quay.io/sclorg/postgresql-15-c9s"
 
-// DBPostgresImage is the default postgres db image url
+// Psql12Image is the default postgres12 db image url
 // currently it can not be overridden.
-var DBPostgresImage = "centos/postgresql-12-centos7"
-
-// DBMongoImage is the default mongo db image url
-// this is used during migration to solve issues where mongo STS referencing to postgres image
-var DBMongoImage = "centos/mongodb-36-centos7"
+var Psql12Image = "centos/postgresql-12-centos7"
 
 // DBType is the default db image type
 // it can be overridden for testing or different types.
@@ -86,12 +89,26 @@ var DBVolumeSizeGB = 0
 // it can be overridden for testing or different PV providers.
 var DBStorageClass = ""
 
-// MongoDbURL is used for providing mongodb url
+// PostgresDbURL is used for providing postgres url
 // it can be overridden for testing or different url.
-var MongoDbURL = ""
+var PostgresDbURL = ""
 
-//DebugLevel can be used to override the default debug level
-var DebugLevel = 0
+// PostgresSSLRequired is used to force noobaa to work with SSL with external pgsql
+// when using an external postgres DB.
+var PostgresSSLRequired = false
+
+// PostgresSSLSelfSigned is used to allow noobaa to work with self-signed SSL with external pgsql
+// when using an external postgres DB.
+var PostgresSSLSelfSigned = false
+
+// PostgresSSLKey is used for providing the path to the client SSL key file when working with external pgsql
+var PostgresSSLKey = ""
+
+// PostgresSSLCert is used for providing the path to the client SSL cert file when working with external pgsql
+var PostgresSSLCert = ""
+
+// DebugLevel can be used to override the default debug level
+var DebugLevel = "default_level"
 
 // PVPoolDefaultStorageClass is used for PVC's allocation for the noobaa server data
 // it can be overridden for testing or different PV providers.
@@ -106,6 +123,49 @@ var ImagePullSecret = ""
 // pod)
 var MiniEnv = false
 
+// DevEnv setting this option indicates to the operator that it is deployed on development environment
+// This info is used by the operator for environment based decisions (e.g. number of resources to request per
+// pod)
+var DevEnv = false
+
+// DisableLoadBalancerService is used for setting the service type to ClusterIP instead of LoadBalancer
+var DisableLoadBalancerService = false
+
+// CosiDriverPath is the cosi socket fs path
+var CosiDriverPath = "/var/lib/cosi/cosi.sock"
+
+// AdmissionWebhook is used for deploying the system with admission validation webhook
+var AdmissionWebhook = false
+
+// TestEnv is used for deploying the system with test env minimal resources
+var TestEnv = false
+
+// S3LoadBalancerSourceSubnets is used for setting the source subnets for the load balancer
+// created for noobaa S3 service
+var S3LoadBalancerSourceSubnets = []string{}
+
+// STSLoadBalancerSourceSubnets is used for setting the source subnets for the load balancer
+// created for noobaa STS service
+var STSLoadBalancerSourceSubnets = []string{}
+
+// ShowSecrets is used to show the secrets in the status output
+var ShowSecrets = false
+
+// ManualDefaultBackingStore is used for disabling and allow deletion of default backingstore
+var ManualDefaultBackingStore = false
+
+// AutoscalerType is the default noobaa-endpoint autoscaler type
+// it can be overridden for testing or different types. there is no default autoscaler for endpoint
+var AutoscalerType = ""
+
+// PrometheusNamespace is prometheus installed namespace
+// it can be overridden for testing or different namespace.
+var PrometheusNamespace = ""
+
+// AWSSTSARN is used in an AWS STS cluster to assume role ARN
+// it can be overridden for testing.
+var AWSSTSARN = ""
+
 // SubDomainNS returns a unique subdomain for the namespace
 func SubDomainNS() string {
 	return Namespace + ".noobaa.io"
@@ -114,6 +174,21 @@ func SubDomainNS() string {
 // ObjectBucketProvisionerName returns the provisioner name to be used in storage classes for OB/OBC
 func ObjectBucketProvisionerName() string {
 	return SubDomainNS() + "/obc"
+}
+
+// COSIDriverName returns the driver name to be used in for COSI
+func COSIDriverName() string {
+	return "noobaa.objectstorage.k8s.io"
+}
+
+// WatchNamespace returns the namespace which NooBaa operator will watch for changes
+func WatchNamespace() string {
+	ns, err := util.GetWatchNamespace()
+	if err == nil {
+		return ns
+	}
+
+	return Namespace
 }
 
 // FlagSet defines the
@@ -144,8 +219,12 @@ func init() {
 		DBImage, "The database container image",
 	)
 	FlagSet.StringVar(
-		&DBType, "db-type",
-		DBType, "The type of database container image (mongodb, postgres)",
+		&Psql12Image, "psql-12-image",
+		Psql12Image, "The database old container image",
+	)
+	FlagSet.StringVar(
+		&CosiSideCarImage, "cosi-sidecar-image",
+		CosiSideCarImage, "The cosi side car container image",
 	)
 	FlagSet.IntVar(
 		&DBVolumeSizeGB, "db-volume-size-gb",
@@ -156,12 +235,28 @@ func init() {
 		DBStorageClass, "The database volume storage class name",
 	)
 	FlagSet.StringVar(
-		&MongoDbURL, "mongodb-url",
-		MongoDbURL, "url for mongodb",
+		&PostgresDbURL, "postgres-url",
+		PostgresDbURL, "url for postgresql",
 	)
-	FlagSet.IntVar(
+	FlagSet.BoolVar(
+		&PostgresSSLRequired, "pg-ssl-required",
+		false, "Force noobaa to work with ssl (external postgres - server-side) [if server cert is self-signed, needs to add --ssl-unauthorized]",
+	)
+	FlagSet.BoolVar(
+		&PostgresSSLSelfSigned, "pg-ssl-unauthorized",
+		false, "Allow the client to work with self-signed ssl (external postgres - server-side)",
+	)
+	FlagSet.StringVar(
+		&PostgresSSLKey, "pg-ssl-key",
+		PostgresSSLKey, "ssl key for postgres (client-side cert - need to be signed by external pg accepted CA)",
+	)
+	FlagSet.StringVar(
+		&PostgresSSLCert, "pg-ssl-cert",
+		PostgresSSLCert, "ssl cert for postgres (client-side cert - need to be signed by external pg accepted CA)",
+	)
+	FlagSet.StringVar(
 		&DebugLevel, "debug-level",
-		DebugLevel, "Sets debug level prints of the system, affects the install spec",
+		DebugLevel, "The type of debug sets that the system prints (all, nsfs, warn, default_level)",
 	)
 	FlagSet.StringVar(
 		&PVPoolDefaultStorageClass, "pv-pool-default-storage-class",
@@ -174,5 +269,53 @@ func init() {
 	FlagSet.BoolVar(
 		&MiniEnv, "mini",
 		false, "Signal the operator that it is running in a low resource environment",
+	)
+	FlagSet.BoolVar(
+		&DevEnv, "dev",
+		false, "Set sufficient resources for dev env",
+	)
+	FlagSet.BoolVar(
+		&TestEnv, "test-env",
+		false, "Install the system with test env minimal resources",
+	)
+	FlagSet.BoolVar(
+		&DisableLoadBalancerService, "disable-load-balancer",
+		false, "Set the service type to ClusterIP instead of LoadBalancer",
+	)
+	FlagSet.StringVar(
+		&CosiDriverPath, "cosi-driver-path",
+		CosiDriverPath, "unix socket path for COSI",
+	)
+	FlagSet.BoolVar(
+		&AdmissionWebhook, "admission",
+		false, "Install the system with admission validation webhook",
+	)
+	FlagSet.BoolVar(
+		&ShowSecrets, "show-secrets",
+		false, "Show the secrets in the status output",
+	)
+	FlagSet.StringArrayVar(
+		&S3LoadBalancerSourceSubnets, "s3-load-balancer-source-subnets",
+		[]string{}, "The source subnets for the S3 service load balancer",
+	)
+	FlagSet.StringArrayVar(
+		&STSLoadBalancerSourceSubnets, "sts-load-balancer-source-subnets",
+		[]string{}, "The source subnets for the STS service load balancer",
+	)
+	FlagSet.BoolVar(
+		&ManualDefaultBackingStore, "manual-default-backingstore",
+		false, "allow to delete the default backingstore",
+	)
+	FlagSet.StringVar(
+		&AutoscalerType, "autoscaler-type",
+		AutoscalerType, "The type of autoscaler (hpav2, keda)",
+	)
+	FlagSet.StringVar(
+		&PrometheusNamespace, "prometheus-namespace",
+		PrometheusNamespace, "namespace with installed prometheus for autoscaler",
+	)
+	FlagSet.StringVar(
+		&AWSSTSARN, "aws-sts-arn",
+		AWSSTSARN, "The AWS STS Role ARN which will assume role",
 	)
 }

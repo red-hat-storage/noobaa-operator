@@ -57,7 +57,7 @@ spec:
 
 # OBC with specific BucketClass
 
-Applications that require a bucket from a specific BucketClass can create an OBC with the default StorageClass, but override the BucketClass specifically for that claim using the `spec.additionalConfig.bucketclass` property.
+Applications that require a bucket from a specific BucketClass can create an OBC with the default StorageClass, but override the BucketClass specifically for that claim using the `spec.additionalConfig.bucketclass` property. The BucketClass can exist either in the same namespace as that of OBC or it can exist in NooBaa system namespace. In case of a conflict, BucketClass that exists in the OBC namespace will take priority over the BucketClass in NooBaa system.
 
 Example:
 
@@ -78,6 +78,71 @@ spec:
     bucketclass: custom-bucket-class
 ```
 
+# OBC with specific Replication Policy
+
+Applications that require a bucket to have a specific replication policy can create an OBC and add to the claim 
+the `spec.additionalConfig.replication-policy` property.
+
+/path/to/json-file.json is the path to a JSON file which defines the replication policy
+
+Example:
+
+```bash
+noobaa obc create my-bucket-claim -n noobaa --app-namespace my-app --replication-policy /path/to/json-file.json
+```
+
+```yaml
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: my-bucket-claim
+  namespace: my-app
+spec:
+  generateBucketName: my-bucket
+  storageClassName: noobaa.noobaa.io
+  additionalConfig:
+    replicationPolicy: [{ "rule_id": "rule-2", "destination_bucket": "first.bucket", "filter": {"prefix": "bc"}}]
+```
+
+# OBC with an NSFS account config
+
+It is possible to create an OBC on top of NSFS.
+In order to do this, two prerequisites need to be provided:
+- The name of a bucketclass that was created on top of an NSFS namespacestore
+- Filesystem access mapping (either `uid` and `gid`, or a `distinguished_name`)
+
+In the case of applying a YAML, the user has to provide the data as a JSON object in `nsfsAccountConfig` under the OBC's `spec.additionalConfig` key (see example below)
+
+Both CLI and YAML options utilize the same parameter names:
+gid - the group ID of the account that should be mimicked within the filesystem
+uid - the user ID of the account that should be mimicked within the filesystem
+OR
+distinguished_name - the distinguished name of the account that should be mimicked within the filesystem
+
+These optional additionalConfig keys can be provided by the user to further configure NSFS OBC properties:
+path - the filesystem path that should be 'mounted' as the bucket's root. Please make sure that the path was created with the appropriate ownership and permissions ahead of time.
+
+Examples:
+
+```bash
+noobaa obc create my-bucket-claim -n my-app --app-namespace my-app --bucketclass nsfs-bucket-class --uid 42 --gid 505 --path '/mnt/nsfs'
+```
+
+```yaml
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: my-bucket-claim
+  namespace: my-app
+spec:
+  generateBucketName: my-bucket
+  storageClassName: noobaa.noobaa.io
+  additionalConfig:
+    bucketclass: nsfs-bucket-class
+    nsfsAccountConfig: { "distinguished_name": "current_user" }
+    path: "/mnt/nsfs"
+```
+
 # Using the OBC
 
 Once the OBC is provisioned by the operator, a bucket will be created in NooBaa, and the operator will create a Secret and ConfigMap with the same name of the OBC on the same namespace of the OBC. For the example above, the Secret and ConfigMap will both be named `my-bucket-claim`.
@@ -94,7 +159,7 @@ Secret:
 apiVersion: v1
 data:
   AWS_ACCESS_KEY_ID: UU1odkFSWjNiMWplTmx2UnZpcHU=
-  AWS_SECRET_ACCESS_KEY: eTdFdlkva1FSQVEzWElWWXB3L2ZYdVBZdG8wSDBxaVlBSUpraW1iTA==
+  AWS_SECRET_ACCESS_KEY: EXAMPLEeTdFdlkva1FSQVEzWElWWXB3L2ZYdVBZdG8wSDBxaVlBSUpraW1iTA==
 kind: Secret
 metadata:
   creationTimestamp: "2020-01-14T08:05:31Z"

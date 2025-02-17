@@ -5,12 +5,12 @@ import (
 	"log"
 	"net/url"
 
-	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2017-06-01/storage"
+	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2019-06-01/storage"
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/adal"
 	"github.com/Azure/go-autorest/autorest/azure"
-	"github.com/Azure/go-autorest/autorest/to"
+	"k8s.io/utils/ptr"
 )
 
 func (r *Reconciler) getStorageAccountsClient() storage.AccountsClient {
@@ -38,22 +38,12 @@ func (r *Reconciler) CreateStorageAccount(accountName, accountGroupName string) 
 	var s storage.Account
 	storageAccountsClient := r.getStorageAccountsClient()
 
-	result, err := storageAccountsClient.CheckNameAvailability(
-		r.Ctx,
-		storage.AccountCheckNameAvailabilityParameters{
-			Name: to.StringPtr(accountName),
-			Type: to.StringPtr("Microsoft.Storage/storageAccounts"),
-		})
-	if err != nil {
-		return s, fmt.Errorf("storage account check-name-availability failed: %+v", err)
-	}
+	// we used to call storage.AccountCheckNameAvailabilityParameters here to make sure the name is available
+	// removed it because when using a newer API version (2019-06-01), this call produced some irrelevant errors sometimes
+	// if the name is not available, CreateStorageAccount will return an error, and a different name will be used next time
 
-	if !*result.NameAvailable {
-		return s, fmt.Errorf(
-			"storage account name [%s] not available: %v\nserver message: %v",
-			accountName, err, *result.Message)
-	}
-
+	enableHTTPSTrafficOnly := true
+	allowBlobPublicAccess := false
 	future, err := storageAccountsClient.Create(
 		r.Ctx,
 		accountGroupName,
@@ -61,9 +51,13 @@ func (r *Reconciler) CreateStorageAccount(accountName, accountGroupName string) 
 		storage.AccountCreateParameters{
 			Sku: &storage.Sku{
 				Name: storage.StandardLRS},
-			Kind:                              storage.Storage,
-			Location:                          to.StringPtr(r.AzureContainerCreds.StringData["azure_region"]),
-			AccountPropertiesCreateParameters: &storage.AccountPropertiesCreateParameters{},
+			Kind:     storage.StorageV2,
+			Location: ptr.To(r.AzureContainerCreds.StringData["azure_region"]),
+			AccountPropertiesCreateParameters: &storage.AccountPropertiesCreateParameters{
+				EnableHTTPSTrafficOnly: &enableHTTPSTrafficOnly,
+				AllowBlobPublicAccess:  &allowBlobPublicAccess,
+				MinimumTLSVersion:      storage.TLS12,
+			},
 		})
 
 	if err != nil {
@@ -81,7 +75,7 @@ func (r *Reconciler) CreateStorageAccount(accountName, accountGroupName string) 
 // GetStorageAccount gets details on the specified storage account
 func (r *Reconciler) GetStorageAccount(accountName, accountGroupName string) (storage.Account, error) {
 	storageAccountsClient := r.getStorageAccountsClient()
-	return storageAccountsClient.GetProperties(r.Ctx, accountGroupName, accountName)
+	return storageAccountsClient.GetProperties(r.Ctx, accountGroupName, accountName, storage.AccountExpandBlobRestoreStatus)
 }
 
 // DeleteStorageAccount deletes an existing storate account
@@ -97,8 +91,8 @@ func (r *Reconciler) CheckAccountNameAvailability(accountName string) (storage.C
 	result, err := storageAccountsClient.CheckNameAvailability(
 		r.Ctx,
 		storage.AccountCheckNameAvailabilityParameters{
-			Name: to.StringPtr(accountName),
-			Type: to.StringPtr("Microsoft.Storage/storageAccounts"),
+			Name: ptr.To(accountName),
+			Type: ptr.To("Microsoft.Storage/storageAccounts"),
 		})
 	return result, err
 }
@@ -106,7 +100,7 @@ func (r *Reconciler) CheckAccountNameAvailability(accountName string) (storage.C
 // GetAccountKeys gets the storage account keys
 func (r *Reconciler) GetAccountKeys(accountName, accountGroupName string) (storage.AccountListKeysResult, error) {
 	accountsClient := r.getStorageAccountsClient()
-	return accountsClient.ListKeys(r.Ctx, accountGroupName, accountName)
+	return accountsClient.ListKeys(r.Ctx, accountGroupName, accountName, storage.Kerb)
 }
 
 func (r *Reconciler) getContainerURL(accountName, accountGroupName, containerName string) azblob.ContainerURL {
@@ -128,7 +122,7 @@ func (r *Reconciler) CreateContainer(accountName, accountGroupName, containerNam
 	_, err := c.Create(
 		r.Ctx,
 		azblob.Metadata{},
-		azblob.PublicAccessContainer)
+		azblob.PublicAccessNone)
 	return c, err
 }
 

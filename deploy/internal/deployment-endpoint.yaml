@@ -19,7 +19,10 @@ spec:
       labels:
         noobaa-s3: noobaa
         app: noobaa
+      annotations:
+        noobaa.io/configmap-hash: ""
     spec:
+        # Notice that changing the serviceAccountName would need to update existing AWS STS role trust policy for customers
       serviceAccountName: noobaa-endpoint
       volumes:
         - name: mgmt-secret
@@ -30,6 +33,27 @@ spec:
           secret:
             secretName: noobaa-s3-serving-cert
             optional: true
+        - name: sts-secret
+          secret:
+            secretName: noobaa-sts-serving-cert
+            optional: true
+        # This service account token can be used to provide identity outside the cluster.
+        # For example, this token can be used with AssumeRoleWithWebIdentity to authenticate with AWS using IAM OIDC provider and STS.
+        - name: bound-sa-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  # For testing purposes change the audience to api
+                  audience: openshift
+        - name: noobaa-auth-token
+          secret:
+            secretName: noobaa-endpoints
+            optional: true
+        - name: noobaa-server
+          secret:
+            secretName: noobaa-server
+            optional: true
       containers:
         - name: endpoint
           image: NOOBAA_CORE_IMAGE
@@ -38,45 +62,64 @@ spec:
             - init_endpoint
           resources:
             requests:
-              cpu: "1"
+              cpu: "999m"
               memory: "2Gi"
             limits:
-              cpu: "1"
+              cpu: "999m"
               memory: "2Gi"
           securityContext:
+            fsGroupChangePolicy: "OnRootMismatch"
+            seLinuxOptions:
+              type: "spc_t"
             capabilities:
               add: ["SETUID", "SETGID"]
           ports:
             - containerPort: 6001
             - containerPort: 6443
+            - containerPort: 7443
           env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NOOBAA_DISABLE_COMPRESSION
+              valueFrom:
+                configMapKeyRef:
+                  name: noobaa-config
+                  key: NOOBAA_DISABLE_COMPRESSION
+            - name: NOOBAA_LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: noobaa-config
+                  key: NOOBAA_LOG_LEVEL
+            - name: NOOBAA_LOG_COLOR
+              valueFrom:
+                configMapKeyRef:
+                  name: noobaa-config
+                  key: NOOBAA_LOG_COLOR
             - name: MGMT_ADDR
+            - name: SYSLOG_ADDR
             - name: BG_ADDR
             - name: MD_ADDR
             - name: HOSTED_AGENTS_ADDR
             - name: DB_TYPE
-            - name: MONGODB_URL
             - name: POSTGRES_HOST
+            - name: POSTGRES_PORT
             - name: POSTGRES_DBNAME
               value: nbcore
             - name: POSTGRES_USER
             - name: POSTGRES_PASSWORD
+            - name: POSTGRES_CONNECTION_STRING
+            - name: POSTGRES_SSL_REQUIRED
+            - name: POSTGRES_SSL_UNAUTHORIZED
             - name: VIRTUAL_HOSTS
             - name: REGION
             - name: ENDPOINT_GROUP_ID
             - name: LOCAL_MD_SERVER
             - name: LOCAL_N2N_AGENT
-            - name: JWT_SECRET
             - name: NOOBAA_ROOT_SECRET
-            - name: NOOBAA_LOG_LEVEL
-              value: "0"
-            - name: NOOBAA_DISABLE_COMPRESSION
-              value: "false"
-            - name: NOOBAA_AUTH_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: noobaa-endpoints
-                  key: auth_token
+            - name: NODE_EXTRA_CA_CERTS
+            - name: GUARANTEED_LOGS_PATH
             - name: CONTAINER_CPU_REQUEST
               valueFrom:
                 resourceFieldRef:
@@ -102,10 +145,23 @@ spec:
             - name: s3-secret
               mountPath: /etc/s3-secret
               readOnly: true
+            - name: noobaa-auth-token
+              mountPath: /etc/noobaa-auth-token
+              readOnly: true
+            - name: noobaa-server
+              mountPath: /etc/noobaa-server
+              readOnly: true
+            - name: sts-secret
+              mountPath: /etc/sts-secret
+              readOnly: true
+            # used for aws sts endpoint type
+            - name: bound-sa-token
+              mountPath: /var/run/secrets/openshift/serviceaccount
+              readOnly: true
           readinessProbe: # must be configured to support rolling updates
             tcpSocket:
               port: 6001 # ready when s3 port is open
             timeoutSeconds: 5
-      securityContext: 
+      securityContext:
         runAsUser: 0
         runAsGroup: 0

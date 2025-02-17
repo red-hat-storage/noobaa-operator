@@ -11,10 +11,10 @@ import (
 	"github.com/noobaa/noobaa-operator/v5/pkg/options"
 	"github.com/noobaa/noobaa-operator/v5/pkg/system"
 	"github.com/noobaa/noobaa-operator/v5/pkg/util"
+	"github.com/noobaa/noobaa-operator/v5/pkg/validations"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -60,7 +60,7 @@ func NewReconciler(
 
 	// Set Namespace
 	r.BucketClass.Namespace = r.Request.Namespace
-	r.NooBaa.Namespace = r.Request.Namespace
+	r.NooBaa.Namespace = options.Namespace
 
 	// Set Names
 	r.BucketClass.Name = r.Request.Name
@@ -74,16 +74,26 @@ func NewReconciler(
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *Reconciler) Reconcile() (reconcile.Result, error) {
-
+	var err error = nil
 	res := reconcile.Result{}
 	log := r.Logger
-	log.Infof("Start ...")
+	log.Infof("Start BucketClass Reconcile...")
 
-	util.KubeCheck(r.BucketClass)
+	systemFound := system.CheckSystem(r.NooBaa)
 
-	if r.BucketClass.UID == "" {
-		log.Infof("BucketClass %q not found or deleted. Skip reconcile.", r.BucketClass.Name)
-		return reconcile.Result{}, nil
+	if !util.KubeCheck(r.BucketClass) {
+		log.Infof("❌ BucketClass %q not found or deleted.", r.BucketClass.Name)
+		return res, err
+	}
+
+	if r.BucketClass.DeletionTimestamp != nil {
+		err = r.ReconcileDeletion()
+		return res, err
+	}
+
+	if !systemFound {
+		log.Infof("NooBaa not found or already deleted. Skip reconcile.")
+		return res, nil
 	}
 
 	if util.EnsureCommonMetaFields(r.BucketClass, nbv1.Finalizer) {
@@ -95,14 +105,7 @@ func (r *Reconciler) Reconcile() (reconcile.Result, error) {
 		}
 	}
 
-	system.CheckSystem(r.NooBaa)
-
-	var err error
-	if r.BucketClass.DeletionTimestamp != nil {
-		err = r.ReconcileDeletion()
-	} else {
-		err = r.ReconcilePhases()
-	}
+	err = r.ReconcilePhases()
 	if err != nil {
 		if perr, isPERR := err.(*util.PersistentError); isPERR {
 			r.SetPhase(nbv1.BucketClassPhaseRejected, perr.Reason, perr.Message)
@@ -196,74 +199,23 @@ func (r *Reconciler) ReconcilePhaseVerifying() error {
 		"noobaa operator started phase 1/2 - \"Verifying\"",
 	)
 
+	err := validations.ValidateBucketClass(r.BucketClass)
+	if err != nil {
+		return util.NewPersistentError("ValidationError", err.Error())
+	}
+
 	if r.NooBaa.UID == "" {
 		return util.NewPersistentError("MissingSystem",
 			fmt.Sprintf("NooBaa system %q not found or deleted", r.NooBaa.Name))
 	}
 	if r.BucketClass.Spec.PlacementPolicy != nil {
-		numTiers := len(r.BucketClass.Spec.PlacementPolicy.Tiers)
-		if numTiers != 1 && numTiers != 2 {
-			return util.NewPersistentError("UnsupportedNumberOfTiers",
-				"BucketClass supports only 1 or 2 tiers")
+		if err := validations.ValidatePlacementPolicy(r.BucketClass.Spec.PlacementPolicy, r.NooBaa.Namespace); err != nil {
+			return err
 		}
-		for i := range r.BucketClass.Spec.PlacementPolicy.Tiers {
-			tier := &r.BucketClass.Spec.PlacementPolicy.Tiers[i]
-			for _, backingStoreName := range tier.BackingStores {
-				backStore := &nbv1.BackingStore{
-					TypeMeta: metav1.TypeMeta{Kind: "BackingStore"},
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      backingStoreName,
-						Namespace: r.NooBaa.Namespace,
-					},
-				}
-				if !util.KubeCheck(backStore) {
-					return util.NewPersistentError("MissingBackingStore",
-						fmt.Sprintf("NooBaa BackingStore %q not found or deleted", backingStoreName))
-				}
-				if backStore.Status.Phase == nbv1.BackingStorePhaseRejected {
-					return util.NewPersistentError("RejectedBackingStore",
-						fmt.Sprintf("NooBaa BackingStore %q is in rejected phase", backingStoreName))
-				}
-				if backStore.Status.Phase != nbv1.BackingStorePhaseReady {
-					return fmt.Errorf("NooBaa BackingStore %q is not yet ready", backingStoreName)
-				}
-			}
-		}
-	} 
+	}
 	if r.BucketClass.Spec.NamespacePolicy != nil {
-		nspType := r.BucketClass.Spec.NamespacePolicy.Type
-		var namespaceStoresArr []string
-		if nspType == nbv1.NSBucketClassTypeSingle {
-			namespaceStoresArr = append(namespaceStoresArr, r.BucketClass.Spec.NamespacePolicy.Single.Resource)
-		} else if nspType == nbv1.NSBucketClassTypeMulti {
-			namespaceStoresArr = append(r.BucketClass.Spec.NamespacePolicy.Multi.ReadResources,
-				r.BucketClass.Spec.NamespacePolicy.Multi.WriteResource)
-		} else if nspType == nbv1.NSBucketClassTypeCache {
-			namespaceStoresArr = append(namespaceStoresArr, r.BucketClass.Spec.NamespacePolicy.Cache.HubResource)
-		}
-		// check that namespace stores exists and their phase it ready
-		for _, name := range namespaceStoresArr {
-			nsStore := &nbv1.NamespaceStore{
-				TypeMeta: metav1.TypeMeta{Kind: "NamespaceStore"},
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      name,
-					Namespace: options.Namespace,
-				},
-			}
-			if !util.KubeCheck(nsStore) {
-				return util.NewPersistentError("MissingNamespaceStore",
-					fmt.Sprintf("NooBaa NamespaceStore %q not found or deleted", name))
-			}
-			if nsStore.Status.Phase == nbv1.NamespaceStorePhaseRejected {
-				return util.NewPersistentError("RejectedNamespaceStore",
-					fmt.Sprintf("NooBaa NamespaceStore %q is in rejected phase", name))
-			}
-			if nsStore.Status.Phase != nbv1.NamespaceStorePhaseReady {
-				return fmt.Errorf("NooBaa NamespaceStore %q is not yet ready", name)
-			}
-			if nsStore.Spec.Type == nbv1.NSStoreTypeNSFS && nspType != nbv1.NSBucketClassTypeSingle{
-				return util.NewPersistentError("InvalidNamespaceStoreTypes", fmt.Sprintf("NSFS NamespaceStore %q is allowed on bucketclass of type Single", name))
-			}
+		if err := validations.ValidateNamespacePolicy(r.BucketClass.Spec.NamespacePolicy, r.NooBaa.Namespace); err != nil {
+			return err
 		}
 	}
 
@@ -331,11 +283,7 @@ func (r *Reconciler) ReconcileDeletion() error {
 		}
 	}
 
-	if r.NooBaa.UID == "" {
-		r.Logger.Infof("BucketClass %q remove finalizer because NooBaa system is already deleted", r.BucketClass.Name)
-		return r.FinalizeDeletion()
-	}
-
+	r.Logger.Infof("BucketClass %q remove finalizer", r.BucketClass.Name)
 	return r.FinalizeDeletion()
 }
 
@@ -357,39 +305,10 @@ func (r *Reconciler) updateNamespaceBucketClass(bucketNames []string) error {
 	}
 
 	if r.BucketClass.Spec.NamespacePolicy != nil {
-		namespacePolicyType := r.BucketClass.Spec.NamespacePolicy.Type
-		var readResources []nb.NamespaceResourceFullConfig
 		createBucketParams := &nb.CreateBucketParams{}
-		createBucketParams.Namespace = &nb.NamespaceBucketInfo{}
-
-		if namespacePolicyType == nbv1.NSBucketClassTypeSingle {
-			createBucketParams.Namespace.WriteResource = nb.NamespaceResourceFullConfig{
-				Resource: r.BucketClass.Spec.NamespacePolicy.Single.Resource}
-			createBucketParams.Namespace.ReadResources = append(readResources, nb.NamespaceResourceFullConfig{
-				Resource: r.BucketClass.Spec.NamespacePolicy.Single.Resource})
-
-		} else if namespacePolicyType == nbv1.NSBucketClassTypeMulti {
-			createBucketParams.Namespace.WriteResource = nb.NamespaceResourceFullConfig{
-				Resource: r.BucketClass.Spec.NamespacePolicy.Multi.WriteResource}
-
-			for i := range r.BucketClass.Spec.NamespacePolicy.Multi.ReadResources {
-				rr := r.BucketClass.Spec.NamespacePolicy.Multi.ReadResources[i]
-				readResources = append(readResources, nb.NamespaceResourceFullConfig{Resource: rr})
-			}
-
-			createBucketParams.Namespace.ReadResources = readResources
-
-		} else if namespacePolicyType == nbv1.NSBucketClassTypeCache {
-			createBucketParams.Namespace.WriteResource = nb.NamespaceResourceFullConfig{
-				Resource: r.BucketClass.Spec.NamespacePolicy.Cache.HubResource}
-			createBucketParams.Namespace.ReadResources = append(readResources, nb.NamespaceResourceFullConfig{
-				Resource: r.BucketClass.Spec.NamespacePolicy.Cache.HubResource})
-			createBucketParams.Namespace.Caching = &nb.CacheSpec{TTLMs: r.BucketClass.Spec.NamespacePolicy.Cache.Caching.TTL}
-			//cachePrefix := r.BucketClass.Spec.NamespacePolicy.Cache.Prefix
-		}
+		createBucketParams.Namespace = CreateNamespaceBucketInfoStructure(*r.BucketClass.Spec.NamespacePolicy, "")
 
 		for i := range bucketNames {
-
 			createBucketParams.Name = bucketNames[i]
 			err := r.NBClient.UpdateBucketAPI(*createBucketParams)
 

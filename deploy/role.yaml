@@ -4,15 +4,17 @@ metadata:
   name: noobaa
 rules:
 - apiGroups:
+  - security.openshift.io
+  resourceNames:
+  - noobaa
+  resources:
+  - securitycontextconstraints
+  verbs:
+  - use
+- apiGroups:
   - noobaa.io
   resources:
   - '*'
-  - noobaas
-  - backingstores
-  - bucketclasses
-  - noobaas/finalizers
-  - backingstores/finalizers
-  - bucketclasses/finalizers
   verbs:
   - '*'
 - apiGroups:
@@ -119,6 +121,7 @@ rules:
   - patch
   - list
   - watch
+  - delete
 - apiGroups:
   - batch
   resources:
@@ -132,10 +135,8 @@ rules:
   - watch
   - delete
 - apiGroups:
-  - security.openshift.io 
-  resourceNames:
-  - noobaa 
+  - rbac.authorization.k8s.io
   resources:
-  - securitycontextconstraints 
+  - '*'
   verbs: 
-  - use
+  - '*'

@@ -1,0 +1,97 @@
+name: COSI integration Tests
+# SHOULD BE RETURNED ONCE COSI IS BACK
+# on: [push, pull_request, workflow_dispatch]
+on: []
+
+jobs:
+  run-cosi-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout noobaa-operator
+        uses: actions/checkout@v4
+        with:
+          repository: "noobaa/noobaa-operator"
+          path: "noobaa-operator"
+
+      - name: Setup Go on runner
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Set environment variables
+        run: |
+          echo PATH=$PATH:$HOME/go/bin                           >> $GITHUB_ENV
+          echo OPERATOR_IMAGE=noobaa/noobaa-operator:integration >> $GITHUB_ENV
+          echo CHANGE_MINIKUBE_NONE_USER=true                    >> $GITHUB_ENV
+
+      - name: Deploy dependencies
+        run: |
+          set -x
+          cd ./noobaa-operator
+          sudo bash .travis/install-minikube.sh
+          go get -v github.com/onsi/ginkgo/v2
+          go install -v github.com/onsi/ginkgo/v2/ginkgo
+          ginkgo version
+
+      - name: Change settings for k8s and minikube
+        run: |
+          sudo mv /root/.kube /root/.minikube $HOME
+          sudo chown -R $USER $HOME/.kube $HOME/.minikube
+          sed "s/root/home\/$USER/g" $HOME/.kube/config > tmp; mv tmp $HOME/.kube/config
+
+      - name: Build operator image
+        run: |
+          set -x
+          cd ./noobaa-operator
+          make cli
+          make image
+          sudo docker tag noobaa/noobaa-operator:$(go run cmd/version/main.go) $OPERATOR_IMAGE
+
+      - name: Install noobaa system
+        run: |
+          cd ./noobaa-operator
+          ./build/_output/bin/noobaa-operator crd create -n test
+          ./build/_output/bin/noobaa-operator operator install --operator-image=$OPERATOR_IMAGE -n test
+          ./build/_output/bin/noobaa-operator system create \
+          --db-resources='{ "limits": {"cpu": "100m","memory": "1G"}, "requests": {"cpu": "100m","memory": "1G"}}' \
+          --core-resources='{ "limits": {"cpu": "100m","memory": "1G"}, "requests": {"cpu": "100m","memory": "1G"}}' \
+          --endpoint-resources='{ "limits": {"cpu": "100m","memory": "1G"}, "requests": {"cpu": "100m","memory": "1G"}}' \
+          -n test
+          ./build/_output/bin/noobaa-operator status -n test
+
+      - name: Create COSI CRDs and controller
+        run: |
+          kubectl create -k github.com/kubernetes-sigs/container-object-storage-interface-api -n test
+          kubectl create -k github.com/kubernetes-sigs/container-object-storage-interface-controller
+
+      - name: Wait for phase Ready in the backingstore pod
+        run: |
+          cd ./noobaa-operator
+          ./.travis/number_of_pods_in_system.sh --namespace test --pods 5
+          kubectl wait --for=condition=available backingstore/noobaa-default-backing-store --timeout=5m -n test
+
+      - name: Run COSI test
+        run: |
+          set -x
+          cd ./noobaa-operator
+          make test-cosi
+
+      - name: Collect logs - COSI
+        if: ${{ failure() }}
+        run: |
+          set -x
+          cd ./noobaa-operator
+          kubectl get events --sort-by='.metadata.creationTimestamp' -A > logs_kubectl_events.txt
+          ./build/_output/bin/noobaa-operator diagnostics collect --db-dump --dir=cosi-tests-logs -n test
+          mv logs_kubectl_events.txt ./cosi-tests-logs
+
+      - name: Save logs - COSI
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosi-tests-logs
+          path: noobaa-operator/cosi-tests-logs
