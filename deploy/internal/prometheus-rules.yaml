@@ -31,6 +31,61 @@ spec:
     - expr: |
         NooBaa_total_usage
       record: noobaa_total_usage
+  - name: noobaa-odf.rules
+    rules:
+    - expr: |
+        NooBaa_odf_health_status
+      labels:
+        system_type: OCS
+        system_vendor: Red Hat
+      record: odf_system_health_status
+    - expr: |
+        NooBaa_total_usage
+      labels:
+        system_type: OCS
+        system_vendor: Red Hat
+      record: odf_system_raw_capacity_used_bytes
+    - expr: |
+        sum by (namespace, managedBy, job, service) (rate(NooBaa_providers_ops_read_num[5m]) + rate(NooBaa_providers_ops_write_num[5m]))
+      labels:
+        system_type: OCS
+        system_vendor: Red Hat
+      record: odf_system_iops_total_bytes
+    - expr: |
+        sum by (namespace, managedBy, job, service) (rate(NooBaa_providers_bandwidth_read_size[5m]) + rate(NooBaa_providers_bandwidth_write_size[5m]))
+      labels:
+        system_type: OCS
+        system_vendor: Red Hat
+      record: odf_system_throughput_total_bytes
+    - expr: |
+        sum(NooBaa_num_buckets + NooBaa_num_buckets_claims)
+      record: odf_system_bucket_count
+      labels:
+        system_type: OCS
+        system_vendor: Red Hat
+    - expr: |
+        sum(NooBaa_num_objects + NooBaa_num_objects_buckets_claims)
+      record: odf_system_objects_total
+      labels:
+        system_type: OCS
+        system_vendor: Red Hat
+  - name: noobaa-replication.rules
+    rules:
+    - expr: |
+        sum_over_time(sum by (replication_id) (NooBaa_replication_last_cycle_writes_size)[1y:6m])
+      record: noobaa_replication_total_writes_size
+    - expr: |
+        sum_over_time(sum by (replication_id) (NooBaa_replication_last_cycle_writes_num)[1y:6m])
+      record: noobaa_replication_total_writes_num
+    - expr: |
+        sum_over_time(sum by (replication_id) (NooBaa_replication_last_cycle_error_writes_size)[1y:6m])
+      record: noobaa_replication_total_error_writes_size
+    - expr: |
+        sum_over_time(sum by (replication_id) (NooBaa_replication_last_cycle_error_writes_num)[1y:6m])
+      record: noobaa_replication_total_error_writes_num
+    - expr: |
+        count_over_time(count by (replication_id) (NooBaa_replication_last_cycle_writes_size)[1y:6m])
+      record: noobaa_replication_total_cycles
   - name: bucket-state-alert.rules
     rules:
     - alert: NooBaaBucketErrorState
@@ -57,27 +112,49 @@ spec:
       for: 5m
       labels:
         severity: warning
-    - alert: NooBaaBucketReachingQuotaState
+    - alert: NooBaaBucketReachingSizeQuotaState
       annotations:
         description: A NooBaa bucket {{ $labels.bucket_name }} is using {{ printf
           "%0.0f" $value }}% of its quota
-        message: A NooBaa Bucket Is In Reaching Quota State
+        message: A NooBaa Bucket Is In Reaching Size Quota State
         severity_level: warning
         storage_type: NooBaa
       expr: |
-        NooBaa_bucket_quota{bucket_name=~".*"} > 80
+        NooBaa_bucket_size_quota{bucket_name=~".*"} > 80
       for: 5m
       labels:
         severity: warning
-    - alert: NooBaaBucketExceedingQuotaState
+    - alert: NooBaaBucketExceedingSizeQuotaState
       annotations:
-        description: A NooBaa bucket {{ $labels.bucket_name }} is exceeding its quota
+        description: A NooBaa bucket {{ $labels.bucket_name }} is exceeding its size quota
           - {{ printf "%0.0f" $value }}% used
-        message: A NooBaa Bucket Is In Exceeding Quota State
+        message: A NooBaa Bucket Is In Exceeding Size Quota State
         severity_level: warning
         storage_type: NooBaa
       expr: |
-        NooBaa_bucket_quota{bucket_name=~".*"} >= 100
+        NooBaa_bucket_size_quota{bucket_name=~".*"} >= 100
+      for: 5m
+      labels:
+        severity: warning
+    - alert: NooBaaBucketReachingQuantityQuotaState
+      annotations:
+        description: A NooBaa bucket {{ $labels.bucket_name }} is using {{ printf "%0.0f" $value }}% of its quantity quota
+        message: A NooBaa Bucket Is In Reaching Quantity Quota State
+        severity_level: warning
+        storage_type: NooBaa
+      expr: |
+        NooBaa_bucket_quantity_quota{bucket_name=~".*"} > 80
+      for: 5m
+      labels:
+        severity: warning
+    - alert: NooBaaBucketExceedingQuantityQuotaState
+      annotations:
+        description: A NooBaa bucket {{ $labels.bucket_name }} is exceeding its quantity quota - {{ printf "%0.0f" $value }}% used
+        message: A NooBaa Bucket Is In Exceeding Quantity Quota State
+        severity_level: warning
+        storage_type: NooBaa
+      expr: |
+        NooBaa_bucket_quantity_quota{bucket_name=~".*"} >= 100
       for: 5m
       labels:
         severity: warning

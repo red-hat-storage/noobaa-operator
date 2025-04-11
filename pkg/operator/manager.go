@@ -1,24 +1,32 @@
 package operator
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"sync"
 
+	"github.com/noobaa/noobaa-operator/v5/pkg/admission"
 	"github.com/noobaa/noobaa-operator/v5/pkg/options"
 	"github.com/noobaa/noobaa-operator/v5/pkg/system"
 	"github.com/noobaa/noobaa-operator/v5/pkg/version"
+	"github.com/sirupsen/logrus"
 
 	"github.com/spf13/cobra"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	"k8s.io/client-go/rest"
 
 	"github.com/noobaa/noobaa-operator/v5/pkg/apis"
 	"github.com/noobaa/noobaa-operator/v5/pkg/controller"
 	"github.com/noobaa/noobaa-operator/v5/pkg/util"
 
 	"github.com/operator-framework/operator-lib/leader"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
+	metricsServer "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
 // Change below variables to serve metrics on different host or port.
@@ -30,7 +38,11 @@ var (
 
 // RunOperator is the main function of the operator but it is called from a cobra.Command
 func RunOperator(cmd *cobra.Command, args []string) {
-
+	if options.DebugLevel == "warn" {
+		util.InitLogger(logrus.WarnLevel)
+	} else {
+		util.InitLogger(logrus.DebugLevel)
+	}
 	version.RunVersion(cmd, args)
 
 	config := util.KubeConfig()
@@ -42,13 +54,32 @@ func RunOperator(cmd *cobra.Command, args []string) {
 	}
 
 	// Create a new Cmd to provide shared dependencies and start components
+	// mgr => namespace scoped manager
 	mgr, err := manager.New(config, manager.Options{
-		Namespace:          options.Namespace,
-		MapperProvider:     util.MapperProvider, // restmapper.NewDynamicRESTMapper,
-		MetricsBindAddress: fmt.Sprintf("%s:%d", metricsHost, metricsPort),
+		NewCache: func(config *rest.Config, opts cache.Options) (cache.Cache, error) {
+			opts.DefaultNamespaces = map[string]cache.Config{
+				options.Namespace: {},
+			}
+			return cache.New(config, opts)
+		},
+		MapperProvider: util.MapperProvider, // restmapper.NewDynamicRESTMapper,
+		Metrics: metricsServer.Options{
+			BindAddress: fmt.Sprintf("%s:%d", metricsHost, metricsPort),
+		},
 	})
 	if err != nil {
 		log.Fatalf("Failed to create manager: %s", err)
+	}
+
+	// cmgr => cluster scoped manager
+	cmgr, err := manager.New(config, manager.Options{
+		MapperProvider: util.MapperProvider, // restmapper.NewDynamicRESTMapper,
+		Metrics: metricsServer.Options{
+			BindAddress: fmt.Sprintf("%s:%d", metricsHost, metricsPort+1),
+		},
+	})
+	if err != nil {
+		log.Fatalf("Failed to create cluster scoped manager: %s", err)
 	}
 
 	log.Info("Registering Components.")
@@ -62,10 +93,12 @@ func RunOperator(cmd *cobra.Command, args []string) {
 	if err := controller.AddToManager(mgr); err != nil {
 		log.Fatalf("Failed AddToManager: %s", err)
 	}
+	if err := controller.AddToClusterScopedManager(cmgr); err != nil {
+		log.Fatalf("Failed AddToClusterScopedManager: %s", err)
+	}
 
-	util.Panic(mgr.Add(manager.RunnableFunc(func(stopChan <-chan struct{}) error {
+	util.Panic(mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 		system.RunOperatorCreate(cmd, args)
-		<-stopChan
 		return nil
 	})))
 
@@ -75,9 +108,31 @@ func RunOperator(cmd *cobra.Command, args []string) {
 	// 	log.Warnf("Failed ExposeMetricsPort: %s", err)
 	// }
 
+	enableAdmission, ok := os.LookupEnv("ENABLE_NOOBAA_ADMISSION")
+	if ok && enableAdmission == "true" {
+		// start webhook server in new routine
+		go func() {
+			admission.RunAdmissionServer()
+		}()
+	}
+
 	// Start the manager
 	log.Info("Starting the Operator ...")
-	if err := mgr.Start(signals.SetupSignalHandler()); err != nil {
-		log.Fatalf("Manager exited non-zero: %s", err)
+	mgrs := []manager.Manager{mgr, cmgr}
+
+	ctx := signals.SetupSignalHandler()
+	var wg sync.WaitGroup
+
+	for _, mgr := range mgrs {
+		wg.Add(1)
+
+		go func(mgr manager.Manager) {
+			defer wg.Done()
+			if err := mgr.Start(ctx); err != nil {
+				log.Errorf("Manager exited non-zero: %s", err)
+			}
+		}(mgr)
 	}
+
+	wg.Wait()
 }
