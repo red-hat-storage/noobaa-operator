@@ -12,16 +12,18 @@ spec:
       resources:
         # https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/
         requests:
-          cpu: "100m"
-          memory: "400Mi"
+          cpu: "999m"
+          memory: "1Gi"
         limits:
-          cpu: "100m"
-          memory: "400Mi"
+          cpu: "999m"
+          memory: "1Gi"
       env:
         # Insert the relevant config for the current agent
         - name: CONTAINER_PLATFORM
           value: KUBERNETES
         - name: AGENT_CONFIG
+        - name: NOOBAA_LOG_LEVEL
+        - name: NOOBAA_LOG_COLOR
       command: ["/noobaa_init_files/noobaa_init.sh", "agent"]
       # Insert the relevant image for the agent
       ports:
@@ -32,6 +34,15 @@ spec:
           mountPath: /noobaa_storage
         - name: tmp-logs-vol
           mountPath: /usr/local/noobaa/logs
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+  automountServiceAccountToken: false
+  securityContext:
+    runAsUser: 10001
+    runAsGroup: 0
+    fsGroup: 0
+    fsGroupChangePolicy: "OnRootMismatch"
   volumes:
     - name: tmp-logs-vol
       emptyDir: {}
