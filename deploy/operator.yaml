@@ -4,6 +4,8 @@ metadata:
   name: noobaa-operator
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       noobaa-operator: deployment
@@ -13,14 +15,77 @@ spec:
         app: noobaa
         noobaa-operator: deployment
     spec:
+        # Notice that changing the serviceAccountName would need to update existing AWS STS role trust policy for customers
       serviceAccountName: noobaa
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+      # This service account token can be used to provide identity outside the cluster.
+      # For example, this token can be used with AssumeRoleWithWebIdentity to authenticate with AWS using IAM OIDC provider and STS.
+      - name: bound-sa-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              path: token
+              # For testing purposes change the audience to api
+              audience: openshift
+      # SHOULD BE RETURNED ONCE COSI IS BACK
+      # - name: socket
+      #   emptyDir: {}
+      - name: ocp-injected-ca-bundle
+        configMap:
+          name: ocp-injected-ca-bundle
+          items:
+          - key: ca-bundle.crt
+            path: ca-bundle.crt
+          optional: true
       containers:
         - name: noobaa-operator
           image: NOOBAA_OPERATOR_IMAGE
+          terminationMessagePolicy: FallbackToLogsOnError
+          ports:
+            - name: readyz
+              containerPort: 8081
+          volumeMounts:
+          - name: bound-sa-token
+            mountPath: /var/run/secrets/openshift/serviceaccount
+            readOnly: true
+          - name: ocp-injected-ca-bundle
+            mountPath: /etc/ocp-injected-ca-bundle
+          # SHOULD BE RETURNED ONCE COSI IS BACK
+          # - name: socket
+          #   mountPath: /var/lib/cosi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: readyz
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /readyz
+              port: readyz
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: readyz
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
           resources:
             limits:
               cpu: "250m"
               memory: "512Mi"
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
           env:
             - name: OPERATOR_NAME
               value: noobaa-operator
@@ -32,3 +97,21 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+        # SHOULD BE RETURNED ONCE COSI IS BACK
+        # - name: objectstorage-provisioner-sidecar
+        #   image: COSI_SIDECAR_IMAGE
+        #   args:
+        #   - "--v=5"
+        #   resources:
+        #     limits:
+        #       cpu: "100m"
+        #       memory: "512Mi"
+        #   imagePullPolicy: Always
+        #   env:
+        #   - name: POD_NAMESPACE
+        #     valueFrom:
+        #       fieldRef:
+        #         fieldPath: metadata.namespace
+        #   volumeMounts:
+        #   - mountPath: /var/lib/cosi
+        #     name: socket

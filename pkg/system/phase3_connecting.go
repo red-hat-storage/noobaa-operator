@@ -26,11 +26,22 @@ func (r *Reconciler) ReconcilePhaseConnecting() error {
 	if r.JoinSecret == nil {
 		r.CheckServiceStatus(r.ServiceMgmt, r.RouteMgmt, &r.NooBaa.Status.Services.ServiceMgmt, "mgmt-https")
 	}
+
+	// wait for noobaa core statefulset to be ready before proceeding
+	if r.CoreApp.Spec.Replicas == nil {
+		return fmt.Errorf("noobaa core statefulset replicas is nil, cannot proceed")
+	} else if r.CoreApp.Status.ReadyReplicas < *r.CoreApp.Spec.Replicas {
+		return fmt.Errorf("waiting for noobaa core pod to be ready, currently ready replicas: %d, expected: %d",
+			r.CoreApp.Status.ReadyReplicas, *r.CoreApp.Spec.Replicas)
+	}
+
 	if err := r.InitNBClient(); err != nil {
 		return err
 	}
 
 	r.CheckServiceStatus(r.ServiceS3, r.RouteS3, &r.NooBaa.Status.Services.ServiceS3, "s3-https")
+	r.CheckServiceStatus(r.ServiceSts, r.RouteSts, &r.NooBaa.Status.Services.ServiceSts, "sts-https")
+	r.CheckServiceStatus(r.ServiceIam, r.RouteIam, &r.NooBaa.Status.Services.ServiceIam, "iam-https")
 
 	return nil
 
@@ -100,7 +111,7 @@ func (r *Reconciler) CheckServiceStatus(srv *corev1.Service, route *routev1.Rout
 	if route.Spec.Host != "" {
 		status.ExternalDNS = append(
 			status.ExternalDNS,
-			fmt.Sprintf("%s://%s", proto, route.Spec.Host),
+			fmt.Sprintf("%s://%s:%d", proto, route.Spec.Host, servicePort.Port),
 		)
 	}
 
