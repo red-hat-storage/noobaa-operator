@@ -5751,7 +5751,7 @@ spec:
     noobaa-operator: deployment
 `
 
-const Sha256_deploy_internal_servicemonitor_mgmt_yaml = "dd92e14c909a2b7605df90ae50647894f7aef63553e86d3a13d7edec6405f9e4"
+const Sha256_deploy_internal_servicemonitor_mgmt_yaml = "3b2820e1088e9cffea1404d1296186af8d478b5c2530a27899104885caa2dcdf"
 
 const File_deploy_internal_servicemonitor_mgmt_yaml = `apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
@@ -5764,12 +5764,24 @@ spec:
   - port: mgmt-https
     path: /metrics/web_server
     scheme: https
+    relabelings:
+    - sourceLabels: [__meta_kubernetes_pod_ready]
+      action: keep
+      regex: "true"
   - port: mgmt-https
     path: /metrics/bg_workers
     scheme: https
+    relabelings:
+    - sourceLabels: [__meta_kubernetes_pod_ready]
+      action: keep
+      regex: "true"
   - port: mgmt-https
     path: /metrics/hosted_agents
     scheme: https
+    relabelings:
+    - sourceLabels: [__meta_kubernetes_pod_ready]
+      action: keep
+      regex: "true"
   namespaceSelector: {}
   selector:
     matchLabels:

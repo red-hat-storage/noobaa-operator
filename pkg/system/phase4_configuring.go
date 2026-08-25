@@ -50,6 +50,9 @@ const (
 	credentialsKey                    = "credentials"
 	metricsAuthKey                    = "metrics_token"
 	serviceMonitorCAFile              = "/etc/prometheus/configmaps/serving-certs-ca-bundle/service-ca.crt"
+	podReadyMetaLabel                 = "__meta_kubernetes_pod_ready"
+	keepReadyRelabelAction            = "keep"
+	keepReadyRelabelRegex             = "true"
 )
 
 // OnAdmissionTLSChanged is called by the reconciler when the NooBaa CR's
@@ -1768,6 +1771,7 @@ func (r *Reconciler) setDesiredServiceMonitorMgmt() error {
 	r.setServiceMonitorEndpointsToHTTPS(r.ServiceMonitorMgmt.Spec.Endpoints, "mgmt-https")
 	r.setServiceMonitorAuthorization(r.ServiceMonitorMgmt.Spec.Endpoints)
 	r.setServiceMonitorTLSConfig(r.ServiceMonitorMgmt.Spec.Endpoints, r.ServiceMgmt.Name)
+	r.setServiceMonitorKeepReadyPodRelabel(r.ServiceMonitorMgmt.Spec.Endpoints)
 	return nil
 }
 
@@ -1800,6 +1804,31 @@ func (r *Reconciler) setServiceMonitorAuthorization(endpoints []monitoringv1.End
 				},
 				Key: metricsAuthKey,
 			},
+		}
+	}
+}
+
+// setServiceMonitorKeepReadyPodRelabel adds a keep-on-pod-ready relabel to each endpoint
+// if missing. Core HA standbys stay Running but never Ready and do not serve /metrics.
+func (r *Reconciler) setServiceMonitorKeepReadyPodRelabel(endpoints []monitoringv1.Endpoint) {
+	keep := monitoringv1.RelabelConfig{
+		SourceLabels: []monitoringv1.LabelName{podReadyMetaLabel},
+		Action:       keepReadyRelabelAction,
+		Regex:        keepReadyRelabelRegex,
+	}
+	for i := range endpoints {
+		found := false
+		for _, c := range endpoints[i].RelabelConfigs {
+			if strings.EqualFold(c.Action, keepReadyRelabelAction) &&
+				c.Regex == keepReadyRelabelRegex &&
+				len(c.SourceLabels) == 1 &&
+				string(c.SourceLabels[0]) == podReadyMetaLabel {
+				found = true
+				break
+			}
+		}
+		if !found {
+			endpoints[i].RelabelConfigs = append([]monitoringv1.RelabelConfig{keep}, endpoints[i].RelabelConfigs...)
 		}
 	}
 }
