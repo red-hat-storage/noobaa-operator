@@ -242,17 +242,17 @@ func (r *Reconciler) checkExternalPg(postgresDbURL string) error {
 				dbURL, err))
 	}
 	// Query the PostgreSQL version
-	var version string
+	var version int
 	err = db.QueryRow("SELECT current_setting('server_version_num')::integer / 10000").Scan(&version)
 	if err != nil {
 		return util.NewPersistentError("InvalidExternalPgVersion",
 			fmt.Sprintf("failed getting version of external DB url: %q, error: %s",
 				dbURL, err))
 	}
-	// Check if the version is 15
-	if version != "15" {
+	// Reject PostgreSQL versions older than 15
+	if version < 15 {
 		return util.NewPersistentError("InvalidExternalPgVersion",
-			fmt.Sprintf("version of external DB %q, is not supported: %s",
+			fmt.Sprintf("version of external DB %q, is not supported: %d",
 				dbURL, version))
 	}
 	// Query the database's collation
