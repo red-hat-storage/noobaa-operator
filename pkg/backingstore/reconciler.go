@@ -2,9 +2,7 @@ package backingstore
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	math "math"
 	"net/url"
 	"os"
 	"reflect"
@@ -14,19 +12,21 @@ import (
 
 	nbv1 "github.com/noobaa/noobaa-operator/v5/pkg/apis/noobaa/v1alpha1"
 	"github.com/noobaa/noobaa-operator/v5/pkg/bundle"
+	"github.com/noobaa/noobaa-operator/v5/pkg/constants"
 	"github.com/noobaa/noobaa-operator/v5/pkg/nb"
 	"github.com/noobaa/noobaa-operator/v5/pkg/options"
 	"github.com/noobaa/noobaa-operator/v5/pkg/system"
 	"github.com/noobaa/noobaa-operator/v5/pkg/util"
+	"github.com/noobaa/noobaa-operator/v5/pkg/validations"
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/sirupsen/logrus"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -72,7 +72,7 @@ type Reconciler struct {
 	Scheme   *runtime.Scheme
 	Ctx      context.Context
 	Logger   *logrus.Entry
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 	NBClient nb.Client
 
 	BackingStore     *nbv1.BackingStore
@@ -81,16 +81,18 @@ type Reconciler struct {
 	PodAgentTemplate *corev1.Pod
 	PvcAgentTemplate *corev1.PersistentVolumeClaim
 	ServiceAccount   *corev1.ServiceAccount
+	CoreAppConfig    *corev1.ConfigMap
 
 	SystemInfo             *nb.SystemInfo
 	ExternalConnectionInfo *nb.ExternalConnectionInfo
 	PoolInfo               *nb.PoolInfo
 	HostsInfo              *[]nb.HostInfo
 
-	AddExternalConnectionParams *nb.AddExternalConnectionParams
-	CreateCloudPoolParams       *nb.CreateCloudPoolParams
-	CreateHostsPoolParams       *nb.CreateHostsPoolParams
-	UpdateHostsPoolParams       *nb.UpdateHostsPoolParams
+	AddExternalConnectionParams    *nb.AddExternalConnectionParams
+	CreateCloudPoolParams          *nb.CreateCloudPoolParams
+	CreateHostsPoolParams          *nb.CreateHostsPoolParams
+	UpdateHostsPoolParams          *nb.UpdateHostsPoolParams
+	UpdateExternalConnectionParams *nb.UpdateExternalConnectionParams
 }
 
 // Own sets the object owner references to the backingstore
@@ -103,7 +105,7 @@ func NewReconciler(
 	req types.NamespacedName,
 	client client.Client,
 	scheme *runtime.Scheme,
-	recorder record.EventRecorder,
+	recorder events.EventRecorder,
 ) *Reconciler {
 
 	r := &Reconciler{
@@ -117,6 +119,7 @@ func NewReconciler(
 		NooBaa:           util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_noobaa_cr_yaml).(*nbv1.NooBaa),
 		Secret:           util.KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret),
 		ServiceAccount:   util.KubeObject(bundle.File_deploy_service_account_yaml).(*corev1.ServiceAccount),
+		CoreAppConfig:    util.KubeObject(bundle.File_deploy_internal_configmap_empty_yaml).(*corev1.ConfigMap),
 		PodAgentTemplate: util.KubeObject(bundle.File_deploy_internal_pod_agent_yaml).(*corev1.Pod),
 		PvcAgentTemplate: util.KubeObject(bundle.File_deploy_internal_pvc_agent_yaml).(*corev1.PersistentVolumeClaim),
 	}
@@ -125,11 +128,13 @@ func NewReconciler(
 	r.BackingStore.Namespace = r.Request.Namespace
 	r.NooBaa.Namespace = r.Request.Namespace
 	r.ServiceAccount.Namespace = r.Request.Namespace
+	r.CoreAppConfig.Namespace = r.Request.Namespace
 
 	// Set Names
 	r.BackingStore.Name = r.Request.Name
 	r.NooBaa.Name = options.SystemName
 	r.ServiceAccount.Name = options.SystemName
+	r.CoreAppConfig.Name = "noobaa-config"
 
 	// Set secret names to empty
 	r.Secret.Namespace = ""
@@ -143,55 +148,58 @@ func NewReconciler(
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *Reconciler) Reconcile() (reconcile.Result, error) {
-
-	res := reconcile.Result{}
 	log := r.Logger
-	log.Infof("Start ...")
+	log.Infof("Start BackingStore Reconcile ...")
 
-	util.KubeCheck(r.BackingStore)
+	systemFound := system.CheckSystem(r.NooBaa)
 
-	if r.BackingStore.UID == "" {
-		log.Infof("BackingStore %q not found or deleted. Skip reconcile.", r.BackingStore.Name)
-		return reconcile.Result{}, nil
+	if !util.KubeCheck(r.BackingStore) {
+		log.Infof("❌ BackingStore %q not found.", r.BackingStore.Name)
+		return reconcile.Result{}, nil // final state
+	}
+
+	if err := r.LoadBackingStoreSecret(); err != nil {
+		return r.completeReconcile(err)
+	}
+
+	if ts := r.BackingStore.DeletionTimestamp; ts != nil {
+		log.Infof("BackingStore %q was deleted on %v.", r.BackingStore.Name, ts)
+		err := r.ReconcileDeletion(systemFound)
+		return r.completeReconcile(err)
+	}
+
+	if !systemFound {
+		log.Infof("NooBaa not found or already deleted. Skip reconcile.")
+		return r.completeReconcile(nil)
+	}
+
+	if r.BackingStore.Annotations != nil &&
+		r.BackingStore.Annotations[constants.PauseReconcile] == "true" {
+		log.Infof("BackingStore %q reconciliation paused. Skipping reconcile.", r.BackingStore.Name)
+		return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	if util.EnsureCommonMetaFields(r.BackingStore, nbv1.Finalizer) {
 		if !util.KubeUpdate(r.BackingStore) {
-			log.Errorf("❌ BackingStore %q failed to add mandatory meta fields", r.BackingStore.Name)
-
-			res.RequeueAfter = 3 * time.Second
-			return res, nil
+			err := fmt.Errorf("❌ BackingStore %q failed to add mandatory meta fields", r.BackingStore.Name)
+			return r.completeReconcile(err)
 		}
 	}
 
-	system.CheckSystem(r.NooBaa)
+	err := r.ReconcilePhases()
+	return r.completeReconcile(err)
+}
 
-	oldStatefulSet := &appsv1.StatefulSet{}
-	oldStatefulSet.Name = fmt.Sprintf("%s-%s-noobaa", r.BackingStore.Name, options.SystemName)
-	oldStatefulSet.Namespace = r.Request.Namespace
-	var err error
-	if util.KubeCheck(oldStatefulSet) {
-		err = r.upgradeBackingStore(oldStatefulSet)
-	}
-
-	if err == nil {
-		err = r.LoadBackingStoreSecret()
-	}
-
-	if err == nil {
-		if r.BackingStore.DeletionTimestamp != nil {
-			err = r.ReconcileDeletion()
-		} else {
-			err = r.ReconcilePhases()
-		}
-	}
+func (r *Reconciler) completeReconcile(err error) (reconcile.Result, error) {
+	log := r.Logger
+	res := reconcile.Result{}
 
 	if err != nil {
 		if perr, isPERR := err.(*util.PersistentError); isPERR {
 			r.SetPhase(nbv1.BackingStorePhaseRejected, perr.Reason, perr.Message)
 			log.Errorf("❌ Persistent Error: %s", err)
 			if r.Recorder != nil {
-				r.Recorder.Eventf(r.BackingStore, corev1.EventTypeWarning, perr.Reason, perr.Message)
+				r.Recorder.Eventf(r.BackingStore, nil, corev1.EventTypeWarning, perr.Reason, perr.Reason, perr.Message)
 			}
 		} else {
 			res.RequeueAfter = 3 * time.Second
@@ -203,14 +211,18 @@ func (r *Reconciler) Reconcile() (reconcile.Result, error) {
 		mode := r.BackingStore.Status.Mode.ModeCode
 		phaseInfo, exist := bsModeInfoMap[mode]
 
-		if exist && phaseInfo.Phase != r.BackingStore.Status.Phase {
-			phaseName := fmt.Sprintf("BackingStorePhase%s", phaseInfo.Phase)
-			desc := fmt.Sprintf("Backing store mode: %s", mode)
-			r.SetPhase(phaseInfo.Phase, desc, phaseName)
-			if r.Recorder != nil {
-				r.Recorder.Eventf(r.BackingStore, phaseInfo.Severity, phaseName, desc)
+		if exist {
+			if phaseInfo.Phase != r.BackingStore.Status.Phase {
+				phaseName := fmt.Sprintf("BackingStorePhase%s", phaseInfo.Phase)
+				desc := fmt.Sprintf("Backing store mode: %s", mode)
+				r.SetPhase(phaseInfo.Phase, desc, phaseName)
+				if r.Recorder != nil {
+					r.Recorder.Eventf(r.BackingStore, nil, phaseInfo.Severity, phaseName, phaseName, desc)
+				}
 			}
 		} else {
+			// We will get here in case we do not have a mapping inside bsModeInfoMap
+			// The default phase that was chosen was phase ready
 			r.SetPhase(
 				nbv1.BackingStorePhaseReady,
 				"BackingStorePhaseReady",
@@ -248,13 +260,19 @@ func (r *Reconciler) ReconcilePhases() error {
 
 // LoadBackingStoreSecret loads the secret to the reconciler struct
 func (r *Reconciler) LoadBackingStoreSecret() error {
-	secretRef := GetBackingStoreSecret(r.BackingStore)
+	if util.IsAWSSTSClusterBS(r.BackingStore) {
+		return nil
+	}
+
+	secretRef, err := util.GetBackingStoreSecret(r.BackingStore)
+	if err != nil {
+		return err
+	}
+
 	if secretRef != nil {
 		r.Secret.Name = secretRef.Name
 		r.Secret.Namespace = secretRef.Namespace
-		if r.Secret.Namespace == "" {
-			r.Secret.Namespace = r.BackingStore.Namespace
-		}
+
 		if r.Secret.Name == "" {
 			if r.BackingStore.Spec.Type != nbv1.StoreTypePVPool {
 				return util.NewPersistentError("EmptySecretName",
@@ -272,10 +290,45 @@ func (r *Reconciler) LoadBackingStoreSecret() error {
 						fmt.Sprintf("Could not create Secret %q in Namespace %q (conflict)", r.Secret.Name, r.Secret.Namespace))
 				}
 			}
-
+		} else {
+			// check the existence of another secret in the system that contains the same credentials,
+			// if found, point this BS secret reference to it.
+			// so if the user will update the credentials, it will trigger updateExternalConnection in all the Backingstores
+			secret, err := util.GetSecretFromSecretReference(secretRef)
+			if err != nil {
+				return nil
+			}
+			if secret != nil {
+				suggestedSecret := util.CheckForIdenticalSecretsCreds(secret, string(r.BackingStore.Spec.Type))
+				if suggestedSecret != nil {
+					secretRef.Name = suggestedSecret.Name
+					secretRef.Namespace = suggestedSecret.Namespace
+					err := util.SetBackingStoreSecretRef(r.BackingStore, secretRef)
+					if err != nil {
+						return err
+					}
+					if !util.KubeUpdate(r.BackingStore) {
+						return fmt.Errorf("failed to update Backingstore: %q secret reference", r.BackingStore.Name)
+					}
+					secret = suggestedSecret
+				}
+				if util.IsOwnedByNoobaa(secret.OwnerReferences) {
+					err = util.SetOwnerReference(r.BackingStore, secret, r.Scheme)
+					if _, isAlreadyOwnedErr := err.(*controllerutil.AlreadyOwnedError); !isAlreadyOwnedErr {
+						if err == nil {
+							if !util.KubeUpdate(secret) {
+								return fmt.Errorf("failed to update secret: %q owner reference", r.BackingStore.Name)
+							}
+						} else {
+							return err
+						}
+					}
+				}
+			}
 		}
-		util.KubeCheck(r.Secret)
 	}
+
+	util.KubeCheck(r.Secret)
 	return nil
 }
 
@@ -321,6 +374,11 @@ func (r *Reconciler) ReconcilePhaseVerifying() error {
 		"BackingStorePhaseVerifying",
 		"noobaa operator started phase 1/3 - \"Verifying\"",
 	)
+
+	err := validations.ValidateBackingStore(*r.BackingStore)
+	if err != nil {
+		return util.NewPersistentError("BackingStoreValidationError", err.Error())
+	}
 
 	if r.NooBaa.UID == "" {
 		return util.NewPersistentError("MissingSystem",
@@ -373,34 +431,11 @@ func (r *Reconciler) ReconcilePhaseCreating() error {
 	return nil
 }
 
-// ReconcileDeletion handles the deletion of a backing-store using the noobaa api
-func (r *Reconciler) ReconcileDeletion() error {
+// finalizeCore runs when the backing store is being deleted
+// Handles NooBaa core side of the store deletion
+func (r *Reconciler) finalizeCore() error {
 
-	// Set the phase to let users know the operator has noticed the deletion request
-	if r.BackingStore.Status.Phase != nbv1.BackingStorePhaseDeleting {
-		r.SetPhase(
-			nbv1.BackingStorePhaseDeleting,
-			"BackingStorePhaseDeleting",
-			"noobaa operator started deletion",
-		)
-		err := r.UpdateStatus()
-		if err != nil {
-			return err
-		}
-	}
-
-	if r.NooBaa.UID == "" {
-		r.Logger.Infof("BackingStore %q remove finalizer because NooBaa system is already deleted", r.BackingStore.Name)
-		if r.BackingStore.Spec.Type == nbv1.StoreTypePVPool {
-			err := r.deletePvPool()
-			if err != nil {
-				return err
-			}
-		}
-		return r.FinalizeDeletion()
-	}
-
-	if err := r.ReadSystemInfo(); err != nil {
+	if err := r.ReadSystemInfo(); err != nil && !util.IsPersistentError(err) {
 		return err
 	}
 
@@ -408,7 +443,7 @@ func (r *Reconciler) ReconcileDeletion() error {
 		internalPoolName := ""
 		for i := range r.SystemInfo.Pools {
 			pool := &r.SystemInfo.Pools[i]
-			if pool.ResourceType == "INTERNAL" {
+			if pool.Name == "backingstores" {
 				internalPoolName = pool.Name
 				break
 			}
@@ -416,15 +451,10 @@ func (r *Reconciler) ReconcileDeletion() error {
 		for i := range r.SystemInfo.Accounts {
 			account := &r.SystemInfo.Accounts[i]
 			if account.DefaultResource == r.PoolInfo.Name {
-				allowedBuckets := account.AllowedBuckets
-				if allowedBuckets.PermissionList == nil {
-					allowedBuckets.PermissionList = []string{}
-				}
 				err := r.NBClient.UpdateAccountS3Access(nb.UpdateAccountS3AccessParams{
-					Email:        account.Email,
-					S3Access:     account.HasS3Access,
-					DefaultResource:  &internalPoolName,
-					AllowBuckets: &allowedBuckets,
+					Email:           account.Email,
+					S3Access:        account.HasS3Access,
+					DefaultResource: &internalPoolName,
 				})
 				if err != nil {
 					return err
@@ -446,13 +476,6 @@ func (r *Reconciler) ReconcileDeletion() error {
 		}
 	}
 
-	if r.BackingStore.Spec.Type == nbv1.StoreTypePVPool {
-		err := r.deletePvPool()
-		if err != nil {
-			return err
-		}
-	}
-
 	if r.ExternalConnectionInfo != nil {
 		// TODO we cannot assume we are the only one using this connection...
 		err := r.NBClient.DeleteExternalConnectionAPI(nb.DeleteExternalConnectionParams{Name: r.ExternalConnectionInfo.Name})
@@ -468,6 +491,42 @@ func (r *Reconciler) ReconcileDeletion() error {
 		}
 	}
 
+	// success
+	return nil
+}
+
+// ReconcileDeletion handles the deletion of a backing-store using the noobaa api
+func (r *Reconciler) ReconcileDeletion(systemFound bool) error {
+
+	// Set the phase to let users know the operator has noticed the deletion request
+	if r.BackingStore.Status.Phase != nbv1.BackingStorePhaseDeleting {
+		r.SetPhase(
+			nbv1.BackingStorePhaseDeleting,
+			"BackingStorePhaseDeleting",
+			"noobaa operator started deletion",
+		)
+		err := r.UpdateStatus()
+		if err != nil {
+			return err
+		}
+	}
+
+	// Notify the NooBaa core if the system is running
+	if systemFound {
+		if err := r.finalizeCore(); err != nil {
+			return err
+		}
+	}
+
+	// Release the k8s volumes used
+	if r.BackingStore.Spec.Type == nbv1.StoreTypePVPool {
+		err := r.deletePvPool()
+		if err != nil {
+			return err
+		}
+	}
+
+	r.Logger.Infof("BackingStore %q remove finalizer", r.BackingStore.Name)
 	return r.FinalizeDeletion()
 }
 
@@ -514,34 +573,13 @@ func (r *Reconciler) ReadSystemInfo() error {
 			))
 		}
 
-		const maxPoolNameLength = int(43)
-		if len(r.BackingStore.Name) > maxPoolNameLength {
-			return util.NewPersistentError("TooLongPoolName",
-				fmt.Sprintf("NooBaa BackingStore %q is in rejected phase due to too long pvpool backingstore name, max allowed is %d", r.BackingStore.Name, maxPoolNameLength))
-		}
-
-		const defaultVolumeSize = int64(20 * 1024 * 1024 * 1024) // 20Gi=20*1024^3
-		const minimalVolumeSize = int64(16 * 1024 * 1024 * 1024) // 16Gi=16*1024^3
 		var volumeSize int64
 		pvPool := r.BackingStore.Spec.PVPool
 		if pvPool.VolumeResources != nil {
 			qty := pvPool.VolumeResources.Requests[corev1.ResourceName(corev1.ResourceStorage)]
 			volumeSize = qty.Value()
-		}
-		if volumeSize < minimalVolumeSize {
-			if volumeSize == 0 {
-				volumeSize = int64(defaultVolumeSize)
-			} else {
-				return util.NewPersistentError("SmallVolumeSize",
-					fmt.Sprintf("NooBaa BackingStore %q is in rejected phase due to insufficient size, min is %d=%gGB", r.BackingStore.Name, minimalVolumeSize, (float64(minimalVolumeSize)/(math.Pow(1024, 3)))))
-			}
-		}
-
-		const maxNumVolumes = int(20)
-		var numVolumes = int(pvPool.NumVolumes)
-		if numVolumes > maxNumVolumes {
-			return util.NewPersistentError("MaxNumVolumes",
-				fmt.Sprintf("NooBaa BackingStore %q is in rejected phase due to large amount of volumes, max is %d", r.BackingStore.Name, maxNumVolumes))
+		} else {
+			volumeSize = int64(defaultVolumeSize)
 		}
 
 		if pool == nil {
@@ -596,8 +634,15 @@ func (r *Reconciler) ReadSystemInfo() error {
 		if pool.CloudInfo == nil ||
 			pool.CloudInfo.EndpointType != conn.EndpointType ||
 			pool.CloudInfo.Endpoint != conn.Endpoint ||
-			pool.CloudInfo.Identity != conn.Identity {
+			pool.CloudInfo.Identity != string(conn.Identity) {
 			r.Logger.Warnf("using existing pool but connection mismatch %+v pool %+v %+v", conn, pool, pool.CloudInfo)
+			r.UpdateExternalConnectionParams = &nb.UpdateExternalConnectionParams{
+				Name:               conn.Name,
+				Identity:           conn.Identity,
+				Secret:             conn.Secret,
+				AzureLogAccessKeys: conn.AzureLogAccessKeys,
+				Region:             conn.Region,
+			}
 		}
 	}
 
@@ -608,7 +653,7 @@ func (r *Reconciler) ReadSystemInfo() error {
 			c := &account.ExternalConnections.Connections[j]
 			if c.EndpointType == conn.EndpointType &&
 				c.Endpoint == conn.Endpoint &&
-				c.Identity == conn.Identity {
+				c.Identity == string(conn.Identity) {
 				r.ExternalConnectionInfo = c
 				conn.Name = c.Name
 			}
@@ -617,10 +662,15 @@ func (r *Reconciler) ReadSystemInfo() error {
 
 	r.AddExternalConnectionParams = conn
 
+	targetBucket, err := util.GetBackingStoreTargetBucket(r.BackingStore)
+	if err != nil {
+		return err
+	}
+
 	r.CreateCloudPoolParams = &nb.CreateCloudPoolParams{
 		Name:         r.BackingStore.Name,
 		Connection:   conn.Name,
-		TargetBucket: GetBackingStoreTargetBucket(r.BackingStore),
+		TargetBucket: targetBucket,
 		Backingstore: &nb.BackingStoreInfo{
 			Name:      r.BackingStore.Name,
 			Namespace: r.NooBaa.Namespace,
@@ -631,7 +681,7 @@ func (r *Reconciler) ReadSystemInfo() error {
 }
 
 // MakeExternalConnectionParams translates the backing store spec and secret,
-// to noobaa api structures to be used for creating/updating external connetion and pool
+// to noobaa api structures to be used for creating/updating external connection and pool
 func (r *Reconciler) MakeExternalConnectionParams() (*nb.AddExternalConnectionParams, error) {
 
 	conn := &nb.AddExternalConnectionParams{
@@ -643,9 +693,14 @@ func (r *Reconciler) MakeExternalConnectionParams() (*nb.AddExternalConnectionPa
 	switch r.BackingStore.Spec.Type {
 
 	case nbv1.StoreTypeAWSS3:
-		conn.EndpointType = nb.EndpointTypeAws
-		conn.Identity = r.Secret.StringData["AWS_ACCESS_KEY_ID"]
-		conn.Secret = r.Secret.StringData["AWS_SECRET_ACCESS_KEY"]
+		if util.IsAWSSTSClusterBS(r.BackingStore) {
+			conn.EndpointType = nb.EndpointTypeAwsSTS
+			conn.AWSSTSARN = *r.BackingStore.Spec.AWSS3.AWSSTSRoleARN
+		} else {
+			conn.EndpointType = nb.EndpointTypeAws
+			conn.Identity = nb.MaskedString(r.Secret.StringData["AWS_ACCESS_KEY_ID"])
+			conn.Secret = nb.MaskedString(r.Secret.StringData["AWS_SECRET_ACCESS_KEY"])
+		}
 		awsS3 := r.BackingStore.Spec.AWSS3
 		u := url.URL{
 			Scheme: "https",
@@ -656,22 +711,20 @@ func (r *Reconciler) MakeExternalConnectionParams() (*nb.AddExternalConnectionPa
 		}
 		if awsS3.Region != "" {
 			u.Host = fmt.Sprintf("s3.%s.amazonaws.com", awsS3.Region)
+			conn.Region = awsS3.Region
 		}
 		conn.Endpoint = u.String()
 
 	case nbv1.StoreTypeS3Compatible:
 		conn.EndpointType = nb.EndpointTypeS3Compat
-		conn.Identity = r.Secret.StringData["AWS_ACCESS_KEY_ID"]
-		conn.Secret = r.Secret.StringData["AWS_SECRET_ACCESS_KEY"]
+		conn.Identity = nb.MaskedString(r.Secret.StringData["AWS_ACCESS_KEY_ID"])
+		conn.Secret = nb.MaskedString(r.Secret.StringData["AWS_SECRET_ACCESS_KEY"])
 		s3Compatible := r.BackingStore.Spec.S3Compatible
-		if s3Compatible.SignatureVersion == nbv1.S3SignatureVersionV4 {
+		switch s3Compatible.SignatureVersion {
+		case nbv1.S3SignatureVersionV4:
 			conn.AuthMethod = "AWS_V4"
-		} else if s3Compatible.SignatureVersion == nbv1.S3SignatureVersionV2 {
+		case nbv1.S3SignatureVersionV2:
 			conn.AuthMethod = "AWS_V2"
-		} else if s3Compatible.SignatureVersion != "" {
-			return nil, util.NewPersistentError("InvalidSignatureVersion",
-				fmt.Sprintf("Invalid s3 signature version %q for backing store %q",
-					s3Compatible.SignatureVersion, r.BackingStore.Name))
 		}
 		if s3Compatible.Endpoint == "" {
 			u := url.URL{
@@ -711,17 +764,14 @@ func (r *Reconciler) MakeExternalConnectionParams() (*nb.AddExternalConnectionPa
 
 	case nbv1.StoreTypeIBMCos:
 		conn.EndpointType = nb.EndpointTypeIBMCos
-		conn.Identity = r.Secret.StringData["IBM_COS_ACCESS_KEY_ID"]
-		conn.Secret = r.Secret.StringData["IBM_COS_SECRET_ACCESS_KEY"]
+		conn.Identity = nb.MaskedString(r.Secret.StringData["IBM_COS_ACCESS_KEY_ID"])
+		conn.Secret = nb.MaskedString(r.Secret.StringData["IBM_COS_SECRET_ACCESS_KEY"])
 		IBMCos := r.BackingStore.Spec.IBMCos
-		if IBMCos.SignatureVersion == nbv1.S3SignatureVersionV4 {
+		switch IBMCos.SignatureVersion {
+		case nbv1.S3SignatureVersionV4:
 			conn.AuthMethod = "AWS_V4"
-		} else if IBMCos.SignatureVersion == nbv1.S3SignatureVersionV2 {
+		case nbv1.S3SignatureVersionV2:
 			conn.AuthMethod = "AWS_V2"
-		} else if IBMCos.SignatureVersion != "" {
-			return nil, util.NewPersistentError("InvalidSignatureVersion",
-				fmt.Sprintf("Invalid s3 signature version %q for backing store %q",
-					IBMCos.SignatureVersion, r.BackingStore.Name))
 		}
 		if IBMCos.Endpoint == "" {
 			u := url.URL{
@@ -760,27 +810,56 @@ func (r *Reconciler) MakeExternalConnectionParams() (*nb.AddExternalConnectionPa
 		}
 
 	case nbv1.StoreTypeAzureBlob:
-		conn.EndpointType = nb.EndpointTypeAzure
 		conn.Endpoint = "https://blob.core.windows.net"
-		conn.Identity = r.Secret.StringData["AccountName"]
-		conn.Secret = r.Secret.StringData["AccountKey"]
+		tenantID := r.Secret.StringData["TenantID"]
+		conn.Identity = nb.MaskedString(r.Secret.StringData["AccountName"])
+		if util.IsAzureSTSClusterBS(r.BackingStore) {
+			conn.EndpointType = nb.EndpointTypeAzureSTS
+			conn.AzureSTSCredentials = &nb.AzureSTSCredentials{
+				ClientID: r.Secret.StringData["azure_client_id"],
+				TenantID: r.Secret.StringData["azure_tenant_id"],
+			}
+		} else {
+			conn.EndpointType = nb.EndpointTypeAzure
+			conn.Secret = nb.MaskedString(r.Secret.StringData["AccountKey"])
+		}
+
+		appID := r.Secret.StringData["ApplicationID"]
+		appSecret := r.Secret.StringData["ApplicationSecret"]
+		logsAnalyticsWorkspaceID := r.Secret.StringData["LogsAnalyticsWorkspaceID"]
+
+		if tenantID != "" && appID != "" && appSecret != "" && logsAnalyticsWorkspaceID != "" {
+			conn.AzureLogAccessKeys = &nb.AzureLogAccessKeysParams{
+				AzureTenantID:                 tenantID,
+				AzureClientID:                 appID,
+				AzureClientSecret:             appSecret,
+				AzureLogsAnalyticsWorkspaceID: logsAnalyticsWorkspaceID,
+			}
+		}
 
 	case nbv1.StoreTypeGoogleCloudStorage:
-		conn.EndpointType = nb.EndpointTypeGoogle
 		conn.Endpoint = "https://www.googleapis.com"
-		privateKeyJSON := r.Secret.StringData["GoogleServiceAccountPrivateKeyJson"]
-		privateKey := &struct {
-			ID string `json:"private_key_id"`
-		}{}
-		err := json.Unmarshal([]byte(privateKeyJSON), privateKey)
+		googleCredentialsJSON, err := util.GoogleCredentialsFromStoreSecret(r.Secret)
 		if err != nil {
 			return nil, util.NewPersistentError("InvalidGoogleSecret", fmt.Sprintf(
-				"Invalid secret for google type %q expected JSON in data.GoogleServiceAccountPrivateKeyJson",
-				r.Secret.Name,
+				"Invalid google credentials secret: %v", err,
 			))
 		}
-		conn.Identity = privateKey.ID
-		conn.Secret = privateKeyJSON
+
+		isGoogleExternalAccountJSON, identity, err := util.ParseGoogleCredentials(googleCredentialsJSON)
+		if err != nil {
+			return nil, util.NewPersistentError("InvalidGoogleSecret", fmt.Sprintf(
+				"Invalid secret for google type %q: invalid GCP credentials JSON: %v",
+				r.Secret.Name, err,
+			))
+		}
+		if isGoogleExternalAccountJSON {
+			conn.EndpointType = nb.EndpointTypeGoogleSTS
+		} else {
+			conn.EndpointType = nb.EndpointTypeGoogle
+		}
+		conn.Identity = nb.MaskedString(identity)
+		conn.Secret = nb.MaskedString(googleCredentialsJSON)
 
 	case nbv1.StoreTypePVPool:
 		return nil, util.NewPersistentError("InvalidType",
@@ -790,35 +869,21 @@ func (r *Reconciler) MakeExternalConnectionParams() (*nb.AddExternalConnectionPa
 		return nil, util.NewPersistentError("InvalidType",
 			fmt.Sprintf("Invalid backing store type %q", r.BackingStore.Spec.Type))
 	}
-
-	if !util.IsStringGraphicOrSpacesCharsOnly(conn.Identity) || !util.IsStringGraphicOrSpacesCharsOnly(conn.Secret) {
-		return nil, util.NewPersistentError("InvalidSecret",
-			fmt.Sprintf("Invalid secret containing non graphic characters (perhaps not base64 encoded?) %q", r.Secret.Name))
+	if !util.IsAWSSTSClusterBS(r.BackingStore) {
+		if !util.IsStringGraphicOrSpacesCharsOnly(string(conn.Identity)) || !util.IsStringGraphicOrSpacesCharsOnly(string(conn.Secret)) {
+			return nil, util.NewPersistentError("InvalidSecret",
+				fmt.Sprintf("Invalid secret containing non graphic characters (perhaps not base64 encoded?) %q", r.Secret.Name))
+		}
 	}
 
 	return conn, nil
 }
 
 func (r *Reconciler) fixAlternateKeysNames() {
-
-	alternateAccessKeyNames := []string{"aws_access_key_id", "AccessKey"}
-	alternateSecretKeyNames := []string{"aws_secret_access_key", "SecretKey"}
-
-	if r.Secret.StringData["AWS_ACCESS_KEY_ID"] == "" {
-		for _, key := range alternateAccessKeyNames {
-			if r.Secret.StringData[key] != "" {
-				r.Secret.StringData["AWS_ACCESS_KEY_ID"] = r.Secret.StringData[key]
-				break
-			}
-		}
-	}
-
-	if r.Secret.StringData["AWS_SECRET_ACCESS_KEY"] == "" {
-		for _, key := range alternateSecretKeyNames {
-			if r.Secret.StringData[key] != "" {
-				r.Secret.StringData["AWS_SECRET_ACCESS_KEY"] = r.Secret.StringData[key]
-				break
-			}
+	keyNames := []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"}
+	for _, key := range keyNames {
+		if r.Secret.StringData[key] == "" {
+			r.Secret.StringData[key] = util.MapAlternateKeysValue(r.Secret.StringData, key)
 		}
 	}
 }
@@ -826,21 +891,60 @@ func (r *Reconciler) fixAlternateKeysNames() {
 // ReconcileExternalConnection handles the external connection using noobaa api
 func (r *Reconciler) ReconcileExternalConnection() error {
 
-	// TODO we only support creation here, but not updates
 	if r.ExternalConnectionInfo != nil {
 		return nil
 	}
+
 	if r.AddExternalConnectionParams == nil {
 		return nil
 	}
 
-	res, err := r.NBClient.CheckExternalConnectionAPI(*r.AddExternalConnectionParams)
-	if err != nil {
-		if rpcErr, isRPCErr := err.(*nb.RPCError); isRPCErr {
-			if rpcErr.RPCCode == "INVALID_SCHEMA_PARAMS" {
-				return util.NewPersistentError("InvalidConnectionParams", rpcErr.Message)
-			}
+	checkConnectionParams := &nb.CheckExternalConnectionParams{
+		Name:                r.AddExternalConnectionParams.Name,
+		EndpointType:        r.AddExternalConnectionParams.EndpointType,
+		Endpoint:            r.AddExternalConnectionParams.Endpoint,
+		Region:              r.AddExternalConnectionParams.Region,
+		Identity:            r.AddExternalConnectionParams.Identity,
+		Secret:              r.AddExternalConnectionParams.Secret,
+		AuthMethod:          r.AddExternalConnectionParams.AuthMethod,
+		AWSSTSARN:           r.AddExternalConnectionParams.AWSSTSARN,
+		AzureLogAccessKeys:  r.AddExternalConnectionParams.AzureLogAccessKeys,
+		AzureSTSCredentials: r.AddExternalConnectionParams.AzureSTSCredentials,
+	}
+
+	if r.UpdateExternalConnectionParams != nil {
+		checkConnectionParams.IgnoreNameAlreadyExist = true
+		err := r.CheckExternalConnection(checkConnectionParams)
+		if err != nil {
+			return err
 		}
+
+		err = r.NBClient.UpdateExternalConnectionAPI(*r.UpdateExternalConnectionParams)
+		if err != nil {
+			return err
+		}
+		r.UpdateExternalConnectionParams = nil
+		return nil
+	}
+
+	checkConnectionParams.IgnoreNameAlreadyExist = false
+	err := r.CheckExternalConnection(checkConnectionParams)
+	if err != nil {
+		return err
+	}
+
+	err = r.NBClient.AddExternalConnectionAPI(*r.AddExternalConnectionParams)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// CheckExternalConnection checks an external connection using the noobaa api
+func (r *Reconciler) CheckExternalConnection(connInfo *nb.CheckExternalConnectionParams) error {
+	res, err := r.NBClient.CheckExternalConnectionAPI(*connInfo)
+	if err != nil {
 		return err
 	}
 
@@ -852,13 +956,13 @@ func (r *Reconciler) ReconcileExternalConnection() error {
 	case nb.ExternalConnectionInvalidCredentials:
 		if time.Since(r.BackingStore.CreationTimestamp.Time) < 5*time.Minute {
 			r.Logger.Infof("got invalid credentials. sometimes access keys take time to propagate inside AWS. requeuing for 5 minutes")
-			return fmt.Errorf("Got InvalidCredentials. requeue again")
+			return fmt.Errorf("got InvalidCredentials. requeue again")
 		}
 		fallthrough
 	case nb.ExternalConnectionInvalidEndpoint:
 		if time.Since(r.BackingStore.CreationTimestamp.Time) < 5*time.Minute {
-			r.Logger.Infof("got invalid endopint. requeuing for 5 minutes to make sure it is not a temporary connection issue")
-			return fmt.Errorf("got invalid endopint. requeue again")
+			r.Logger.Infof("got invalid endpoint. requeuing for 5 minutes to make sure it is not a temporary connection issue")
+			return fmt.Errorf("got invalid endpoint. requeue again")
 		}
 		fallthrough
 	case nb.ExternalConnectionTimeSkew:
@@ -866,7 +970,6 @@ func (r *Reconciler) ReconcileExternalConnection() error {
 	case nb.ExternalConnectionNotSupported:
 		return util.NewPersistentError(string(res.Status),
 			fmt.Sprintf("BackingStore %q invalid external connection %q", r.BackingStore.Name, res.Status))
-
 	case nb.ExternalConnectionTimeout:
 		fallthrough
 	case nb.ExternalConnectionUnknownFailure:
@@ -876,16 +979,15 @@ func (r *Reconciler) ReconcileExternalConnection() error {
 			res.Status, res.Error.Code, res.Error.Message)
 	}
 
-	err = r.NBClient.AddExternalConnectionAPI(*r.AddExternalConnectionParams)
-	if err != nil {
-		return err
-	}
-
 	return nil
 }
 
 // ReconcilePool handles the pool using noobaa api
 func (r *Reconciler) ReconcilePool() error {
+
+	if !util.KubeCheck(r.CoreAppConfig) {
+		r.Logger.Warnf("Could not find NooBaa config map")
+	}
 
 	// TODO we only support creation here, but not updates - just for pvpool
 	if r.PoolInfo != nil {
@@ -914,8 +1016,8 @@ func (r *Reconciler) ReconcilePool() error {
 			}
 			return err
 		}
-		if r.Secret.StringData["AGENT_CONFIG"] == "" {
-			r.Secret.StringData["AGENT_CONFIG"] = res
+		if r.Secret.StringData["agent_config"] == "" {
+			r.Secret.StringData["agent_config"] = res
 			util.KubeUpdate(r.Secret)
 		}
 		err = r.NBClient.UpdateAllBucketsDefaultPool(nb.UpdateDefaultResourceParams{
@@ -932,8 +1034,8 @@ func (r *Reconciler) ReconcilePool() error {
 	}
 
 	if r.CreateCloudPoolParams != nil {
-		if r.BackingStore.ObjectMeta.Annotations != nil {
-			if _, ok := r.BackingStore.ObjectMeta.Annotations["rgw"]; ok {
+		if r.BackingStore.Annotations != nil {
+			if _, ok := r.BackingStore.Annotations["rgw"]; ok {
 				cephCluster := &cephv1.CephCluster{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "ocs-storagecluster",
@@ -967,14 +1069,17 @@ func (r *Reconciler) ReconcilePool() error {
 }
 
 func (r *Reconciler) reconcilePvPool() error {
-	if r.Secret.StringData["AGENT_CONFIG"] == "" {
+	if r.Secret.StringData == nil {
+		return fmt.Errorf("reconcilePvPool: r.Secret.StringData is not initialized yet")
+	}
+	if r.Secret.StringData["agent_config"] == "" {
 		res, err := r.NBClient.GetHostsPoolAgentConfigAPI(nb.GetHostsPoolAgentConfigParams{
 			Name: r.BackingStore.Name,
 		})
 		if err != nil {
 			return err
 		}
-		r.Secret.StringData["AGENT_CONFIG"] = res
+		r.Secret.StringData["agent_config"] = res
 		util.KubeUpdate(r.Secret)
 	}
 	podsList := &corev1.PodList{}
@@ -997,23 +1102,16 @@ func (r *Reconciler) reconcilePvPool() error {
 	return r.reconcileExistingPods(podsList)
 }
 
-func contains(slice []string, str string) bool {
-	for _, s := range slice {
-		if s == str {
-			return true
-		}
-	}
-	return false
-}
-
 func (r *Reconciler) reconcileMissingPods(podsList *corev1.PodList, pvcsList *corev1.PersistentVolumeClaimList) error {
 	claimNames := []string{}
 	for _, pod := range podsList.Items {
 		claimNames = append(claimNames, pod.Spec.Volumes[1].PersistentVolumeClaim.ClaimName)
 	}
-	r.updatePodTemplate()
+	if err := r.updatePodTemplate(); err != nil {
+		return err
+	}
 	for _, pvc := range pvcsList.Items {
-		if !contains(claimNames, pvc.Name) {
+		if !util.Contains(claimNames, pvc.Name) {
 			i := strings.LastIndex(pvc.Name, "-")
 			postfix := pvc.Name[i+1:]
 			newPod := r.PodAgentTemplate.DeepCopy()
@@ -1061,20 +1159,72 @@ func (r *Reconciler) reconcileExistingPods(podsList *corev1.PodList) error {
 	return nil
 }
 
+// return true if update is required
+func compareResourceList(template, container *corev1.ResourceList) bool {
+	for _, res := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		if qty, ok := (*template)[res]; ok {
+			if qty.Cmp((*container)[res]) != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// return true if resources need to be updated
+func (r *Reconciler) needUpdateResources(c *corev1.Container) bool {
+	pvPool := r.BackingStore.Spec.PVPool
+	if pvPool == nil || pvPool.VolumeResources == nil {
+		return false
+	}
+
+	return compareResourceList(&pvPool.VolumeResources.Requests, &c.Resources.Requests) ||
+		compareResourceList(&pvPool.VolumeResources.Limits, &c.Resources.Limits)
+}
+
 func (r *Reconciler) needUpdate(pod *corev1.Pod) bool {
 	var c = &pod.Spec.Containers[0]
 	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} {
 		envVar := util.GetEnvVariable(&c.Env, name)
 		val, ok := os.LookupEnv(name)
 		if (envVar == nil && ok) || (envVar != nil && (!ok || envVar.Value != val)) {
-			r.Logger.Warnf("Change in Env varaibles detected: os(%s) container(%v)", val, envVar)
+			r.Logger.Warnf("Change in Env variables detected: os(%s) container(%v)", val, envVar)
 			return true
 		}
 	}
+
+	var pod_label = pod.Labels["backingstore"]
+	var bs_label = r.BackingStore.Labels["backingstore"]
+	if (bs_label != "") && (pod_label != bs_label) {
+		r.Logger.Warnf("Backingstore lable has been modified to (%v) and it is different from pod lable: (%v)", bs_label, pod_label)
+		return true
+	}
+
+	for _, name := range []string{"NOOBAA_LOG_LEVEL", "NOOBAA_LOG_COLOR"} {
+		configMapValue := r.CoreAppConfig.Data[name]
+		noobaaLogEnvVar := util.GetEnvVariable(&c.Env, name)
+
+		if (noobaaLogEnvVar == nil && configMapValue != "") || (noobaaLogEnvVar != nil && configMapValue != noobaaLogEnvVar.Value) {
+			r.Logger.Warnf("%s Env variable change detected: (%v) on the config map (%v)", name, noobaaLogEnvVar, configMapValue)
+			return true
+		}
+	}
+
 	if c.Image != r.NooBaa.Status.ActualImage {
 		r.Logger.Warnf("Change in Image detected: current image(%v) noobaa image(%v)", c.Image, r.NooBaa.Status.ActualImage)
 		return true
 	}
+
+	if r.needUpdateResources(c) {
+		r.Logger.Warnf("Change in backing store agent resources detected")
+		return true
+	}
+
+	// if automountServiceAccountToken setting is different than the podAgentTemplate, return true
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken != *r.PodAgentTemplate.Spec.AutomountServiceAccountToken {
+		return true
+	}
+
 	podSecrets := pod.Spec.ImagePullSecrets
 	noobaaSecret := r.NooBaa.Spec.ImagePullSecret
 	if noobaaSecret == nil {
@@ -1089,6 +1239,55 @@ func (r *Reconciler) needUpdate(pod *corev1.Pod) bool {
 		r.Logger.Warnf("Change in Image Pull Secrets detected: NoobaaSecret(%v) Spec(%v)", noobaaSecret, podSecrets)
 		return true
 	}
+
+	// In case noobaa CR was changed and a new toleration was added
+	// we want that change to pass to the backingstore pod as well.
+	// This change does not support removal of a toleration, in this case
+	// the user will need to manually terminate the backingstore pod.
+	podTolerations := pod.Spec.Tolerations
+	noobaaTolerations := r.NooBaa.Spec.Tolerations
+	for _, noobaaToleration := range noobaaTolerations {
+		if !util.ContainsAny(podTolerations, noobaaToleration, util.IsTolerationSuperset) {
+			r.Logger.Warnf("Change in Tolerations detected: missing/uncovered (%+v) pod(%+v)", noobaaToleration, podTolerations)
+			return true
+		}
+	}
+
+	// In case noobaa CR was changed and a new affinity was added
+	// we want that change to pass to the backingstore pod as well.
+	podAffinitiesPtr := pod.Spec.Affinity
+	noobaaAffinitiesPtr := r.NooBaa.Spec.Affinity
+	// There 4 cases
+	//                                          noobaaAffinitiesPtr value
+	//                  |         | nil                         | not nil                        |
+	//                  | ------- | --------------------------- | ------------------------------ |
+	// podAffinitiesPtr | nil     | false (nothing changed)     | true (affinity was added)      |
+	// value            | not nil | true (affinity was deleted) | depends on the reference value |
+	//                  | ------- | --------------------------- | ------------------------------ |
+	if noobaaAffinitiesPtr != nil {
+		noobaaAffinities := *noobaaAffinitiesPtr
+		if podAffinitiesPtr == nil {
+			return true
+		}
+		podAffinities := *noobaaAffinitiesPtr
+		if podAffinities != noobaaAffinities {
+			return true
+		}
+	} else {
+		if podAffinitiesPtr != nil {
+			return true
+		}
+	}
+
+	desiredPriorityClassName := ""
+	if r.BackingStore.Spec.PVPool != nil {
+		desiredPriorityClassName = r.BackingStore.Spec.PVPool.PriorityClassName
+	}
+	if pod.Spec.PriorityClassName != desiredPriorityClassName {
+		r.Logger.Warnf("Change in PriorityClassName detected")
+		return true
+	}
+
 	return false
 }
 
@@ -1115,19 +1314,15 @@ func (r *Reconciler) isPodinNoobaa(pod *corev1.Pod) bool {
 	return false
 }
 
-func (r *Reconciler) updatePodTemplate() {
+func (r *Reconciler) updatePodTemplate() error {
+	log := r.Logger.WithField("func", "updatePodTemplate")
 	c := &r.PodAgentTemplate.Spec.Containers[0]
 	for j := range c.Env {
 		switch c.Env[j].Name {
-		case "AGENT_CONFIG":
-			c.Env[j].ValueFrom = &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: r.Secret.Name,
-					},
-					Key: "AGENT_CONFIG",
-				},
-			}
+		case "NOOBAA_LOG_LEVEL":
+			c.Env[j].Value = r.CoreAppConfig.Data["NOOBAA_LOG_LEVEL"]
+		case "NOOBAA_LOG_COLOR":
+			c.Env[j].Value = r.CoreAppConfig.Data["NOOBAA_LOG_COLOR"]
 		}
 	}
 	util.ReflectEnvVariable(&c.Env, "HTTP_PROXY")
@@ -1142,16 +1337,92 @@ func (r *Reconciler) updatePodTemplate() {
 		r.PodAgentTemplate.Spec.ImagePullSecrets =
 			[]corev1.LocalObjectReference{*r.NooBaa.Spec.ImagePullSecret}
 	}
+
+	bs_label, ok := r.BackingStore.Labels["backingstore"]
+	if !ok || bs_label == "" {
+		bs_label = "noobaa"
+	}
+
 	r.PodAgentTemplate.Labels = map[string]string{
-		"app":  "noobaa",
-		"pool": r.BackingStore.Name,
+		"app":          "noobaa",
+		"pool":         r.BackingStore.Name,
+		"backingstore": bs_label,
 	}
 	if r.NooBaa.Spec.Tolerations != nil {
 		r.PodAgentTemplate.Spec.Tolerations = r.NooBaa.Spec.Tolerations
 	}
 	if r.NooBaa.Spec.Affinity != nil {
-		r.PodAgentTemplate.Spec.Affinity = r.NooBaa.Spec.Affinity
+		r.PodAgentTemplate.Spec.Affinity = &corev1.Affinity{
+			NodeAffinity:    r.NooBaa.Spec.Affinity.NodeAffinity,
+			PodAffinity:     r.NooBaa.Spec.Affinity.PodAffinity,
+			PodAntiAffinity: r.NooBaa.Spec.Affinity.PodAntiAffinity,
+		}
 	}
+	if r.BackingStore.Spec.PVPool != nil {
+		r.PodAgentTemplate.Spec.PriorityClassName = r.BackingStore.Spec.PVPool.PriorityClassName
+	}
+
+	if !util.HasNodeInclusionPolicyInPodTopologySpread() {
+		log.Info("TopologySpreadConstraints cannot be set because feature gate NodeInclusionPolicyInPodTopologySpread is not supported on this cluster version")
+	} else {
+		log.Info("Adding default TopologySpreadConstraints to backingstore pod")
+		honor := corev1.NodeInclusionPolicyHonor
+		topologySpreadConstraint := corev1.TopologySpreadConstraint{
+			MaxSkew:           1,
+			TopologyKey:       "kubernetes.io/hostname",
+			WhenUnsatisfiable: corev1.ScheduleAnyway,
+			NodeTaintsPolicy:  &honor,
+			LabelSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"backingstore": bs_label,
+				},
+			},
+		}
+		r.PodAgentTemplate.Spec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{topologySpreadConstraint}
+	}
+
+	// replace AGENT_CONFIG_SECRET_NAME with actual secret name
+	for i, vol := range r.PodAgentTemplate.Spec.Volumes {
+		if vol.Secret != nil && vol.Secret.SecretName == "AGENT_CONFIG_SECRET_NAME" {
+			r.PodAgentTemplate.Spec.Volumes[i].Secret.SecretName = r.Secret.Name
+		}
+	}
+
+	return r.updatePodResourcesTemplate(c)
+}
+
+func (r *Reconciler) updatePodResourcesTemplate(c *corev1.Container) error {
+	profileDefaults := system.GetPVPoolResources(r.NooBaa)
+
+	c.Resources.Requests = profileDefaults.Requests.DeepCopy()
+	c.Resources.Limits = profileDefaults.Limits.DeepCopy()
+
+	if pvPool := r.BackingStore.Spec.PVPool; pvPool != nil && pvPool.VolumeResources != nil {
+		applyResourceOverrides(&c.Resources, pvPool.VolumeResources)
+	}
+
+	if err := validateResourceRequestsVsLimits(c.Resources); err != nil {
+		return util.NewPersistentError("InvalidResources",
+			fmt.Sprintf("BackingStore %q has invalid resources: %v", r.BackingStore.Name, err))
+	}
+
+	r.Logger.Infof("BackingStore %q PV pool resources — requests cpu:%v mem:%v, limits cpu:%v mem:%v",
+		r.BackingStore.Name,
+		c.Resources.Requests.Cpu(), c.Resources.Requests.Memory(),
+		c.Resources.Limits.Cpu(), c.Resources.Limits.Memory())
+	return nil
+}
+
+// validateResourceRequestsVsLimits checks that for each resource, request does not exceed limit.
+func validateResourceRequestsVsLimits(res corev1.ResourceRequirements) error {
+	for _, rName := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		req, hasReq := res.Requests[rName]
+		lim, hasLim := res.Limits[rName]
+		if hasReq && hasLim && req.Cmp(lim) > 0 {
+			return fmt.Errorf("request %s (%s) exceeds limit (%s)", rName, req.String(), lim.String())
+		}
+	}
+	return nil
 }
 
 func (r *Reconciler) updatePvcTemplate() {
@@ -1160,7 +1431,14 @@ func (r *Reconciler) updatePvcTemplate() {
 	} else if r.NooBaa.Spec.PVPoolDefaultStorageClass != nil {
 		r.PvcAgentTemplate.Spec.StorageClassName = r.NooBaa.Spec.PVPoolDefaultStorageClass
 	}
-	r.PvcAgentTemplate.Spec.Resources = *r.BackingStore.Spec.PVPool.VolumeResources
+	var volumeSize resource.Quantity
+	pvPool := r.BackingStore.Spec.PVPool
+	if pvPool.VolumeResources != nil {
+		volumeSize = pvPool.VolumeResources.Requests[corev1.ResourceStorage]
+	} else {
+		volumeSize = *resource.NewQuantity(defaultVolumeSize, resource.BinarySI)
+	}
+	r.PvcAgentTemplate.Spec.Resources.Requests[corev1.ResourceStorage] = volumeSize
 	r.PvcAgentTemplate.Labels = map[string]string{
 		"app":  "noobaa",
 		"pool": r.BackingStore.Name,
@@ -1175,47 +1453,20 @@ func (r *Reconciler) deletePvPool() error {
 	return nil
 }
 
-func (r *Reconciler) upgradeBackingStore(sts *appsv1.StatefulSet) error {
-	r.Logger.Infof("Deleting old statefulset: %s", sts.Name)
-	envVar := util.GetEnvVariable(&sts.Spec.Template.Spec.Containers[0].Env, "AGENT_CONFIG")
-	if envVar == nil {
-		return util.NewPersistentError("NoAgentConfig", "Old BackingStore stateful set not having agent config")
-	}
-	agentConfig := envVar.Value
-	replicas := sts.Spec.Replicas
-	stsName := sts.Name
-	util.KubeDelete(sts, client.PropagationPolicy("Orphan")) // delete STS leave pods behind
-	o := util.KubeObject(bundle.File_deploy_internal_secret_empty_yaml)
-	secret := o.(*corev1.Secret)
-	secret.Name = fmt.Sprintf("backing-store-%s-%s", nbv1.StoreTypePVPool, r.BackingStore.Name)
-	secret.Namespace = options.Namespace
-	util.KubeCheck(secret)
-	secret.StringData["AGENT_CONFIG"] = agentConfig // update secret for future pods
-	util.KubeUpdate(secret)
-	for i := 0; i < int(*replicas); i++ {
-		pod := &corev1.Pod{}
-		pod.Name = fmt.Sprintf("%s-%d", stsName, i)
-		pod.Namespace = r.BackingStore.Namespace
-		if util.KubeCheck(pod) {
-			pod.Spec.Containers[0].Image = r.NooBaa.Status.ActualImage
-			if r.NooBaa.Spec.ImagePullSecret == nil {
-				pod.Spec.ImagePullSecrets =
-					[]corev1.LocalObjectReference{}
-			} else {
-				pod.Spec.ImagePullSecrets =
-					[]corev1.LocalObjectReference{*r.NooBaa.Spec.ImagePullSecret}
-			}
-			pod.Labels = map[string]string{"pool": r.BackingStore.Name}
-			r.Own(pod)
-			util.KubeUpdate(pod)
-			pvc := &corev1.PersistentVolumeClaim{}
-			pvc.Name = fmt.Sprintf("noobaastorage-%s", pod.Name)
-			pvc.Namespace = pod.Namespace
-			util.KubeCheck(pvc)
-			pvc.Labels = map[string]string{"pool": r.BackingStore.Name}
-			r.Own(pvc)
-			util.KubeUpdate(pvc)
+// applyResourceOverrides overrides CPU and memory in dst with values from src
+// when present. Used to apply user-specified PVPool.VolumeResources over profile defaults.
+func applyResourceOverrides(dst *corev1.ResourceRequirements, src *corev1.VolumeResourceRequirements) {
+	overrideList := func(dstList *corev1.ResourceList, srcList corev1.ResourceList) {
+		if srcList == nil {
+			return
+		}
+		if qty, ok := srcList[corev1.ResourceCPU]; ok {
+			(*dstList)[corev1.ResourceCPU] = qty
+		}
+		if qty, ok := srcList[corev1.ResourceMemory]; ok {
+			(*dstList)[corev1.ResourceMemory] = qty
 		}
 	}
-	return nil
+	overrideList(&dst.Requests, src.Requests)
+	overrideList(&dst.Limits, src.Limits)
 }

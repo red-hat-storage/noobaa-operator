@@ -1,8 +1,11 @@
 package obc
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -11,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	nbv1 "github.com/noobaa/noobaa-operator/v5/pkg/apis/noobaa/v1alpha1"
+	"github.com/noobaa/noobaa-operator/v5/pkg/bucketclass"
 	"github.com/noobaa/noobaa-operator/v5/pkg/nb"
 	"github.com/noobaa/noobaa-operator/v5/pkg/options"
 	"github.com/noobaa/noobaa-operator/v5/pkg/system"
@@ -21,27 +25,44 @@ import (
 	obErrors "github.com/kube-object-storage/lib-bucket-provisioner/pkg/provisioner/api/errors"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+type externalDNSService string
+
 const (
-	allNamespaces = ""
+	allNamespaces                                = ""
+	externalDNSServiceS3      externalDNSService = "s3"
+	externalDNSServiceVectors externalDNSService = "vectors"
 )
+
+var excludeBucketTaggingLabelKeysSet = map[string]struct{}{
+	"app":                {},
+	"noobaa-domain":      {},
+	"bucket-provisioner": {},
+	// labels that are related to provider-consumer setup
+	"remote-obc-name":       {},
+	"remote-obc-namespace":  {},
+	"remote-obc-uid":        {},
+	"storage-consumer-name": {},
+	"storage-consumer-uuid": {},
+}
 
 // Provisioner implements lib-bucket-provisioner callbacks
 type Provisioner struct {
 	client    client.Client
 	scheme    *runtime.Scheme
-	recorder  record.EventRecorder
+	recorder  events.EventRecorder
 	Logger    *logrus.Entry
 	Namespace string
 }
 
 // RunProvisioner will run OBC provisioner
-func RunProvisioner(client client.Client, scheme *runtime.Scheme, recorder record.EventRecorder) error {
+func RunProvisioner(client client.Client, scheme *runtime.Scheme, recorder events.EventRecorder) error {
 
 	provisionerName := options.ObjectBucketProvisionerName()
 	log := logrus.WithField("provisioner", provisionerName)
@@ -83,11 +104,22 @@ func RunProvisioner(client client.Client, scheme *runtime.Scheme, recorder recor
 	return nil
 }
 
+// GenerateUserID implements lib-bucket-provisioner callback to generate a user ID
+func (p Provisioner) GenerateUserID(obc *nbv1.ObjectBucketClaim, ob *nbv1.ObjectBucket) (string, error) {
+	// We do not implement this
+	return "", nil
+}
+
 // Provision implements lib-bucket-provisioner callback to create a new bucket
 func (p *Provisioner) Provision(bucketOptions *obAPI.BucketOptions) (*nbv1.ObjectBucket, error) {
 
 	log := p.Logger
 	log.Infof("Provision: got request to provision bucket %q", bucketOptions.BucketName)
+
+	err := ValidateOBC(bucketOptions.ObjectBucketClaim, false)
+	if err != nil {
+		return nil, err
+	}
 
 	r, err := NewBucketRequest(p, nil, bucketOptions)
 	if err != nil {
@@ -96,15 +128,15 @@ func (p *Provisioner) Provision(bucketOptions *obAPI.BucketOptions) (*nbv1.Objec
 
 	if r.SysClient.NooBaa.DeletionTimestamp != nil {
 		finalizersArray := r.SysClient.NooBaa.GetFinalizers()
-		if util.Contains(nbv1.GracefulFinalizer, finalizersArray) {
+		if util.Contains(finalizersArray, nbv1.GracefulFinalizer) {
 			msg := "NooBaa is in deleting state, new requests will be ignored"
-			log.Errorf(msg)
+			log.Error(msg)
 			return nil, obErrors.NewBucketExistsError(msg)
 		}
 	}
 	// TODO: we need to better handle the case that a bucket was created, but Provision failed
 	// right now we will fail on create bucket when Provision is called the second time
-	err = r.CreateBucket(p, bucketOptions)
+	err = r.CreateAndUpdateBucket(p, bucketOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -115,9 +147,14 @@ func (p *Provisioner) Provision(bucketOptions *obAPI.BucketOptions) (*nbv1.Objec
 		return nil, err
 	}
 
-	err = r.putBucketTagging()
-	if err != nil {
-		logrus.Warnf("failed executing putBucketTagging on bucket: %v, %v", r.BucketName, err)
+	// TODO: tagging is not yet supported for vector buckets
+	if r.BucketClass != nil && r.BucketClass.Spec.VectorPolicy != nil {
+		log.Infof("Provision: skipping UpdateBucketTagging for vector bucket %q — not yet supported", r.BucketName)
+	} else {
+		err = UpdateBucketTagging(r.SysClient, r.OBC)
+		if err != nil {
+			logrus.Warnf("failed executing UpdateBucketTagging on bucket: %v, %v", r.BucketName, err)
+		}
 	}
 	return r.OB, nil
 }
@@ -135,9 +172,9 @@ func (p *Provisioner) Grant(bucketOptions *obAPI.BucketOptions) (*nbv1.ObjectBuc
 
 	if r.SysClient.NooBaa.DeletionTimestamp != nil {
 		finalizersArray := r.SysClient.NooBaa.GetFinalizers()
-		if util.Contains(nbv1.GracefulFinalizer, finalizersArray) {
+		if util.Contains(finalizersArray, nbv1.GracefulFinalizer) {
 			msg := "NooBaa is in deleting state, new requests will be ignored"
-			log.Errorf(msg)
+			log.Error(msg)
 			return nil, obErrors.NewBucketExistsError(msg)
 		}
 	}
@@ -202,6 +239,90 @@ func (p *Provisioner) Revoke(ob *nbv1.ObjectBucket) error {
 	return nil
 }
 
+// Update implements lib-bucket-provisioner callback to stop using an existing bucket additional config of OBC
+func (p *Provisioner) Update(ob *nbv1.ObjectBucket) error {
+	log := p.Logger
+	log.Infof("Update: got request to Update bucket %q", ob.Name)
+
+	err := ValidateOB(ob, false)
+	if err != nil {
+		return err
+	}
+
+	r, err := NewBucketRequest(p, ob, nil)
+	if err != nil {
+		return err
+	}
+
+	// TODO: add support for updating vector buckets (quota, tagging)
+	if r.BucketClass != nil && r.BucketClass.Spec.VectorPolicy != nil {
+		log.Infof("Update: vector bucket update is currently unsupported, skipping")
+		return nil
+	}
+
+	if err = r.updateReplicationPolicy(ob); err != nil {
+		return err
+	}
+
+	if err = r.UpdateBucket(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// UpdateBucketTagging is not handled by lib-bucket-provisioner and is a customized function to update bucket tagging with OBC labels
+func UpdateBucketTagging(sysClient *system.Client, obc *nbv1.ObjectBucketClaim) error {
+	if obc == nil || obc.Labels == nil {
+		return fmt.Errorf("OBC is not provided or doesn't contain any label")
+	}
+
+	client := &http.Client{Transport: util.InsecureHTTPTransport}
+	s3Status := &sysClient.NooBaa.Status.Services.ServiceS3
+	s3Config := &aws.Config{
+		Credentials: credentials.NewStaticCredentials(
+			sysClient.SecretAdmin.StringData["AWS_ACCESS_KEY_ID"],
+			sysClient.SecretAdmin.StringData["AWS_SECRET_ACCESS_KEY"],
+			"",
+		),
+		Region:           aws.String("us-east-1"),
+		Endpoint:         aws.String(s3Status.InternalDNS[0]),
+		S3ForcePathStyle: aws.Bool(true),
+		HTTPClient:       client,
+	}
+	s3Session, err := session.NewSession(s3Config)
+	if err != nil {
+		return err
+	}
+	s3Client := s3.New(s3Session)
+
+	// convert labels to tagging array
+	taggingArray := []*s3.Tag{}
+	for key, value := range obc.Labels {
+		if _, ok := excludeBucketTaggingLabelKeysSet[key]; ok {
+			continue
+		}
+		keyPointer := key
+		valuePointer := value
+		taggingArray = append(taggingArray, &s3.Tag{Key: &keyPointer, Value: &valuePointer})
+	}
+	logrus.Infof("put bucket tagging on bucket: %s tagging: %+v ", obc.Spec.BucketName, taggingArray)
+	if len(taggingArray) == 0 {
+		return nil
+	}
+	_, err = s3Client.PutBucketTagging(&s3.PutBucketTaggingInput{
+		Bucket: &obc.Spec.BucketName,
+		Tagging: &s3.Tagging{
+			TagSet: taggingArray,
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // BucketRequest is the context of handling a single bucket request
 type BucketRequest struct {
 	Provisioner *Provisioner
@@ -231,6 +352,12 @@ func NewBucketRequest(
 		return nil, fmt.Errorf("failed to parse s3 port %q. got error: %v", sysClient.S3URL, err)
 	}
 
+	vectorsHostname := sysClient.VectorsURL.Hostname()
+	vectorsPort, err := strconv.Atoi(sysClient.VectorsURL.Port())
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse vectors port %q. got error: %v", sysClient.VectorsURL, err)
+	}
+
 	r := &BucketRequest{
 		Provisioner: p,
 		OB:          ob,
@@ -253,31 +380,63 @@ func NewBucketRequest(
 			)
 		}
 
-		r.BucketClass = &nbv1.BucketClass{
-			TypeMeta: metav1.TypeMeta{Kind: "BucketClass"},
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      bucketClassName,
-				Namespace: p.Namespace,
-			},
-		}
-		if !util.KubeCheck(r.BucketClass) {
-			msg := fmt.Sprintf("BucketClass %q not found in provisioner namespace %q", bucketClassName, p.Namespace)
-			p.recorder.Event(r.OBC, "Warning", "MissingBucketClass", msg)
-			return nil, fmt.Errorf(msg)
+		bucketClass, exists := getBucketClass(r.OBC, bucketOptions, p.Namespace, util.KubeCheck)
+		r.BucketClass = bucketClass
+		if !exists {
+			var msg string
+			if bucketClass.GetName() == "" {
+				msg = fmt.Sprintf(
+					"failed to find bucket class name in OBC %s or storage class %s",
+					r.OBC.Name,
+					r.OBC.Spec.StorageClassName,
+				)
+			} else {
+				msg = fmt.Sprintf("BucketClass %q not found in namespace %q", bucketClassName, p.Namespace)
+			}
+
+			p.recorder.Eventf(r.OBC, nil, "Warning", "MissingBucketClass", "MissingBucketClass", msg)
+			return nil, errors.New(msg)
 		}
 		if r.BucketClass.Status.Phase != nbv1.BucketClassPhaseReady {
 			msg := fmt.Sprintf("BucketClass %q is not ready", bucketClassName)
-			p.recorder.Event(r.OBC, "Warning", "BucketClassNotReady", msg)
-			return nil, fmt.Errorf(msg)
+			p.recorder.Eventf(r.OBC, nil, "Warning", "BucketClassNotReady", "BucketClassNotReady", msg)
+			return nil, errors.New(msg)
 		}
+
+		endpointHostname := s3Hostname
+		endpointPort := s3Port
+		if r.BucketClass.Spec.VectorPolicy != nil {
+			endpointHostname = vectorsHostname
+			endpointPort = vectorsPort
+		}
+		if util.IsRemoteObcAnnotation(r.OBC.Annotations) {
+			extSvc := externalDNSServiceS3
+			if r.BucketClass.Spec.VectorPolicy != nil {
+				extSvc = externalDNSServiceVectors
+			}
+			extHost, extPort, externalErr := getExternalDNSDetails(sysClient.NooBaa, extSvc)
+			if externalErr != nil {
+				p.recorder.Eventf(r.OBC, nil, "Warning", "RemoteOBCExternalDNSUnavailable", "RemoteOBCExternalDNSUnavailable",
+					fmt.Sprintf("using internal DNS details: %v", externalErr))
+			} else {
+				endpointHostname = extHost
+				endpointPort = extPort
+			}
+		}
+
+		additionalConfig := r.OBC.Spec.AdditionalConfig
+		if additionalConfig == nil {
+			additionalConfig = map[string]string{}
+		}
+
 		r.OB = &nbv1.ObjectBucket{
 			Spec: nbv1.ObjectBucketSpec{
 				Connection: &nbv1.ObjectBucketConnection{
 					Endpoint: &nbv1.ObjectBucketEndpoint{
-						BucketHost:           s3Hostname,
-						BucketPort:           s3Port,
+						BucketHost:           endpointHostname,
+						BucketPort:           endpointPort,
 						BucketName:           r.BucketName,
-						AdditionalConfigData: map[string]string{},
+						AdditionalConfigData: additionalConfig,
 					},
 					AdditionalState: map[string]string{
 						"account":               r.AccountName, // needed for delete flow
@@ -288,38 +447,44 @@ func NewBucketRequest(
 			},
 		}
 	} else {
-		if ob.Spec.Connection == nil || ob.Spec.Connection.Endpoint == nil {
+		if ob.Spec.Connection == nil || ob.Spec.Endpoint == nil {
 			return nil, fmt.Errorf("ObjectBucket has no connection/endpoint info %+v", ob)
 		}
-		r.BucketName = ob.Spec.Connection.Endpoint.BucketName
+		r.BucketName = ob.Spec.Endpoint.BucketName
 		r.AccountName = ob.Spec.AdditionalState["account"]
 		bucketClassName := ob.Spec.AdditionalState["bucketclass"]
-		r.BucketClass = &nbv1.BucketClass{
-			TypeMeta: metav1.TypeMeta{Kind: "BucketClass"},
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      bucketClassName,
-				Namespace: p.Namespace,
-			},
+
+		obcNamespace := ""
+		if ob.Spec.ClaimRef != nil {
+			obcNamespace = ob.Spec.ClaimRef.Namespace
 		}
-		if !util.KubeCheck(r.BucketClass) {
-			msg := fmt.Sprintf("BucketClass %q not found in provisioner namespace %q", bucketClassName, p.Namespace)
-			p.recorder.Event(r.OBC, "Warning", "MissingBucketClass", msg)
-			return nil, fmt.Errorf(msg)
+		bucketClass, exists := getBucketClassByName(bucketClassName, obcNamespace, p.Namespace, util.KubeCheck)
+		if !exists {
+			p.Logger.Warnf("BucketClass %q not found in namespace %q", bucketClassName, p.Namespace)
+		}
+		r.BucketClass = bucketClass
+		if r.OB.Spec.Endpoint.AdditionalConfigData == nil {
+			r.OB.Spec.Endpoint.AdditionalConfigData = map[string]string{}
 		}
 	}
 
 	return r, nil
 }
 
-// CreateBucket creates the obc bucket
-func (r *BucketRequest) CreateBucket(
+// CreateAndUpdateBucket creates the obc bucket and update
+func (r *BucketRequest) CreateAndUpdateBucket(
 	p *Provisioner,
 	bucketOptions *obAPI.BucketOptions,
 ) error {
 
 	log := r.Provisioner.Logger
+	var err error
 
-	_, err := r.SysClient.NBClient.ReadBucketAPI(nb.ReadBucketParams{Name: r.BucketName})
+	if r.BucketClass != nil && r.BucketClass.Spec.VectorPolicy != nil {
+		_, err = r.SysClient.NBClient.GetVectorBucketAPI(nb.GetVectorBucketParams{VectorBucketName: r.BucketName})
+	} else {
+		_, err = r.SysClient.NBClient.ReadBucketAPI(nb.ReadBucketParams{Name: r.BucketName})
+	}
 	if err == nil {
 		msg := fmt.Sprintf("Bucket %q already exists", r.BucketName)
 		log.Error(msg)
@@ -332,6 +497,56 @@ func (r *BucketRequest) CreateBucket(
 	if r.BucketClass == nil {
 		return fmt.Errorf("BucketClass not loaded %#v", r)
 	}
+
+	if bucketType := r.OBC.Spec.AdditionalConfig["bucketType"]; bucketType == "vector" && r.BucketClass.Spec.VectorPolicy == nil {
+		return fmt.Errorf("OBC %q specifies bucketType %q but BucketClass %q does not have a VectorPolicy",
+			r.OBC.Name, bucketType, r.BucketClass.Name)
+	}
+
+	if r.BucketClass.Spec.VectorPolicy != nil {
+		vectorParams := nb.CreateVectorBucketParams{
+			VectorBucketName: r.BucketName,
+			VectorDBType:     r.BucketClass.Spec.VectorPolicy.VectorDBType,
+			NamespaceResource: &nb.NamespaceResourceFullConfig{
+				Resource: r.BucketClass.Spec.VectorPolicy.Resource,
+				Path:     r.OBC.Spec.AdditionalConfig["path"],
+			},
+			BucketClaim: &nb.BucketClaimInfo{
+				BucketClass: r.BucketClass.Name,
+				Namespace:   r.OBC.Namespace,
+			},
+		}
+		_, err := r.SysClient.NBClient.CreateVectorBucketAPI(vectorParams)
+		if err != nil {
+			if nbErr, ok := err.(*nb.RPCError); ok && nbErr.RPCCode == "BUCKET_ALREADY_EXISTS" {
+				msg := fmt.Sprintf("Vector bucket %q already exists", r.BucketName)
+				log.Error(msg)
+				return obErrors.NewBucketExistsError(msg)
+			}
+			return fmt.Errorf("Failed to create vector bucket %q with error: %v", r.BucketName, err)
+		}
+		log.Infof("✅ Successfully created vector bucket %q", r.BucketName)
+		_, err = r.SysClient.NBClient.GetVectorBucketAPI(nb.GetVectorBucketParams{VectorBucketName: r.BucketName})
+		if err != nil {
+			return fmt.Errorf("Failed to read vector bucket %q after creation: %v", r.BucketName, err)
+		}
+		// TODO: add support for updating vector buckets (quota, tagging)
+		return nil
+	}
+
+	log.Infof("Provisioner: replication policy %s", r.BucketClass.Spec.ReplicationPolicy)
+	var replicationParams *nb.BucketReplicationParams
+	replicationPolicy := r.BucketClass.Spec.ReplicationPolicy
+	// if OBC has replication policy set it to replication policy instead of the bucketclass
+	if r.OBC.Spec.AdditionalConfig["replicationPolicy"] != "" {
+		replicationPolicy = r.OBC.Spec.AdditionalConfig["replicationPolicy"]
+	}
+	if replicationPolicy != "" {
+		if replicationParams, _, err = PrepareReplicationParams(r.BucketName, replicationPolicy, false); err != nil {
+			return err
+		}
+	}
+
 	createBucketParams := &nb.CreateBucketParams{
 		Name: r.BucketName,
 		BucketClaim: &nb.BucketClaimInfo{
@@ -343,58 +558,30 @@ func (r *BucketRequest) CreateBucket(
 		if r.OBC.Spec.AdditionalConfig["path"] != "" {
 			return fmt.Errorf("Could not create OBC %q with inner path while missing namespace bucketclass", r.OBC.Name)
 		}
-		tierName, err := r.CreateTieringStructure(*r.BucketClass)
+
+		tierName, err := bucketclass.CreateTieringStructure(*r.BucketClass.Spec.PlacementPolicy, r.BucketName, r.SysClient.NBClient)
 		if err != nil {
 			return fmt.Errorf("CreateTieringStructure for PlacementPolicy failed to create policy %q with error: %v", tierName, err)
 		}
 		createBucketParams.Tiering = tierName
+		if r.BucketClass.Spec.ArchivePolicy != nil {
+			createBucketParams.ArchivePolicy = &nb.ArchivePolicyConfig{
+				DeepArchiveResource: &nb.NamespaceResourceFullConfig{
+					Resource: r.BucketClass.Spec.ArchivePolicy.DeepArchiveResource,
+				},
+			}
+		}
 	}
 
 	// create NS bucket
 	if r.BucketClass.Spec.NamespacePolicy != nil {
-		namespacePolicyType := r.BucketClass.Spec.NamespacePolicy.Type
-		var readResources []nb.NamespaceResourceFullConfig
-		createBucketParams.Namespace = &nb.NamespaceBucketInfo{}
-
-		if r.BucketClass.Spec.PlacementPolicy == nil { // For none-caching will use default bucket class
-			defaultBucketClass, err := GetDefaultBucketClass(p, bucketOptions)
-			if err != nil {
-				return fmt.Errorf("GetDefaultBucketClass for NamespacePolicy failed with error: %v", err)
-			}
-
-			tierName, err := r.CreateTieringStructure(*defaultBucketClass)
-			if err != nil {
-				return fmt.Errorf("CreateTieringStructure for NamespacePolicy failed to create policy %q with error: %v", tierName, err)
-			}
-			createBucketParams.Tiering = tierName
+		path := r.OBC.Spec.AdditionalConfig["path"]
+		if path == "" {
+			path = r.BucketName
 		}
-
-		if namespacePolicyType == nbv1.NSBucketClassTypeSingle {
-			createBucketParams.Namespace.WriteResource = nb.NamespaceResourceFullConfig{ 
-				Resource: r.BucketClass.Spec.NamespacePolicy.Single.Resource,
-				Path:  r.OBC.Spec.AdditionalConfig["path"],
-			}
-			createBucketParams.Namespace.ReadResources = append(readResources, nb.NamespaceResourceFullConfig{ 
-				Resource: r.BucketClass.Spec.NamespacePolicy.Single.Resource })
-		} else if namespacePolicyType == nbv1.NSBucketClassTypeMulti {
-			createBucketParams.Namespace.WriteResource = nb.NamespaceResourceFullConfig{ 
-				Resource: r.BucketClass.Spec.NamespacePolicy.Multi.WriteResource,
-				Path:  r.OBC.Spec.AdditionalConfig["path"],
-			}
-			for i := range r.BucketClass.Spec.NamespacePolicy.Multi.ReadResources {
-				rr := r.BucketClass.Spec.NamespacePolicy.Multi.ReadResources[i]
-				readResources = append(readResources, nb.NamespaceResourceFullConfig{Resource: rr})
-			}
-			createBucketParams.Namespace.ReadResources = readResources
-		} else if namespacePolicyType == nbv1.NSBucketClassTypeCache {
-			createBucketParams.Namespace.WriteResource = nb.NamespaceResourceFullConfig{
-				Resource: r.BucketClass.Spec.NamespacePolicy.Cache.HubResource}
-			createBucketParams.Namespace.ReadResources = append(readResources, nb.NamespaceResourceFullConfig{
-				Resource: r.BucketClass.Spec.NamespacePolicy.Cache.HubResource})
-			createBucketParams.Namespace.Caching = &nb.CacheSpec{TTLMs: r.BucketClass.Spec.NamespacePolicy.Cache.Caching.TTL}
-			//cachePrefix := r.BucketClass.Spec.NamespacePolicy.Cache.Prefix
-		}
+		createBucketParams.Namespace = bucketclass.CreateNamespaceBucketInfoStructure(*r.BucketClass.Spec.NamespacePolicy, path)
 	}
+
 	err = r.SysClient.NBClient.CreateBucketAPI(*createBucketParams)
 
 	if err != nil {
@@ -408,74 +595,143 @@ func (r *BucketRequest) CreateBucket(
 		return fmt.Errorf("Failed to create bucket %q with error: %v", r.BucketName, err)
 	}
 
+	log.Infof("PutBucketReplicationAPI params: %v", replicationParams)
+
+	// update replication policy
+	if replicationParams != nil {
+		err = r.SysClient.NBClient.PutBucketReplicationAPI(*replicationParams)
+		if err != nil {
+			return fmt.Errorf("Provisioner Failed to update replication on bucket %q with error: %v", r.BucketName, err)
+		}
+	}
+
 	log.Infof("✅ Successfully created bucket %q", r.BucketName)
+
+	return r.UpdateBucket()
+}
+
+// UpdateBucket update obc bucket
+func (r *BucketRequest) UpdateBucket() error {
+
+	log := r.Provisioner.Logger
+
+	if r.BucketClass == nil {
+		return r.LogAndGetError("BucketClass not loaded %#v", r)
+	}
+
+	bucket, err := r.SysClient.NBClient.ReadBucketAPI(nb.ReadBucketParams{Name: r.BucketName})
+	if err != nil {
+		return r.LogAndGetError("Bucket %q doesn't exist", r.BucketName)
+	}
+
+	quotaConfig, err := GetQuotaConfig(r.BucketName, &r.BucketClass.Spec, r.OB.Spec.Endpoint.AdditionalConfigData, log)
+	if err != nil {
+		return err
+	}
+	if quotaConfig.IsEqual(bucket.Quota) {
+		r.Provisioner.Logger.Infof("UpdateBucket: no changes in quota config")
+	} else {
+		nb.WarnIfQuotaCappedByFree(r.BucketName, &bucket, nil, quotaConfig, func(format string, args ...interface{}) {
+			log.Warnf("QUOTA_WARN: "+format, args...)
+		})
+		if err := nb.ValidateQuotaAgainstBucketUsage(&bucket, quotaConfig); err != nil {
+			return err
+		}
+		createBucketParams := &nb.CreateBucketParams{
+			Name:  r.BucketName,
+			Quota: quotaConfig,
+		}
+
+		err = r.SysClient.NBClient.UpdateBucketAPI(*createBucketParams)
+		if err != nil {
+			return r.LogAndGetError("failed to update bucket %q with error: %v", r.BucketName, err)
+		}
+	}
+
+	log.Infof("✅ Successfully update bucket %q", r.BucketName)
 	return nil
 }
 
-// GetDefaultBucketClass will get the default bucket class
-func GetDefaultBucketClass(
-	p *Provisioner,
-	bucketOptions *obAPI.BucketOptions,
-) (*nbv1.BucketClass, error) {
-	bucketClassName := bucketOptions.Parameters["bucketclass"]
+// GetQuotaConfig Gets minimum QuotaConfig based on OBC config and BucketClass.
+func GetQuotaConfig(bucketName string, BucketClassSpec *nbv1.BucketClassSpec, obAdditionalConfig map[string]string, log *logrus.Entry) (*nb.QuotaConfig, error) {
+	var obMaxSize, obMaxObjects, bcMaxSize, bcMaxObjects string
+	var minMaxSize, minMaxObjects int64
 
-	if bucketClassName == "" {
-		return nil, fmt.Errorf("GetDefaultBucketClass failed to find bucket class")
+	// get quota config from ob
+	if obAdditionalConfig != nil {
+		obMaxSize = obAdditionalConfig["maxSize"]
+		obMaxObjects = obAdditionalConfig["maxObjects"]
+	}
+	// get quota config from bucketclass
+	if BucketClassSpec.Quota != nil {
+		bcMaxSize = BucketClassSpec.Quota.MaxSize
+		bcMaxObjects = BucketClassSpec.Quota.MaxObjects
 	}
 
-	bucketClass := &nbv1.BucketClass{
-		TypeMeta: metav1.TypeMeta{Kind: "BucketClass"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      bucketClassName,
-			Namespace: p.Namespace,
-		},
+	log.Debugf("getQuotaConfig: bucket %q, obMaxSize %q, obMaxObjects %q, bcMaxSize %q, bcMaxObjects %q",
+		bucketName, obMaxSize, obMaxObjects, bcMaxSize, bcMaxObjects)
+
+	quota := nb.QuotaConfig{}
+	// In order to remove the bucket quota, returns empty quota config if bucketclass and ob have no quota config
+	if bcMaxSize == "" && bcMaxObjects == "" && obMaxSize == "" && obMaxObjects == "" {
+		return &quota, nil
 	}
 
-	if !util.KubeCheck(bucketClass) {
-		msg := fmt.Sprintf("GetDefaultBucketClass BucketClass %q not found in provisioner namespace %q", bucketClassName, p.Namespace)
-		return nil, fmt.Errorf(msg)
+	//Parse bucketclass quota and transform to quotaConfig
+	if bcMaxSize != "" {
+		quantity, err := resource.ParseQuantity(bcMaxSize)
+		if err != nil {
+			return nil, fmt.Errorf("bucket %q GetQuotaConfig: parse bucketClass maxSize %q: %w", bucketName, bcMaxSize, err)
+		}
+		minMaxSize = quantity.Value()
+	}
+	if bcMaxObjects != "" {
+		n, err := strconv.ParseInt(bcMaxObjects, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("bucket %q GetQuotaConfig: parse bucketClass maxObjects %q: %w", bucketName, bcMaxObjects, err)
+		}
+		minMaxObjects = n
 	}
 
-	if bucketClass.Status.Phase != nbv1.BucketClassPhaseReady {
-		msg := fmt.Sprintf("GetDefaultBucketClass BucketClass %q is not ready", bucketClassName)
-		return nil, fmt.Errorf(msg)
+	//Parse obc quota transform to quotaConfig
+	if obMaxSize != "" {
+		quantity, err := resource.ParseQuantity(obMaxSize)
+		if err != nil {
+			return nil, fmt.Errorf("bucket %q GetQuotaConfig: parse OBC maxSize %q: %w", bucketName, obMaxSize, err)
+		}
+		obcMaxSizeInt := quantity.Value()
+		if minMaxSize == 0 || obcMaxSizeInt < minMaxSize {
+			minMaxSize = obcMaxSizeInt
+		}
 	}
 
-	return bucketClass, nil
+	if obMaxObjects != "" {
+		obcMaxObjectsInt, err := strconv.ParseInt(obMaxObjects, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("bucket %q GetQuotaConfig: parse OBC maxObjects %q: %w", bucketName, obMaxObjects, err)
+		}
+		if minMaxObjects == 0 || obcMaxObjectsInt < minMaxObjects {
+			minMaxObjects = obcMaxObjectsInt
+		}
+	}
+
+	if minMaxSize > 0 {
+		f, u := nb.GetBytesAndUnits(minMaxSize, 2)
+		quota.Size = &nb.SizeQuotaConfig{Value: f, Unit: u}
+	}
+	if minMaxObjects > 0 {
+		quota.Quantity = &nb.QuantityQuotaConfig{Value: int(minMaxObjects)}
+	}
+
+	return &quota, nil
 }
 
-// CreateTieringStructure will create the tiering structure needed for the OBC
-func (r *BucketRequest) CreateTieringStructure(BucketClass nbv1.BucketClass) (string, error) {
-	tierName := fmt.Sprintf("%s.%x", r.BucketName, time.Now().Unix())
-	tiers := []nb.TierItem{}
-
-	for i := range BucketClass.Spec.PlacementPolicy.Tiers {
-		tier := BucketClass.Spec.PlacementPolicy.Tiers[i]
-		name := fmt.Sprintf("%s.%d", tierName, i)
-		tiers = append(tiers, nb.TierItem{Order: int64(i), Tier: name})
-		// we assume either mirror or spread but no mix and the bucket class controller rejects mixed classes.
-		placement := "SPREAD"
-		if tier.Placement == nbv1.TierPlacementMirror {
-			placement = "MIRROR"
-		}
-		err := r.SysClient.NBClient.CreateTierAPI(nb.CreateTierParams{
-			Name:          name,
-			AttachedPools: tier.BackingStores,
-			DataPlacement: placement,
-		})
-		if err != nil {
-			return tierName, fmt.Errorf("Failed to create tier %q with error: %v", name, err)
-		}
-	}
-
-	err := r.SysClient.NBClient.CreateTieringPolicyAPI(nb.TieringPolicyInfo{
-		Name:  tierName,
-		Tiers: tiers,
-	})
-	if err != nil {
-		return tierName, fmt.Errorf("Failed to create tier %q with error: %v", tierName, err)
-	}
-	return tierName, nil
+// LogAndGetError error handler. prints error message to log and returns error
+func (r *BucketRequest) LogAndGetError(format string, a ...interface{}) error {
+	log := r.Provisioner.Logger
+	msg := fmt.Sprintf(format, a...)
+	log.Error(msg)
+	return errors.New(msg)
 }
 
 // CreateAccount creates the obc account
@@ -486,18 +742,39 @@ func (r *BucketRequest) CreateAccount() error {
 	if r.BucketClass.Spec.PlacementPolicy != nil {
 		defaultResource = r.BucketClass.Spec.PlacementPolicy.Tiers[0].BackingStores[0]
 	}
+
+	var nsfsAccountConfig *nbv1.AccountNsfsConfig
+	// Validation is already performed as part of ValidateOBC before CreateAccount is ever called
+	// ...but we revalidate to satisfy the linter.
+	if r.OBC.Spec.AdditionalConfig["nsfsAccountConfig"] != "" {
+		nsfsAccountConfig = &nbv1.AccountNsfsConfig{}
+		err := json.Unmarshal([]byte(r.OBC.Spec.AdditionalConfig["nsfsAccountConfig"]), nsfsAccountConfig)
+		if err != nil {
+			return fmt.Errorf("failed to parse NSFS config %q: %w", r.OBC.Spec.AdditionalConfig["nsfsAccountConfig"], err)
+		}
+		// We prefer to make sure this account is only used for its appropriate NSFS operations
+		nsfsAccountConfig.NewBucketsPath = ""
+		nsfsAccountConfig.NsfsOnly = true
+		// -1 is the default CLI value which we use to indicate that the UID/GID should not be set
+		// 0 cannot be used since it is a valid GID/UID value
+		var IDNullifier = -1
+		if nsfsAccountConfig.UID == &IDNullifier {
+			nsfsAccountConfig.UID = nil
+			nsfsAccountConfig.GID = nil
+		}
+	}
+
 	accountInfo, err := r.SysClient.NBClient.CreateAccountAPI(nb.CreateAccountParams{
-		Name:              r.AccountName,
-		Email:             r.AccountName,
-		DefaultResource:   defaultResource,
-		HasLogin:          false,
-		S3Access:          true,
+		Name:  r.AccountName,
+		Email: r.AccountName,
+		// defaultResource is left as-is only because AllowBucketCreate is false
+		DefaultResource: defaultResource,
+		HasLogin:        false,
+		S3Access:        true,
+		// If this field is to be changed, DefaultResource above will need to be modified as well
 		AllowBucketCreate: false,
-		AllowedBuckets: nb.AccountAllowedBuckets{
-			FullPermission: false,
-			PermissionList: []string{r.BucketName},
-		},
-		BucketClaimOwner: r.BucketName,
+		BucketClaimOwner:  r.BucketName,
+		NsfsAccountConfig: nsfsAccountConfig,
 	})
 	if err != nil {
 		return err
@@ -519,10 +796,11 @@ func (r *BucketRequest) CreateAccount() error {
 
 	r.OB.Spec.Authentication = &nbv1.ObjectBucketAuthentication{
 		AccessKeys: &nbv1.ObjectBucketAccessKeys{
-			AccessKeyID:     accessKeys.AccessKey,
-			SecretAccessKey: accessKeys.SecretKey,
+			AccessKeyID:     string(accessKeys.AccessKey),
+			SecretAccessKey: string(accessKeys.SecretKey),
 		},
 	}
+	r.OB.Spec.AdditionalState["arn"] = accountInfo.ARN
 
 	log.Infof("✅ Successfully created account %q with access to bucket %q", r.AccountName, r.BucketName)
 	return nil
@@ -555,7 +833,11 @@ func (r *BucketRequest) DeleteBucket() error {
 	var err error
 	log := r.Provisioner.Logger
 	log.Infof("deleting bucket %q", r.BucketName)
-	if r.BucketClass.Spec.NamespacePolicy != nil {
+	isVector := (r.BucketClass != nil && r.BucketClass.Spec.VectorPolicy != nil) ||
+		r.OB.Spec.Endpoint.AdditionalConfigData["bucketType"] == "vector"
+	if isVector {
+		err = r.SysClient.NBClient.DeleteVectorBucketAPI(nb.DeleteVectorBucketParams{VectorBucketName: r.BucketName})
+	} else if r.BucketClass != nil && r.BucketClass.Spec.NamespacePolicy != nil {
 		err = r.SysClient.NBClient.DeleteBucketAPI(nb.DeleteBucketParams{Name: r.BucketName})
 	} else {
 		err = r.SysClient.NBClient.DeleteBucketAndObjectsAPI(nb.DeleteBucketParams{Name: r.BucketName})
@@ -574,50 +856,165 @@ func (r *BucketRequest) DeleteBucket() error {
 	return nil
 }
 
-// putBucketTagging calls s3 putBucketTagging on the created noobaa bucket
-func (r *BucketRequest) putBucketTagging() error {
+// PrepareReplicationParams validates and prepare the replication params
+func PrepareReplicationParams(bucketName string, replicationPolicy string, update bool) (*nb.BucketReplicationParams, *nb.DeleteBucketReplicationParams, error) {
 
-	client := &http.Client{Transport: util.InsecureHTTPTransport}
-	s3Status := &r.SysClient.NooBaa.Status.Services.ServiceS3
-	s3Config := &aws.Config{
-		Credentials: credentials.NewStaticCredentials(
-			r.SysClient.SecretAdmin.StringData["AWS_ACCESS_KEY_ID"],
-			r.SysClient.SecretAdmin.StringData["AWS_SECRET_ACCESS_KEY"],
-			"",
-		),
-		Region:           aws.String("us-east-1"),
-		Endpoint:         aws.String(s3Status.InternalDNS[0]),
-		S3ForcePathStyle: aws.Bool(true),
-		HTTPClient:       client,
+	var replicationRules nb.ReplicationPolicy
+
+	if replicationPolicy == "" && update {
+		deleteReplicationParams := &nb.DeleteBucketReplicationParams{
+			Name: bucketName,
+		}
+		return nil, deleteReplicationParams, nil
 	}
-	s3Session, err := session.NewSession(s3Config)
+
+	err := json.Unmarshal([]byte(replicationPolicy), &replicationRules)
+	if err != nil {
+		return nil, nil, fmt.Errorf("PrepareReplicationParams: Failed to parse replication json %q: %v", replicationRules, err)
+	}
+
+	replicationParams := &nb.BucketReplicationParams{
+		Name:              bucketName,
+		ReplicationPolicy: replicationRules,
+	}
+
+	return replicationParams, nil, nil
+}
+
+// updateReplicationPolicy validates and prepare the replication params
+func (r *BucketRequest) updateReplicationPolicy(ob *nbv1.ObjectBucket) error {
+	log := r.Provisioner.Logger
+	newReplication := ob.Spec.Endpoint.AdditionalConfigData["replicationPolicy"]
+	log.Infof("updateReplicationPolicy: new Replication %q detected on ob: %v", newReplication, ob.Name)
+
+	updateReplicationParams, deleteReplicationParams, err := PrepareReplicationParams(r.BucketName, newReplication, true)
 	if err != nil {
 		return err
 	}
-	s3Client := s3.New(s3Session)
 
-	// convert labels to tagging array
-	taggingArray := []*s3.Tag{}
-	for key, value := range r.OBC.Labels {
-		// no need to put tagging of these labels
-		if !util.Contains(key, []string{"app", "noobaa-domain", "bucket-provisioner"}) {
-			keyPointer := key
-			valuePointer := value
-			taggingArray = append(taggingArray, &s3.Tag{Key: &keyPointer, Value: &valuePointer})
+	// delete bucket replication
+	if deleteReplicationParams != nil {
+		log.Infof("updateReplicationPolicy: deleting replication of bucket %q", ob.Name)
+		err = r.SysClient.NBClient.DeleteBucketReplicationAPI(*deleteReplicationParams)
+		if err != nil {
+			return fmt.Errorf("Provisioner Failed to remove replication of bucket %q with error: %v", ob.Name, err)
 		}
-	}
-	logrus.Infof("put bucket tagging on bucket: %s tagging: %+v ", r.BucketName, taggingArray)
-	if len(taggingArray) == 0 {
 		return nil
 	}
-	_, err = s3Client.PutBucketTagging(&s3.PutBucketTaggingInput{
-		Bucket: &r.BucketName,
-		Tagging: &s3.Tagging{
-			TagSet: taggingArray,
-		},
-	})
-	if err != nil {
-		return err
+
+	// update replication policy
+	if updateReplicationParams != nil {
+		log.Infof("updateReplicationPolicy: updating replication on ob: %q replicationParams: %+v", ob.Name, updateReplicationParams)
+		err = r.SysClient.NBClient.PutBucketReplicationAPI(*updateReplicationParams)
+		if err != nil {
+			return fmt.Errorf("Provisioner Failed to update replication on bucket %q with error: %v", ob.Name, err)
+		}
 	}
+	log.Infof("updateReplicationPolicy: updated replication successfully")
 	return nil
+}
+
+// getBucketClass extracts the bucket class name from an OBC (or StorageClass parameters)
+// and delegates to getBucketClassByName. Used by the create/provision path where a full
+// ObjectBucketClaim is available. On the update path (ObjectBucket only), callers should
+// use getBucketClassByName directly with values from AdditionalState and ClaimRef.
+func getBucketClass(
+	obc *nbv1.ObjectBucketClaim,
+	bucketOptions *obAPI.BucketOptions,
+	provisionerNS string,
+	checkExists func(client.Object) bool,
+) (bc *nbv1.BucketClass, exists bool) {
+	bucketClass := &nbv1.BucketClass{
+		TypeMeta: metav1.TypeMeta{Kind: "BucketClass"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "",
+			Namespace: "",
+		},
+	}
+
+	if obc == nil {
+		return bucketClass, false
+	}
+
+	bucketclassName := obc.Spec.AdditionalConfig["bucketclass"]
+	if bucketclassName == "" && bucketOptions != nil {
+		bucketclassName = bucketOptions.Parameters["bucketclass"]
+	}
+	return getBucketClassByName(bucketclassName, obc.Namespace, provisionerNS, checkExists)
+}
+
+// getBucketClassByName looks up a BucketClass by name in the OBC namespace first,
+// then in the provisioner (NooBaa system) namespace.
+//
+// If bucketClassName is empty, returns exists=false.
+// If found in obcNamespace, returns that BucketClass with exists=true.
+// If found in provisionerNS, returns that BucketClass with exists=true.
+// If not found, returns a BucketClass with namespace set to provisionerNS and exists=false.
+func getBucketClassByName(
+	bucketClassName, obcNamespace, provisionerNS string,
+	checkExists func(client.Object) bool,
+) (bc *nbv1.BucketClass, exists bool) {
+	bucketClass := &nbv1.BucketClass{
+		TypeMeta: metav1.TypeMeta{Kind: "BucketClass"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "",
+			Namespace: "",
+		},
+	}
+
+	if bucketClassName == "" {
+		return bucketClass, false
+	}
+
+	bucketClass.SetName(bucketClassName)
+
+	// Find the bucketclass in the same namespace as the OBC
+	if obcNamespace != "" {
+		bucketClass.SetNamespace(obcNamespace)
+		if checkExists(bucketClass) {
+			return bucketClass, true
+		}
+	}
+
+	// Find the bucketclass in the provisioner namespace
+	bucketClass.SetNamespace(provisionerNS)
+	if checkExists(bucketClass) {
+		return bucketClass, true
+	}
+
+	return bucketClass, false
+}
+
+// getExternalDNSDetails returns hostname and port for the ObjectBucket ConfigMap from NooBaa status ExternalDNS
+func getExternalDNSDetails(nb *nbv1.NooBaa, svc externalDNSService) (string, int, error) {
+	if nb == nil || nb.Status.Services == nil {
+		return "", 0, fmt.Errorf("no services found in status")
+	}
+	var externalDNS []string
+	switch svc {
+	case externalDNSServiceS3:
+		externalDNS = nb.Status.Services.ServiceS3.ExternalDNS
+	case externalDNSServiceVectors:
+		externalDNS = nb.Status.Services.ServiceVectors.ExternalDNS
+	default:
+		return "", 0, fmt.Errorf("unknown external DNS service %q", svc)
+	}
+	if len(externalDNS) == 0 {
+		return "", 0, fmt.Errorf("no external %q service endpoint in status (Route or LoadBalancer)", svc)
+	}
+	// ExternalDNS order is defined in CheckServiceStatus:
+	// append Route URL when route.Spec.Host is set, then append each LoadBalancer ingress hostname.
+	// For status produced by that code, when both exist index 0 is always the Route URL;
+	primaryExternalDNS := externalDNS[0]
+	uri, err := url.ParseRequestURI(primaryExternalDNS)
+	if err != nil {
+		return "", 0, err
+	}
+	hostname := uri.Hostname()
+	portStr := uri.Port()
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to parse external DNS in %q service: port %q. got error: %v", svc, portStr, err)
+	}
+	return hostname, port, nil
 }

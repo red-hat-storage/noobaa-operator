@@ -1,7 +1,10 @@
 package obc
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 
 	nbv1 "github.com/noobaa/noobaa-operator/v5/pkg/apis/noobaa/v1alpha1"
@@ -19,6 +22,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 )
 
+var ctx = context.TODO()
+
 // Cmd returns a CLI command
 func Cmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -27,6 +32,7 @@ func Cmd() *cobra.Command {
 	}
 	cmd.AddCommand(
 		CmdCreate(),
+		CmdRegenerate(),
 		CmdDelete(),
 		CmdStatus(),
 		CmdList(),
@@ -47,8 +53,37 @@ func CmdCreate() *cobra.Command {
 		"Set bucket class to specify the bucket policy")
 	cmd.Flags().String("app-namespace", "",
 		"Set the namespace of the application where the OBC should be created")
+	cmd.Flags().Int("gid", -1,
+		"Set the GID for the NSFS account config")
+	cmd.Flags().Int("uid", -1,
+		"Set the UID for the NSFS account config")
+	cmd.Flags().String("distinguished-name", "",
+		"Set the distinguished name for the NSFS account config")
 	cmd.Flags().String("path", "",
-		"Set path to specify inner directory in namespace store target path - can be used only while specifing a namespace bucketclass")
+		"Set path to specify inner directory in namespace store target path, or in the case of NSFS - filesystem mount point (can be used only when specifying a namespace bucketclass)")
+	cmd.Flags().String("replication-policy", "",
+		"Set the json file path that contains replication rules")
+	cmd.Flags().String("max-objects", "",
+		"Set quota max objects quantity config to requested bucket")
+	cmd.Flags().String("max-size", "",
+		"Set quota max size config to requested bucket")
+	// vectors bucket configuration
+	cmd.Flags().String("bucket-type", "",
+		"Set bucket type: '' (default) or 'vector'")
+	return cmd
+}
+
+// CmdRegenerate returns a CLI command
+func CmdRegenerate() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "regenerate <bucket-claim-name>",
+		Short: "Regenerate OBC S3 Credentials",
+		Run:   RunRegenerate,
+	}
+	cmd.Flags().String("app-namespace", "",
+		"Set the namespace of the application where the OBC should be regenerated")
+	cmd.Flags().Bool("remote-obc", false,
+		"Operate on remote OBC (created for client cluster)")
 	return cmd
 }
 
@@ -60,7 +95,7 @@ func CmdDelete() *cobra.Command {
 		Run:   RunDelete,
 	}
 	cmd.Flags().String("app-namespace", "",
-		"Set the namespace of the application where the OBC should be created")
+		"Set the namespace of the application where the OBC should be deleted")
 	return cmd
 }
 
@@ -73,6 +108,8 @@ func CmdStatus() *cobra.Command {
 	}
 	cmd.Flags().String("app-namespace", "",
 		"Set the namespace of the application where the OBC should be created")
+	cmd.Flags().Bool("remote-obc", false,
+		"Operate on remote OBC (created for client cluster)")
 	return cmd
 }
 
@@ -82,7 +119,10 @@ func CmdList() *cobra.Command {
 		Use:   "list",
 		Short: "List OBC's",
 		Run:   RunList,
+		Args:  cobra.NoArgs,
 	}
+	cmd.Flags().Bool("local-obc-only", false,
+		"List only local OBCs (exclude remote OBCs created for client clusters)")
 	return cmd
 }
 
@@ -98,9 +138,28 @@ func RunCreate(cmd *cobra.Command, args []string) {
 	exact, _ := cmd.Flags().GetBool("exact")
 	bucketClassName, _ := cmd.Flags().GetString("bucketclass")
 	path, _ := cmd.Flags().GetString("path")
+	replicationPolicy, _ := cmd.Flags().GetString("replication-policy")
 	appNamespace, _ := cmd.Flags().GetString("app-namespace")
 	if appNamespace == "" {
 		appNamespace = options.Namespace
+	}
+	maxSize, _ := cmd.Flags().GetString("max-size")
+	maxObjects, _ := cmd.Flags().GetString("max-objects")
+	gid, _ := cmd.Flags().GetInt("gid")
+	uid, _ := cmd.Flags().GetInt("uid")
+	distinguishedName, _ := cmd.Flags().GetString("distinguished-name")
+	bucketType, _ := cmd.Flags().GetString("bucket-type")
+
+	if distinguishedName != "" && (gid > -1 || uid > -1) {
+		log.Fatalf(`❌ NSFS account config cannot include both distinguished name and UID/GID`)
+	}
+
+	if (gid > -1 && uid == -1) || (gid == -1 && uid > -1) {
+		log.Fatalf(`❌ NSFS account config must include both UID and GID as positive integers`)
+	}
+
+	if bucketClassName == "" && (gid > -1 || uid > -1 || distinguishedName != "") {
+		log.Fatalf(`❌ NSFS account config cannot be set without an NSFS bucketclass`)
 	}
 
 	o := util.KubeObject(bundle.File_deploy_obc_objectbucket_v1alpha1_objectbucketclaim_cr_yaml)
@@ -138,13 +197,65 @@ func RunCreate(cmd *cobra.Command, args []string) {
 			log.Fatalf(`❌ Could not get BucketClass %q in namespace %q`,
 				bucketClass.Name, bucketClass.Namespace)
 		}
-		if bucketClass.Spec.NamespacePolicy == nil && path != "" {
-			log.Fatalf(`❌ Could not create OBC %q with inner path while missing namespace bucketclass`, obc.Name)
+		if bucketClass.Spec.NamespacePolicy == nil && bucketClass.Spec.VectorPolicy == nil && path != "" {
+			log.Fatalf(`❌ Could not create OBC %q with inner path while missing namespace/vector bucketclass`, obc.Name)
+		}
+		if bucketType == "vector" && bucketClass.Spec.VectorPolicy == nil {
+			log.Fatalf(`❌ Could not create vector OBC %q with non-vector bucketclass %q`, obc.Name, bucketClass.Name)
+		}
+		if bucketClass.Spec.VectorPolicy != nil && bucketType != "vector" {
+			log.Fatalf(`❌ Could not create vector OBC %q with vector bucketclass %q missing vector bucket type flag`, obc.Name, bucketClass.Name)
 		}
 		obc.Spec.AdditionalConfig["bucketclass"] = bucketClassName
 		obc.Spec.AdditionalConfig["path"] = path
-	} else if path != "" {
-		log.Fatalf(`❌ Could not create OBC %q with inner path while missing namespace bucketclass`, obc.Name)
+		obc.Spec.AdditionalConfig["replicationPolicy"] = bucketClass.Spec.ReplicationPolicy
+		obc.Spec.AdditionalConfig["bucketType"] = bucketType
+	} else {
+		if bucketType == "vector" {
+			log.Fatalf(`❌ Could not create vector OBC %q with missing vector bucketclass`, obc.Name)
+		}
+		if path != "" {
+			log.Fatalf(`❌ Could not create OBC %q with inner path while missing namespace/vector bucketclass`, obc.Name)
+		}
+	}
+
+	if replicationPolicy != "" {
+		replication, err := util.LoadConfigurationJSON(replicationPolicy)
+		if err != nil {
+			log.Fatalf(`❌ %q`, err)
+		}
+		obc.Spec.AdditionalConfig["replicationPolicy"] = replication
+	}
+
+	if gid > -1 {
+		var nsfsAccountConfig nbv1.AccountNsfsConfig
+		nsfsAccountConfig.GID = &gid
+		nsfsAccountConfig.UID = &uid
+		nsfsAccountConfig.NsfsOnly = true
+		marshalledCfg, _ := json.Marshal(nsfsAccountConfig)
+		obc.Spec.AdditionalConfig["nsfsAccountConfig"] = string(marshalledCfg)
+	}
+
+	if distinguishedName != "" {
+		var nsfsAccountConfig nbv1.AccountNsfsConfig
+		nsfsAccountConfig.DistinguishedName = distinguishedName
+		nsfsAccountConfig.GID = nil
+		nsfsAccountConfig.UID = nil
+		nsfsAccountConfig.NsfsOnly = true
+		marshalledCfg, _ := json.Marshal(nsfsAccountConfig)
+		obc.Spec.AdditionalConfig["nsfsAccountConfig"] = string(marshalledCfg)
+	}
+
+	if maxSize != "" {
+		obc.Spec.AdditionalConfig["maxSize"] = maxSize
+	}
+	if maxObjects != "" {
+		obc.Spec.AdditionalConfig["maxObjects"] = maxObjects
+	}
+
+	err := ValidateOBC(obc, true)
+	if err != nil {
+		log.Fatalf(`❌ Could not create OBC %q in namespace %q validation failed %q`, obc.Name, obc.Namespace, err)
 	}
 
 	if !util.KubeCreateFailExisting(obc) {
@@ -160,6 +271,76 @@ func RunCreate(cmd *cobra.Command, args []string) {
 		log.Printf("")
 		RunStatus(cmd, args)
 	}
+}
+
+// RunRegenerate runs a CLI command
+func RunRegenerate(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+
+	if len(args) != 1 || args[0] == "" {
+		log.Fatalf(`❌ Missing expected arguments: <bucket-claim-name> %s`, cmd.UsageString())
+	}
+
+	var decision string
+	log.Printf("You are about to regenerate an OBC's security credentials.")
+	log.Printf("This will invalidate all connections between S3 clients and NooBaa which are connected using the current credentials.")
+	log.Printf("are you sure? y/n")
+
+	for {
+		if _, err := fmt.Scanln(&decision); err != nil {
+			log.Printf(`are you sure? y/n`)
+		}
+		if decision == "y" {
+			break
+		} else if decision == "n" {
+			return
+		}
+	}
+
+	appNamespace, _ := cmd.Flags().GetString("app-namespace")
+	if appNamespace == "" {
+		appNamespace = options.Namespace
+	}
+
+	remoteObcFlag, _ := cmd.Flags().GetBool("remote-obc")
+
+	name := args[0]
+
+	obc := util.KubeObject(bundle.File_deploy_obc_objectbucket_v1alpha1_objectbucketclaim_cr_yaml).(*nbv1.ObjectBucketClaim)
+	ob := util.KubeObject(bundle.File_deploy_obc_objectbucket_v1alpha1_objectbucket_cr_yaml).(*nbv1.ObjectBucket)
+	obc.Name = name
+	obc.Namespace = appNamespace
+
+	if !util.KubeCheck(obc) {
+		log.Fatalf(`❌ Could not find OBC %q in namespace %q`,
+			obc.Name, obc.Namespace)
+	}
+
+	// as we didn't want to allow regenerating credentials for remote OBCs (created for client clusters)
+	// if the admin must do it, he can use the --remote-obc flag to override this check
+	if util.IsRemoteObcAnnotation(obc.Annotations) && !remoteObcFlag {
+		log.Fatalf(`❌ Could not regenerate credentials for OBC. OBC %q in namespace %q is a remote OBC (created for client cluster)`, obc.Name, obc.Namespace)
+	}
+
+	if obc.Spec.ObjectBucketName != "" {
+		ob.Name = obc.Spec.ObjectBucketName
+	} else {
+		ob.Name = fmt.Sprintf("ob-%s-%s", appNamespace, name)
+	}
+
+	if !util.KubeCheck(ob) {
+		log.Fatalf(`❌ Could not find OB %q`, ob.Name)
+	}
+
+	accountName := ob.Spec.AdditionalState["account"]
+
+	err := GenerateAccountKeys(name, accountName, appNamespace)
+	if err != nil {
+		log.Fatalf(`❌ Could not regenerate credentials for %q: %v`, name, err)
+	}
+
+	RunStatus(cmd, args)
+
 }
 
 // RunDelete runs a CLI command
@@ -180,6 +361,14 @@ func RunDelete(cmd *cobra.Command, args []string) {
 	obc.Name = args[0]
 	obc.Namespace = appNamespace
 
+	if !util.KubeCheck(obc) {
+		log.Fatalf(`❌ Could not delete. OBC %q in namespace %q does not exist`, obc.Name, obc.Namespace)
+	}
+
+	if util.IsRemoteObcAnnotation(obc.Annotations) {
+		log.Fatalf(`❌ Could not delete OBC. OBC %q in namespace %q is a remote OBC (created for client cluster)`, obc.Name, obc.Namespace)
+	}
+
 	if !util.KubeDelete(obc) {
 		log.Fatalf(`❌ Could not delete OBC %q in namespace %q`,
 			obc.Name, obc.Namespace)
@@ -199,6 +388,8 @@ func RunStatus(cmd *cobra.Command, args []string) {
 		appNamespace = options.Namespace
 	}
 
+	remoteObcFlag, _ := cmd.Flags().GetBool("remote-obc")
+
 	obc := util.KubeObject(bundle.File_deploy_obc_objectbucket_v1alpha1_objectbucketclaim_cr_yaml).(*nbv1.ObjectBucketClaim)
 	ob := util.KubeObject(bundle.File_deploy_obc_objectbucket_v1alpha1_objectbucket_cr_yaml).(*nbv1.ObjectBucket)
 	sc := util.KubeObject(bundle.File_deploy_obc_storage_class_yaml).(*storagev1.StorageClass)
@@ -215,6 +406,10 @@ func RunStatus(cmd *cobra.Command, args []string) {
 
 	if !util.KubeCheck(obc) {
 		log.Fatalf(`❌ Could not find OBC %q in namespace %q`, obc.Name, obc.Namespace)
+	}
+
+	if util.IsRemoteObcAnnotation(obc.Annotations) && !remoteObcFlag {
+		log.Fatalf(`❌ Could not status OBC. OBC %q in namespace %q is a remote OBC (created for client cluster)`, obc.Name, obc.Namespace)
 	}
 
 	if obc.Spec.ObjectBucketName != "" {
@@ -248,16 +443,26 @@ func RunStatus(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	sysClient, err := system.Connect(true)
+	sysClient, err := system.ConnectAuto()
 	if err != nil {
 		util.Logger().Fatalf("❌ %s", err)
 	}
 	var b *nb.BucketInfo
+	var vb *nb.VectorBucketInfo
+
+	isVector := obc.Spec.AdditionalConfig["bucketType"] == "vector"
 	if obc.Spec.BucketName != "" {
 		nbClient := sysClient.NBClient
-		bucket, err := nbClient.ReadBucketAPI(nb.ReadBucketParams{Name: obc.Spec.BucketName})
-		if err == nil {
-			b = &bucket
+		if isVector {
+			vectorBucket, err := nbClient.GetVectorBucketAPI(nb.GetVectorBucketParams{VectorBucketName: obc.Spec.BucketName})
+			if err == nil {
+				vb = &vectorBucket
+			}
+		} else {
+			bucket, err := nbClient.ReadBucketAPI(nb.ReadBucketParams{Name: obc.Spec.BucketName})
+			if err == nil {
+				b = &bucket
+			}
 		}
 	}
 
@@ -280,13 +485,22 @@ func RunStatus(cmd *cobra.Command, args []string) {
 	credsEnv := ""
 	for k, v := range secret.StringData {
 		if v != "" {
-			fmt.Printf("  %-22s : %s\n", k, v)
-			credsEnv += k + "=" + v + " "
+			if options.ShowSecrets {
+				fmt.Printf("  %-22s : %s\n", k, v)
+				credsEnv += k + "=" + v + " "
+			} else {
+				fmt.Printf("  %-22s : %s\n", k, nb.MaskedString(v))
+				credsEnv += k + "=" + string(nb.MaskedString(v)) + " "
+			}
 		}
 	}
 	fmt.Printf("\n")
 	fmt.Printf("Shell commands:\n")
-	fmt.Printf("  %-22s : alias s3='%saws s3 --no-verify-ssl --endpoint-url %s'\n", "AWS S3 Alias", credsEnv, sysClient.S3URL.String())
+	if isVector {
+		fmt.Printf("  %-22s : alias s3vectors='%saws s3vectors --no-verify-ssl --endpoint-url %s'\n", "AWS S3 Vectors Alias", credsEnv, sysClient.VectorsURL.String())
+	} else {
+		fmt.Printf("  %-22s : alias s3='%saws s3 --no-verify-ssl --endpoint-url %s'\n", "AWS S3 Alias", credsEnv, sysClient.S3URL.String())
+	}
 	fmt.Printf("\n")
 	if b != nil {
 		fmt.Printf("Bucket status:\n")
@@ -306,14 +520,25 @@ func RunStatus(cmd *cobra.Command, args []string) {
 		if b.DataCapacity != nil {
 			fmt.Printf("  %-22s : %s\n", "Data Size", nb.BigIntToHumanBytes(b.DataCapacity.Size))
 			fmt.Printf("  %-22s : %s\n", "Data Size Reduced", nb.BigIntToHumanBytes(b.DataCapacity.SizeReduced))
-			fmt.Printf("  %-22s : %s\n", "Data Space Avail", nb.BigIntToHumanBytes(b.DataCapacity.AvailableToUpload))
+			fmt.Printf("  %-22s : %s\n", "Data Space Avail", nb.BigIntToNonNegativeHumanBytes(b.DataCapacity.AvailableSizeToUpload))
+			fmt.Printf("  %-22s : %s\n", "Num Objects Avail", nb.BigIntToNonNegativeString(b.DataCapacity.AvailableQuantityToUpload))
 		}
-		fmt.Printf("\n")
+		nb.WarnIfQuotaCappedByFree(b.Name, b, nil, b.Quota, func(format string, args ...interface{}) {
+			fmt.Fprintf(os.Stderr, "Warning: "+format+"\n", args...)
+		})
 	}
+	if vb != nil {
+		fmt.Printf("Bucket status:\n")
+		fmt.Printf("  %-22s : %s\n", "Name", vb.Name)
+		fmt.Printf("  %-22s : %s\n", "Bucket Type", "vector")
+		fmt.Printf("  %-22s : %s\n", "VectorDBType", vb.VectorDBType)
+	}
+	fmt.Printf("\n")
 }
 
 // RunList runs a CLI command
 func RunList(cmd *cobra.Command, args []string) {
+	localObcOnly, _ := cmd.Flags().GetBool("local-obc-only")
 	list := &nbv1.ObjectBucketClaimList{
 		TypeMeta: metav1.TypeMeta{Kind: "ObjectBucketClaim"},
 	}
@@ -330,11 +555,20 @@ func RunList(cmd *cobra.Command, args []string) {
 		"BUCKET-NAME",
 		"STORAGE-CLASS",
 		"BUCKET-CLASS",
+		"BUCKET-TYPE",
 		"PHASE",
 	)
 	scMap := map[string]*storagev1.StorageClass{}
+	countRemoteOBCs := 0
 	for i := range list.Items {
 		obc := &list.Items[i]
+
+		// Do not show remote OBCs in the list (OBCs that were created for client clusters)
+		if localObcOnly && util.IsRemoteObcAnnotation(obc.Annotations) {
+			countRemoteOBCs++
+			continue
+		}
+
 		bucketClass := obc.Spec.AdditionalConfig["bucketclass"]
 		if bucketClass == "" && obc.Spec.StorageClassName != "" {
 			sc := scMap[obc.Spec.StorageClassName]
@@ -347,16 +581,27 @@ func RunList(cmd *cobra.Command, args []string) {
 			}
 			bucketClass = sc.Parameters["bucketclass"]
 		}
+		bucketType := "object"
+		if obc.Spec.AdditionalConfig["bucketType"] == "vector" {
+			bucketType = "vector"
+		}
 		table.AddRow(
 			obc.Namespace,
 			obc.Name,
 			obc.Spec.BucketName,
 			obc.Spec.StorageClassName,
 			bucketClass,
+			bucketType,
 			string(obc.Status.Phase),
 		)
 	}
-	fmt.Print(table.String())
+	if len(list.Items) == countRemoteOBCs {
+		// to avoid printing only the titles when all OBCs are remote OBCs (created for client clusters)
+		fmt.Printf("No OBCs found (The OBCs are remote OBCs created for client clusters).\n")
+		return
+	} else {
+		fmt.Print(table.String())
+	}
 }
 
 // WaitReady waits until the obc phase changes to bound by the operator
@@ -364,9 +609,9 @@ func WaitReady(obc *nbv1.ObjectBucketClaim) bool {
 	log := util.Logger()
 	klient := util.KubeClient()
 
-	intervalSec := time.Duration(3)
+	interval := time.Duration(3)
 
-	err := wait.PollImmediateInfinite(intervalSec*time.Second, func() (bool, error) {
+	err := wait.PollUntilContextCancel(ctx, interval*time.Second, true, func(ctx context.Context) (bool, error) {
 		err := klient.Get(util.Context(), util.ObjectKey(obc), obc)
 		if err != nil {
 			log.Printf("⏳ Failed to get OBC: %s", err)
@@ -401,4 +646,60 @@ func CheckPhase(obc *nbv1.ObjectBucketClaim) {
 	default:
 		log.Printf("⏳ OBC %q Phase is %q", obc.Name, obc.Status.Phase)
 	}
+}
+
+// GenerateAccountKeys regenerate noobaa OBC account S3 keys
+func GenerateAccountKeys(name, accountName, appNamespace string) error {
+	log := util.Logger()
+
+	if accountName == "" {
+		log.Fatalf(`❌  account name cannot be empty.\n`)
+	}
+
+	var accessKeys nb.S3AccessKeys
+
+	sysClient, err := system.ConnectAuto()
+	if err != nil {
+		return err
+	}
+
+	// Checking that we can find the secret before we are calling the RPC to change the credentials.
+	secret := util.KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret)
+	secret.Namespace = appNamespace
+	secret.Name = name
+	if !util.KubeCheckQuiet(secret) {
+		log.Fatalf(`❌  Could not find secret: %s, will not regenerate keys.`, secret.Name)
+	}
+
+	err = sysClient.NBClient.GenerateAccountKeysAPI(nb.GenerateAccountKeysParams{
+		Email: accountName,
+	})
+	if err != nil {
+		return err
+	}
+
+	// GenerateAccountKeysAPI have no replay so we need to read the account in order to get the new credentials
+	accountInfo, err := sysClient.NBClient.ReadAccountAPI(nb.ReadAccountParams{
+		Email: accountName,
+	})
+	if err != nil {
+		return err
+	}
+
+	accessKeys = accountInfo.AccessKeys[0]
+
+	secret.StringData = map[string]string{}
+	secret.StringData["AWS_ACCESS_KEY_ID"] = string(accessKeys.AccessKey)
+	secret.StringData["AWS_SECRET_ACCESS_KEY"] = string(accessKeys.SecretKey)
+
+	//If we will not be able to update the secret we will print the credentials as they already been changed by the RPC
+	if !util.KubeUpdate(secret) {
+		log.Printf(`❌  Please write the new credentials for OBC %s:`, name)
+		fmt.Printf("\nAWS_ACCESS_KEY_ID     : %s\n", string(accessKeys.AccessKey))
+		fmt.Printf("AWS_SECRET_ACCESS_KEY : %s\n\n", string(accessKeys.SecretKey))
+		log.Fatalf(`❌  Failed to update the secret %s with the new accessKeys`, secret.Name)
+	}
+
+	log.Printf("✅ Successfully regenerate s3 credentials for the OBC %q", name)
+	return nil
 }

@@ -7,7 +7,7 @@ import (
 	conditionsv1 "github.com/openshift/custom-resource-status/conditions/v1"
 )
 
-// Note 1: Run "operator-sdk generate k8s" to regenerate code after modifying this file
+// Note 1: Run "make gen-api" to regenerate code after modifying this file
 // Note 2: Add custom validation using kubebuilder tags: https://book.kubebuilder.io/reference/generating-crd.html
 
 func init() {
@@ -148,6 +148,7 @@ type AWSS3Spec struct {
 
 	// Secret refers to a secret that provides the credentials
 	// The secret should define AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+	// +optional
 	Secret corev1.SecretReference `json:"secret"`
 
 	// Region is the AWS region
@@ -157,6 +158,10 @@ type AWSS3Spec struct {
 	// SSLDisabled allows to disable SSL and use plain http
 	// +optional
 	SSLDisabled bool `json:"sslDisabled,omitempty"`
+
+	// AWSSTSRoleARN allows to Assume Role and use AssumeRoleWithWebIdentity
+	// +optional
+	AWSSTSRoleARN *string `json:"awsSTSRoleARN,omitempty"`
 }
 
 // S3CompatibleSpec specifies a backing store of type s3-compatible
@@ -203,7 +208,24 @@ type AzureBlobSpec struct {
 
 	// Secret refers to a secret that provides the credentials
 	// The secret should define AccountName and AccountKey as provided by Azure Blob.
+	// +optional
 	Secret corev1.SecretReference `json:"secret"`
+
+	// Azure STS managed identity client id allows to get access token using NewWorkloadIdentityCredential
+	// +optional
+	ClientId *string `json:"clientId,omitempty"`
+
+	// Azure STS managed identity TenantId id allows to get access token using NewWorkloadIdentityCredential
+	// +optional
+	TenantId *string `json:"tenantId,omitempty"`
+
+	// Azure SubscriptionId is used to create storage account client.
+	// +optional
+	SubscriptionId *string `json:"subscriptionId,omitempty"`
+
+	// Azure storage account is created under this resource group
+	// +optional
+	ResourcegroupId *string `json:"resourcegroupId,omitempty"`
 }
 
 // GoogleCloudStorageSpec specifies a backing store of type google-cloud-storage
@@ -212,8 +234,9 @@ type GoogleCloudStorageSpec struct {
 	// TargetBucket is the name of the target S3 bucket
 	TargetBucket string `json:"targetBucket"`
 
-	// Secret refers to a secret that provides the credentials
-	// The secret should define GoogleServiceAccountPrivateKeyJson containing the entire json string as provided by Google.
+	// Secret refers to a secret that provides the credentials.
+	// For classic google-cloud-storage, define GoogleServiceAccountPrivateKeyJson (service_account JSON).
+	// For GCP WIF (STS), define GoogleCredentialsJson (external_account JSON).
 	Secret corev1.SecretReference `json:"secret"`
 }
 
@@ -227,7 +250,11 @@ type PVPoolSpec struct {
 	NumVolumes int `json:"numVolumes"`
 
 	// VolumeResources represents the minimum resources each volume should have.
-	VolumeResources *corev1.ResourceRequirements `json:"resources,omitempty"`
+	VolumeResources *corev1.VolumeResourceRequirements `json:"resources,omitempty"`
+
+	// PriorityClassName (optional) overrides the priority class for the pv-pool agent pods
+	// +optional
+	PriorityClassName string `json:"priorityClassName,omitempty"`
 
 	// Secret refers to a secret that provides the agent configuration
 	// The secret should define AGENT_CONFIG containing agent_configuration from noobaa-core.

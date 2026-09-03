@@ -1,12 +1,19 @@
 package system
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 
+	// this is the driver we are using for psql
+	_ "github.com/lib/pq"
+	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/asaskevich/govalidator"
 	semver "github.com/coreos/go-semver/semver"
-	dockerref "github.com/docker/distribution/reference"
+	dockerref "github.com/distribution/reference"
 	nbv1 "github.com/noobaa/noobaa-operator/v5/pkg/apis/noobaa/v1alpha1"
 	"github.com/noobaa/noobaa-operator/v5/pkg/options"
 	"github.com/noobaa/noobaa-operator/v5/pkg/util"
@@ -29,6 +36,50 @@ func (r *Reconciler) ReconcilePhaseVerifying() error {
 		if err := r.CheckJoinSecret(); err != nil {
 			return err
 		}
+	}
+
+	if r.ExternalPgSecret != nil {
+		if r.ExternalPgSecret.StringData["db_url"] == "" {
+			return util.NewPersistentError("InvalidExternalPgSecert",
+				"ExternalPgSecret is missing db_url")
+		}
+		if r.ExternalPgSSLSecret != nil {
+			if r.ExternalPgSSLSecret.StringData["tls.key"] == "" ||
+				r.ExternalPgSSLSecret.StringData["tls.crt"] == "" {
+				return util.NewPersistentError("InvalidExternalPgCert",
+					fmt.Sprintf("%q is missing private key (must be tls.key)"+
+						" or missing cert key (must be tls.cert)", r.ExternalPgSSLSecret.Name))
+			}
+			err := os.WriteFile("/tmp/tls.key", []byte(r.ExternalPgSSLSecret.StringData["tls.key"]), 0600)
+			if err != nil {
+				return fmt.Errorf("failed to write k8s secret tls.key content to a file %v", err)
+			}
+			err = os.WriteFile("/tmp/tls.crt", []byte(r.ExternalPgSSLSecret.StringData["tls.crt"]), 0644)
+			if err != nil {
+				return fmt.Errorf("failed to write k8s secret tls.key content to a file %v", err)
+			}
+			util.SafeSetEnv("PGSSLKEY", "/tmp/tls.key")
+			util.SafeSetEnv("PGSSLCERT", "/tmp/tls.crt")
+		}
+		if err := r.checkExternalPg(r.ExternalPgSecret.StringData["db_url"]); err != nil {
+			return err
+		}
+	}
+
+	if r.NooBaa.Spec.BucketLogging.LoggingType == nbv1.BucketLoggingTypeGuaranteed {
+		if err := r.checkPersistentLoggingPVC(r.NooBaa.Spec.BucketLogging.BucketLoggingPVC, r.BucketLoggingPVC, "InvalidBucketLoggingConfiguration"); err != nil {
+			return err
+		}
+	}
+
+	if r.NooBaa.Spec.BucketNotifications.Enabled {
+		if err := r.checkPersistentLoggingPVC(r.NooBaa.Spec.BucketNotifications.PVC, r.BucketNotificationsPVC, "InvalidBucketNotificationConfiguration"); err != nil {
+			return err
+		}
+	}
+
+	if err := util.ValidateTLSSpec(r.NooBaa.Spec.Security.APIServerSecurity); err != nil {
+		return util.NewPersistentError("InvalidTLSConfiguration", err.Error())
 	}
 
 	return nil
@@ -107,12 +158,12 @@ func (r *Reconciler) CheckSystemCR() error {
 	// Verify the endpoints spec
 	endpointsSpec := r.NooBaa.Spec.Endpoints
 	if endpointsSpec != nil {
-		if endpointsSpec.MinCount <= 0 {
+		minCount, maxCount := getEndpointMinMax(r.NooBaa)
+		if minCount <= 0 {
 			return util.NewPersistentError("InvalidEndpointsConfiguration",
 				"Invalid endpoint min count (must be greater than 0)")
 		}
-		// Validate bounds on endpoint counts
-		if endpointsSpec.MinCount > endpointsSpec.MaxCount {
+		if minCount > maxCount {
 			return util.NewPersistentError("InvalidEndpointsConfiguration",
 				"Invalid endpoint maximum count (must be higher than or equal to minimum count)")
 		}
@@ -126,9 +177,17 @@ func (r *Reconciler) CheckSystemCR() error {
 		}
 	}
 
-	err = CheckMongoURL(r.NooBaa)
-	if err != nil {
-		return util.NewPersistentError("InvalidMongoDbURL", fmt.Sprintf(`%s`, err))
+	// Validate the DefaultBackingStore Spec
+	// nolint: staticcheck
+	if r.NooBaa.Spec.DefaultBackingStoreSpec != nil {
+		return util.NewPersistentError("Invalid, DefaultBackingStoreSpec was deprecated", fmt.Sprintf(`%s`, err))
+	}
+
+	if (r.NooBaa.Spec.Autoscaler.AutoscalerType == nbv1.AutoscalerTypeKeda ||
+		r.NooBaa.Spec.Autoscaler.AutoscalerType == nbv1.AutoscalerTypeHPAV2) &&
+		r.NooBaa.Spec.Autoscaler.PrometheusNamespace == "" {
+		return util.NewPersistentError("InvalidEndpointsAutoscalerConfiguration",
+			fmt.Sprintf("Autoscaler %s missing prometheusNamespace property ", r.NooBaa.Spec.Autoscaler.AutoscalerType))
 	}
 
 	return nil
@@ -140,6 +199,10 @@ func (r *Reconciler) CheckJoinSecret() error {
 	if r.JoinSecret.StringData["mgmt_addr"] == "" {
 		return util.NewPersistentError("InvalidJoinSecert",
 			"JoinSecret is missing mgmt_addr")
+	}
+	if r.JoinSecret.StringData["auth_token"] == "" {
+		return util.NewPersistentError("InvalidJoinSecert",
+			"JoinSecret is missing auth_token")
 	}
 	if r.JoinSecret.StringData["bg_addr"] == "" {
 		return util.NewPersistentError("InvalidJoinSecert",
@@ -153,9 +216,99 @@ func (r *Reconciler) CheckJoinSecret() error {
 		return util.NewPersistentError("InvalidJoinSecert",
 			"JoinSecret is missing hosted_agents_addr")
 	}
-	if r.JoinSecret.StringData["auth_token"] == "" {
-		return util.NewPersistentError("InvalidJoinSecert",
-			"JoinSecret is missing auth_token")
+	return nil
+}
+
+func (r *Reconciler) checkExternalPg(postgresDbURL string) error {
+	dbURL := r.ExternalPgSecret.StringData["db_url"]
+	if r.NooBaa.Spec.ExternalPgSSLRequired {
+		if !r.NooBaa.Spec.ExternalPgSSLUnauthorized {
+			dbURL += "?sslmode=verify-full" // won't allow self-signed certs
+		} // when we want to allow self-signed we will use the default sslmode=require
+	} else {
+		dbURL += "?sslmode=disable" // don't use ssl - the default is to use it
+	}
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		return util.NewPersistentError("InvalidExternalPgUrl",
+			fmt.Sprintf("failed openning a connection to external DB url: %q, error: %s",
+				dbURL, err))
+	}
+	defer util.SafeClose(db, "Failed to close database connection")
+	err = db.Ping()
+	if err != nil {
+		return util.NewPersistentError("InvalidExternalPgUrl",
+			fmt.Sprintf("failed pinging external DB url: %q, error: %s",
+				dbURL, err))
+	}
+	// Query the PostgreSQL version
+	var version int
+	err = db.QueryRow("SELECT current_setting('server_version_num')::integer / 10000").Scan(&version)
+	if err != nil {
+		return util.NewPersistentError("InvalidExternalPgVersion",
+			fmt.Sprintf("failed getting version of external DB url: %q, error: %s",
+				dbURL, err))
+	}
+	// Reject PostgreSQL versions older than 15
+	if version < 15 {
+		return util.NewPersistentError("InvalidExternalPgVersion",
+			fmt.Sprintf("version of external DB %q, is not supported: %d",
+				dbURL, version))
+	}
+	// Query the database's collation
+	var collation string
+	err = db.QueryRow("SELECT datcollate FROM pg_database WHERE datname = current_database()").Scan(&collation)
+	if err != nil {
+		return util.NewPersistentError("InvalidExternalPgCollation",
+			fmt.Sprintf("failed getting database collation of external DB url: %q, error: %s",
+				dbURL, err))
+	}
+	// Check if the collation is "C"
+	if collation != "C" {
+		return util.NewPersistentError("InvalidExternalPgCollation",
+			fmt.Sprintf("collation of external DB url: %q, is not supported: %s",
+				dbURL, collation))
 	}
 	return nil
+}
+
+// checkPersistentLoggingPVC validates the configuration of pvc for persistent logging
+func (r *Reconciler) checkPersistentLoggingPVC(
+	pvcName *string,
+	pvc *corev1.PersistentVolumeClaim,
+	errorName string) error {
+	if pvcName == nil {
+		sc := &storagev1.StorageClass{
+			TypeMeta:   metav1.TypeMeta{Kind: "StorageClass"},
+			ObjectMeta: metav1.ObjectMeta{Name: "ocs-storagecluster-cephfs"},
+		}
+		// Return nil as the operator running in ODF environment
+		if util.KubeCheck(sc) {
+			return nil
+		}
+		return util.NewPersistentError(errorName,
+			"Persistent Volume Claim (PVC) was not specified (and CephFS was not found for a defualt PVC)")
+	}
+
+	// Check if pvc exists in the cluster
+	PersistentLoggingPVC := &corev1.PersistentVolumeClaim{
+		TypeMeta: metav1.TypeMeta{Kind: "PersistenVolumeClaim"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      *pvcName,
+			Namespace: r.Request.Namespace,
+		},
+	}
+	if !util.KubeCheck(PersistentLoggingPVC) {
+		return util.NewPersistentError(errorName,
+			fmt.Sprintf("The specified persistent logging pvc '%s' was not found", *pvcName))
+	}
+
+	// Check if pvc supports RWX access mode
+	for _, accessMode := range PersistentLoggingPVC.Spec.AccessModes {
+		if accessMode == corev1.ReadWriteMany {
+			return nil
+		}
+	}
+	return util.NewPersistentError(errorName,
+		fmt.Sprintf("The specified persistent logging pvc '%s' does not support RWX access mode", *pvcName))
 }

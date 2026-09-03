@@ -18,11 +18,10 @@ type Client interface {
 	ReadNamespaceResourceOperatorInfoAPI(ReadNamespaceResourceParams) (NamespaceResourceOperatorInfo, error)
 	SetNamespaceStoreInfo(NamespaceStoreInfo) error
 
-	ListAccountsAPI() (ListAccountsReply, error)
-	ListBucketsAPI() (ListBucketsReply, error)
+	ListAccountsAPI(ListAccountsParams) (ListAccountsReply, error)
+	ListBucketsAPI(ListBucketsParams) (ListBucketsReply, error)
 	ListHostsAPI(ListHostsParams) (ListHostsReply, error)
 
-	CreateAuthAPI(CreateAuthParams) (CreateAuthReply, error)
 	CreateSystemAPI(CreateSystemParams) (CreateSystemReply, error)
 	CreateAccountAPI(CreateAccountParams) (CreateAccountReply, error)
 	CreateBucketAPI(CreateBucketParams) error
@@ -43,18 +42,32 @@ type Client interface {
 	DeletePoolAPI(DeletePoolParams) error
 	DeleteNamespaceResourceAPI(DeleteNamespaceResourceParams) error
 
+	UpdateAccount(UpdateAccountParams) error
 	UpdateAccountS3Access(UpdateAccountS3AccessParams) error
 	UpdateAllBucketsDefaultPool(UpdateDefaultResourceParams) error
 	UpdateBucketClass(UpdateBucketClassParams) (BucketClassInfo, error)
 
 	AddExternalConnectionAPI(AddExternalConnectionParams) error
-	CheckExternalConnectionAPI(AddExternalConnectionParams) (CheckExternalConnectionReply, error)
-	EditExternalConnectionCredentialsAPI(EditExternalConnectionCredentialsParams) error
+	CheckExternalConnectionAPI(CheckExternalConnectionParams) (CheckExternalConnectionReply, error)
+	UpdateExternalConnectionAPI(UpdateExternalConnectionParams) error
 	DeleteExternalConnectionAPI(DeleteExternalConnectionParams) error
 
 	UpdateEndpointGroupAPI(UpdateEndpointGroupParams) error
 
 	RegisterToCluster() error
+	PublishToCluster(PublishToClusterParams) error
+
+	PutBucketReplicationAPI(BucketReplicationParams) error
+	GetBucketReplicationAPI(ReadBucketParams) (ReplicationPolicy, error)
+	ValidateReplicationAPI(BucketReplicationParams) error
+	DeleteBucketReplicationAPI(DeleteBucketReplicationParams) error
+
+	GenerateAccountKeysAPI(GenerateAccountKeysParams) error
+	UpdateAccountKeysAPI(UpdateAccountKeysParams) error
+
+	CreateVectorBucketAPI(CreateVectorBucketParams) (VectorBucketInfo, error)
+	GetVectorBucketAPI(GetVectorBucketParams) (VectorBucketInfo, error)
+	DeleteVectorBucketAPI(DeleteVectorBucketParams) error
 }
 
 // ReadAuthAPI calls auth_api.read_auth()
@@ -124,8 +137,8 @@ func (c *RPCClient) ReadPoolAPI(params ReadPoolParams) (PoolInfo, error) {
 }
 
 // ListAccountsAPI calls account_api.list_accounts()
-func (c *RPCClient) ListAccountsAPI() (ListAccountsReply, error) {
-	req := &RPCMessage{API: "account_api", Method: "list_accounts"}
+func (c *RPCClient) ListAccountsAPI(params ListAccountsParams) (ListAccountsReply, error) {
+	req := &RPCMessage{API: "account_api", Method: "list_accounts", Params: params}
 	res := &struct {
 		RPCMessage `json:",inline"`
 		Reply      ListAccountsReply `json:"reply"`
@@ -135,8 +148,8 @@ func (c *RPCClient) ListAccountsAPI() (ListAccountsReply, error) {
 }
 
 // ListBucketsAPI calls bucket_api.list_buckets()
-func (c *RPCClient) ListBucketsAPI() (ListBucketsReply, error) {
-	req := &RPCMessage{API: "bucket_api", Method: "list_buckets"}
+func (c *RPCClient) ListBucketsAPI(params ListBucketsParams) (ListBucketsReply, error) {
+	req := &RPCMessage{API: "bucket_api", Method: "list_buckets", Params: params}
 	res := &struct {
 		RPCMessage `json:",inline"`
 		Reply      ListBucketsReply `json:"reply"`
@@ -151,17 +164,6 @@ func (c *RPCClient) ListHostsAPI(params ListHostsParams) (ListHostsReply, error)
 	res := &struct {
 		RPCMessage `json:",inline"`
 		Reply      ListHostsReply `json:"reply"`
-	}{}
-	err := c.Call(req, res)
-	return res.Reply, err
-}
-
-// CreateAuthAPI calls auth_api.create_auth()
-func (c *RPCClient) CreateAuthAPI(params CreateAuthParams) (CreateAuthReply, error) {
-	req := &RPCMessage{API: "auth_api", Method: "create_auth", Params: params}
-	res := &struct {
-		RPCMessage `json:",inline"`
-		Reply      CreateAuthReply `json:"reply"`
 	}{}
 	err := c.Call(req, res)
 	return res.Reply, err
@@ -317,6 +319,12 @@ func (c *RPCClient) DeletePoolAPI(params DeletePoolParams) error {
 	return c.Call(req, nil)
 }
 
+// UpdateAccount calls account_api.update_account()
+func (c *RPCClient) UpdateAccount(params UpdateAccountParams) error {
+	req := &RPCMessage{API: "account_api", Method: "update_account", Params: params}
+	return c.Call(req, nil)
+}
+
 // UpdateAccountS3Access calls account_api.update_account_s3_access()
 func (c *RPCClient) UpdateAccountS3Access(params UpdateAccountS3AccessParams) error {
 	req := &RPCMessage{API: "account_api", Method: "update_account_s3_access", Params: params}
@@ -347,7 +355,7 @@ func (c *RPCClient) AddExternalConnectionAPI(params AddExternalConnectionParams)
 }
 
 // CheckExternalConnectionAPI calls account_api.check_external_connection()
-func (c *RPCClient) CheckExternalConnectionAPI(params AddExternalConnectionParams) (CheckExternalConnectionReply, error) {
+func (c *RPCClient) CheckExternalConnectionAPI(params CheckExternalConnectionParams) (CheckExternalConnectionReply, error) {
 	req := &RPCMessage{API: "account_api", Method: "check_external_connection", Params: params}
 	res := &struct {
 		RPCMessage `json:",inline"`
@@ -357,9 +365,9 @@ func (c *RPCClient) CheckExternalConnectionAPI(params AddExternalConnectionParam
 	return res.Reply, err
 }
 
-// EditExternalConnectionCredentialsAPI calls account_api.edit_external_connection_credentials()
-func (c *RPCClient) EditExternalConnectionCredentialsAPI(params EditExternalConnectionCredentialsParams) error {
-	req := &RPCMessage{API: "account_api", Method: "edit_external_connection_credentials", Params: params}
+// UpdateExternalConnectionAPI calls account_api.update_external_connection()
+func (c *RPCClient) UpdateExternalConnectionAPI(params UpdateExternalConnectionParams) error {
+	req := &RPCMessage{API: "account_api", Method: "update_external_connection", Params: params}
 	return c.Call(req, nil)
 }
 
@@ -375,8 +383,83 @@ func (c *RPCClient) UpdateEndpointGroupAPI(params UpdateEndpointGroupParams) err
 	return c.Call(req, nil)
 }
 
-// RegisterToCluster calls redirector_api.RegisterToCluster()
+// RegisterToCluster calls redirector_api.register_to_cluster()
 func (c *RPCClient) RegisterToCluster() error {
 	req := &RPCMessage{API: "redirector_api", Method: "register_to_cluster"}
+	return c.Call(req, nil)
+}
+
+// PublishToCluster calls redirector_api.publish_to_cluster()
+func (c *RPCClient) PublishToCluster(params PublishToClusterParams) error {
+	req := &RPCMessage{API: "redirector_api", Method: "publish_to_cluster", Params: params}
+	return c.Call(req, nil)
+}
+
+// PutBucketReplicationAPI calls bucket_api.put_bucket_replication()
+func (c *RPCClient) PutBucketReplicationAPI(params BucketReplicationParams) error {
+	req := &RPCMessage{API: "bucket_api", Method: "put_bucket_replication", Params: params}
+	return c.Call(req, nil)
+}
+
+// GetBucketReplicationAPI calls bucket_api.get_bucket_replication()
+func (c *RPCClient) GetBucketReplicationAPI(params ReadBucketParams) (ReplicationPolicy, error) {
+	req := &RPCMessage{API: "bucket_api", Method: "get_bucket_replication", Params: params}
+	res := &struct {
+		RPCMessage `json:",inline"`
+		Reply      ReplicationPolicy `json:"reply"`
+	}{}
+	err := c.Call(req, res)
+	return res.Reply, err
+}
+
+// ValidateReplicationAPI calls bucket_api.validate_replication()
+func (c *RPCClient) ValidateReplicationAPI(params BucketReplicationParams) error {
+	req := &RPCMessage{API: "bucket_api", Method: "validate_replication", Params: params}
+	return c.Call(req, nil)
+}
+
+// DeleteBucketReplicationAPI calls bucket_api.delete_bucket_replication()
+func (c *RPCClient) DeleteBucketReplicationAPI(params DeleteBucketReplicationParams) error {
+	req := &RPCMessage{API: "bucket_api", Method: "delete_bucket_replication", Params: params}
+	return c.Call(req, nil)
+}
+
+// GenerateAccountKeysAPI calls account_api.generate_account_keys()
+func (c *RPCClient) GenerateAccountKeysAPI(params GenerateAccountKeysParams) error {
+	req := &RPCMessage{API: "account_api", Method: "generate_account_keys", Params: params}
+	return c.Call(req, nil)
+}
+
+// UpdateAccountKeysAPI calls account_api.update_account_keys()
+func (c *RPCClient) UpdateAccountKeysAPI(params UpdateAccountKeysParams) error {
+	req := &RPCMessage{API: "account_api", Method: "update_account_keys", Params: params}
+	return c.Call(req, nil)
+}
+
+// CreateVectorBucketAPI calls bucket_api.create_vector_bucket()
+func (c *RPCClient) CreateVectorBucketAPI(params CreateVectorBucketParams) (VectorBucketInfo, error) {
+	req := &RPCMessage{API: "bucket_api", Method: "create_vector_bucket", Params: params}
+	res := &struct {
+		RPCMessage `json:",inline"`
+		Reply      VectorBucketInfo `json:"reply"`
+	}{}
+	err := c.Call(req, res)
+	return res.Reply, err
+}
+
+// GetVectorBucketAPI calls bucket_api.get_vector_bucket()
+func (c *RPCClient) GetVectorBucketAPI(params GetVectorBucketParams) (VectorBucketInfo, error) {
+	req := &RPCMessage{API: "bucket_api", Method: "get_vector_bucket", Params: params}
+	res := &struct {
+		RPCMessage `json:",inline"`
+		Reply      VectorBucketInfo `json:"reply"`
+	}{}
+	err := c.Call(req, res)
+	return res.Reply, err
+}
+
+// DeleteVectorBucketAPI calls bucket_api.delete_vector_bucket()
+func (c *RPCClient) DeleteVectorBucketAPI(params DeleteVectorBucketParams) error {
+	req := &RPCMessage{API: "bucket_api", Method: "delete_vector_bucket", Params: params}
 	return c.Call(req, nil)
 }

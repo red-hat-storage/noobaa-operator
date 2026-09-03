@@ -1,6 +1,6 @@
 package version
 
-const (
+var (
 	// Version is the noobaa-operator version (semver)
-	Version = "5.9.0"
+	Version = "5.23.0"
 )
