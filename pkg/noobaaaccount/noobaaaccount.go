@@ -1,0 +1,813 @@
+package noobaaaccount
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	nbv1 "github.com/noobaa/noobaa-operator/v5/pkg/apis/noobaa/v1alpha1"
+	"github.com/noobaa/noobaa-operator/v5/pkg/bundle"
+	"github.com/noobaa/noobaa-operator/v5/pkg/nb"
+	"github.com/noobaa/noobaa-operator/v5/pkg/options"
+	"github.com/noobaa/noobaa-operator/v5/pkg/system"
+	"github.com/noobaa/noobaa-operator/v5/pkg/util"
+	"github.com/noobaa/noobaa-operator/v5/pkg/validations"
+
+	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	sigyaml "sigs.k8s.io/yaml"
+)
+
+var ctx = context.TODO()
+
+// Cmd returns a CLI command
+func Cmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "account",
+		Short: "Manage noobaa accounts",
+	}
+	cmd.AddCommand(
+		CmdCreate(),
+		CmdUpdate(),
+		CmdRegenerate(),
+		CmdCredentials(),
+		CmdDelete(),
+		CmdStatus(),
+		CmdList(),
+		CmdReconcile(),
+	)
+	return cmd
+}
+
+// CmdCreate returns a CLI command
+func CmdCreate() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "create <noobaa-account-name>",
+		Short: "Create noobaa account",
+		Run:   RunCreate,
+	}
+	cmd.Flags().Bool("allow_bucket_create", true,
+		"Should this account be allowed to create new buckets")
+	cmd.Flags().String("default_resource", "", "Set the default resource, on which new buckets will be created")
+	cmd.Flags().Bool("nsfs_account_config", false, "This flag is for creating nsfs account")
+	cmd.Flags().Bool("force_md5_etag", false, "This flag enables md5 etag calculation for account")
+	cmd.Flags().Int("uid", -1, "Set the nsfs uid")
+	cmd.Flags().Int("gid", -1, "Set the nsfs gid")
+	cmd.Flags().String("new_buckets_path", "/", "Change the path where new buckets will be created")
+	cmd.Flags().Bool("nsfs_only", true, "Set if this account is used only for nsfs")
+	return cmd
+}
+
+// CmdUpdate returns a CLI command
+func CmdUpdate() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "update <noobaa-accout-name>",
+		Short: "Update noobaa account",
+		Run:   RunUpdate,
+	}
+	cmd.Flags().String("new_default_resource", "", "(must be provided) update the default resource on which new buckets will be created")
+	cmd.Flags().Bool("force_md5_etag", false, "This flag enables md5 etag calculation for account")
+	return cmd
+}
+
+// CmdRegenerate returns a CLI command
+func CmdRegenerate() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "regenerate <noobaa-account-name>",
+		Short: "Regenerate S3 Credentials",
+		Run:   RunRegenerate,
+	}
+	return cmd
+}
+
+// CmdCredentials returns a CLI command
+func CmdCredentials() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "credentials <noobaa-account-name>",
+		Short: "Update S3 Credentials (access-key and secret-key)",
+		Run:   RunCredentials,
+	}
+	cmd.Flags().String(
+		"access-key", "",
+		`Access key for authentication - The best practice is to **omit this flag**. In that case, the CLI will prompt to securely read it from the terminal, avoiding the risk of leaking secrets in the shell history.`,
+	)
+	cmd.Flags().String(
+		"secret-key", "",
+		`Secret key for authentication - The best practice is to **omit this flag**. In that case, the CLI will prompt to securely read it from the terminal, avoiding the risk of leaking secrets in the shell history.`,
+	)
+	return cmd
+}
+
+// CmdDelete returns a CLI command
+func CmdDelete() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "delete <noobaa-account-name>",
+		Short: "Delete noobaa account",
+		Run:   RunDelete,
+	}
+	return cmd
+}
+
+// CmdStatus returns a CLI command
+func CmdStatus() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "status <noobaa-account-name>",
+		Short: "Status noobaa account",
+		Run:   RunStatus,
+	}
+	return cmd
+}
+
+// CmdList returns a CLI command
+func CmdList() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List noobaa accounts",
+		Run:   RunList,
+	}
+	return cmd
+}
+
+// CmdReconcile returns a CLI command
+func CmdReconcile() *cobra.Command {
+	cmd := &cobra.Command{
+		Hidden: true,
+		Use:    "reconcile",
+		Short:  "Runs a reconcile attempt like noobaa-operator",
+		Run:    RunReconcile,
+	}
+	return cmd
+}
+
+// RunCreate runs a CLI command
+func RunCreate(cmd *cobra.Command, args []string) {
+
+	log := util.Logger()
+
+	if len(args) != 1 || args[0] == "" {
+		log.Fatalf(`❌ Missing expected arguments: <noobaa-account-name> %s`, cmd.UsageString())
+	}
+	name := args[0]
+
+	allowBucketCreate, _ := cmd.Flags().GetBool("allow_bucket_create")
+	defaultResource, _ := cmd.Flags().GetString("default_resource")
+
+	nsfsAccountConfig, _ := cmd.Flags().GetBool("nsfs_account_config")
+	forceMd5EtagPtr, err := util.GetBoolFlagPtr(cmd, "force_md5_etag")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	newBucketsPath, _ := cmd.Flags().GetString("new_buckets_path")
+	nsfsOnly, _ := cmd.Flags().GetBool("nsfs_only")
+
+	// Check and get system
+	o := util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_noobaa_cr_yaml)
+	sys := o.(*nbv1.NooBaa)
+	sys.Name = options.SystemName
+	sys.Namespace = options.Namespace
+
+	o = util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_noobaaaccount_cr_yaml)
+	noobaaAccount := o.(*nbv1.NooBaaAccount)
+	noobaaAccount.Name = name
+	noobaaAccount.Namespace = options.Namespace
+	noobaaAccount.Spec.AllowBucketCreate = allowBucketCreate
+	noobaaAccount.Spec.ForceMd5Etag = forceMd5EtagPtr
+
+	if nsfsAccountConfig {
+		nsfsUID := util.GetFlagIntOrPrompt(cmd, "uid")
+		if nsfsUID < 0 {
+			log.Fatalf(`❌  uid must be a whole positive number`)
+		}
+
+		nsfsGID := util.GetFlagIntOrPrompt(cmd, "gid")
+		if nsfsGID < 0 {
+			log.Fatalf(`❌  gid must be a whole positive number`)
+		}
+
+		noobaaAccount.Spec.NsfsAccountConfig = &nbv1.AccountNsfsConfig{
+			UID:            &nsfsUID,
+			GID:            &nsfsGID,
+			NewBucketsPath: newBucketsPath,
+			NsfsOnly:       nsfsOnly,
+		}
+	}
+
+	if !util.KubeCheck(sys) {
+		log.Fatalf(`❌ Could not find NooBaa system %q in namespace %q`, sys.Name, sys.Namespace)
+	}
+
+	if defaultResource == "" { // if user doesn't provide default resource we will use the default backingstore
+		defaultResource = sys.Name + "-default-backing-store"
+	}
+
+	if err := validations.ValidateAccountDefaultResource(*noobaaAccount); err != nil {
+		log.Fatalf(`❌ %s`, err.Error())
+	}
+
+	noobaaAccount.Spec.DefaultResource = defaultResource
+
+	err = util.KubeClient().Get(util.Context(), util.ObjectKey(noobaaAccount), noobaaAccount)
+	if err == nil {
+		log.Fatalf(`❌ noobaaAccount %q already exists in namespace %q`, noobaaAccount.Name, noobaaAccount.Namespace)
+	}
+
+	// Create noobaa account CR
+	util.Panic(controllerutil.SetControllerReference(sys, noobaaAccount, scheme.Scheme))
+	if !util.KubeCreateSkipExisting(noobaaAccount) {
+		log.Fatalf(`❌ Could not create noobaaAccount %q in Namespace %q (conflict)`, noobaaAccount.Name, noobaaAccount.Namespace)
+	}
+
+	log.Printf("")
+	util.PrintThisNoteWhenFinishedApplyingAndStartWaitLoop()
+	log.Printf("")
+	log.Printf("NooBaaAccount Wait Ready:")
+	if WaitReady(noobaaAccount) {
+		log.Printf("")
+		log.Printf("")
+		RunStatus(cmd, args)
+	}
+}
+
+// RunUpdate runs a CLI command
+func RunUpdate(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+
+	if len(args) != 1 || args[0] == "" {
+		log.Fatalf(`❌ Missing expected arguments: <noobaa-account-name> %s`, cmd.UsageString())
+	}
+	name := args[0]
+
+	newDefaultResource := util.GetFlagStringOrPrompt(cmd, "new_default_resource")
+	forceMd5EtagPtr, err := util.GetBoolFlagPtr(cmd, "force_md5_etag")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	o := util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_noobaaaccount_cr_yaml)
+	noobaaAccount := o.(*nbv1.NooBaaAccount)
+	noobaaAccount.Name = name
+	noobaaAccount.Namespace = options.Namespace
+
+	sysClient, err := system.ConnectAuto()
+	if err != nil {
+		log.Fatalf("❌ failed to run RPC call: %s", err)
+	}
+
+	_, err = sysClient.NBClient.ReadPoolAPI(nb.ReadPoolParams{Name: newDefaultResource})
+	isResourceBackingStore := err == nil
+
+	_, err = sysClient.NBClient.ReadNamespaceResourceAPI(nb.ReadNamespaceResourceParams{Name: newDefaultResource})
+	isResourceNamespaceStore := err == nil
+
+	if isResourceBackingStore && isResourceNamespaceStore {
+		log.Fatalf(`❌  got BackingStore and NamespaceStore %q in namespace %q`,
+			newDefaultResource, options.Namespace)
+	} else if !isResourceBackingStore && !isResourceNamespaceStore {
+		log.Fatalf(`❌ Could not get BackingStore or NamespaceStore %q in namespace %q`,
+			newDefaultResource, options.Namespace)
+	}
+
+	// Checking if noobaaAccount is a CRD account
+	if util.KubeCheck(noobaaAccount) {
+		noobaaAccount.Spec.DefaultResource = newDefaultResource
+
+		err := util.KubeClient().Get(util.Context(), util.ObjectKey(noobaaAccount), noobaaAccount)
+		if err != nil {
+			log.Fatalf(`❌ noobaaAccount %q does not exists in namespace %q`, noobaaAccount.Name, noobaaAccount.Namespace)
+		}
+
+		noobaaAccount.Spec.DefaultResource = newDefaultResource
+		if forceMd5EtagPtr != nil {
+			noobaaAccount.Spec.ForceMd5Etag = forceMd5EtagPtr
+		}
+
+		if !util.KubeUpdate(noobaaAccount) {
+			log.Fatalf(`❌ Unable to update account`)
+		}
+
+		log.Printf("")
+		util.PrintThisNoteWhenFinishedApplyingAndStartWaitLoop()
+		log.Printf("")
+		log.Printf("NooBaaAccount Wait Ready:")
+		if WaitReady(noobaaAccount) {
+			log.Printf("")
+			log.Printf("")
+			RunStatus(cmd, args)
+		}
+	} else {
+		sysClient, err := system.ConnectAuto()
+		if err != nil {
+			log.Fatalf(`❌ Unable to create RPC client %s`, err)
+		}
+		NBClient := sysClient.NBClient
+
+		readAccountParams := nb.ReadAccountParams{Email: name}
+		accountInfo, err := NBClient.ReadAccountAPI(readAccountParams)
+		if err != nil {
+			log.Fatalf(`❌ Unable to read account %s`, err)
+		}
+
+		updateAccountS3AccessParams := nb.UpdateAccountS3AccessParams{
+			Email:           name,
+			DefaultResource: &newDefaultResource,
+			ForceMd5Etag:    forceMd5EtagPtr,
+			S3Access:        accountInfo.HasS3Access,
+		}
+
+		err = NBClient.UpdateAccountS3Access(updateAccountS3AccessParams)
+		if err != nil {
+			log.Fatalf(`❌ Unable to update account %s`, err)
+		}
+	}
+}
+
+// RunRegenerate runs a CLI command
+func RunRegenerate(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+
+	if len(args) != 1 || args[0] == "" {
+		log.Fatalf(`❌ Missing expected arguments: <noobaa-account-name> %s`, cmd.UsageString())
+	}
+
+	var decision string
+	log.Printf("You are about to regenerate an account's security credentials.")
+	log.Printf("This will invalidate all connections between S3 clients and NooBaa which are connected using the current credentials.")
+	log.Printf("are you sure? y/n")
+
+	for {
+		if _, err := fmt.Scanln(&decision); err != nil {
+			log.Printf(`are you sure? y/n`)
+		}
+		if decision == "y" {
+			break
+		} else if decision == "n" {
+			return
+		}
+	}
+
+	name := args[0]
+
+	o := util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_noobaaaccount_cr_yaml)
+	noobaaAccount := o.(*nbv1.NooBaaAccount)
+	noobaaAccount.Name = name
+	noobaaAccount.Namespace = options.Namespace
+
+	if !util.KubeCheck(noobaaAccount) && (name != "admin@noobaa.io") {
+		err := GenerateNonCrdAccountKeys(name)
+		if err != nil {
+			log.Fatalf(`❌ Could not regenerate credentials for %q: %v`, name, err)
+		}
+	} else {
+		err := GenerateAccountKeys(name)
+		if err != nil {
+			log.Fatalf(`❌ Could not regenerate credentials for %q: %v`, name, err)
+		}
+
+		RunStatus(cmd, args)
+	}
+
+}
+
+// RunCredentials runs a CLI command
+func RunCredentials(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+
+	if len(args) != 1 || args[0] == "" {
+		log.Fatalf(`❌ Missing expected arguments: <noobaa-account-name> %s`, cmd.UsageString())
+	}
+
+	var accessKeys nb.S3AccessKeys
+	accessKeys.AccessKey = nb.MaskedString(util.GetFlagStringOrPromptPassword(cmd, "access-key"))
+	accessKeys.SecretKey = nb.MaskedString(util.GetFlagStringOrPromptPassword(cmd, "secret-key"))
+
+	if accessKeys.AccessKey == "" || accessKeys.SecretKey == "" {
+		log.Fatalf(`❌ access_key and secret_key flags must be provided`)
+	}
+	// validating access_keys
+	ValidateAccessKeys(accessKeys)
+
+	name := args[0]
+	o := util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_noobaaaccount_cr_yaml)
+	noobaaAccount := o.(*nbv1.NooBaaAccount)
+	noobaaAccount.Name = name
+	noobaaAccount.Namespace = options.Namespace
+
+	if !util.KubeCheck(noobaaAccount) && (name != "admin@noobaa.io") {
+		err := UpdateNonCrdAccountKeys(name, accessKeys)
+		if err != nil {
+			log.Fatalf(`❌ Could not update credentials for %q: %v`, name, err)
+		}
+	} else {
+		err := UpdateAccountKeys(name, accessKeys)
+		if err != nil {
+			log.Fatalf(`❌ Could not update credentials for %q: %v`, name, err)
+		}
+
+		RunStatus(cmd, args)
+	}
+}
+
+// RunDelete runs a CLI command
+func RunDelete(cmd *cobra.Command, args []string) {
+
+	log := util.Logger()
+
+	if len(args) != 1 || args[0] == "" {
+		log.Fatalf(`❌ Missing expected arguments: <bucket-class-name> %s`, cmd.UsageString())
+	}
+
+	o := util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_noobaaaccount_cr_yaml)
+	noobaaAccount := o.(*nbv1.NooBaaAccount)
+	noobaaAccount.Name = args[0]
+	noobaaAccount.Namespace = options.Namespace
+
+	if !util.KubeDelete(noobaaAccount) {
+		log.Fatalf(`❌ Could not delete NooBaaAccount %q in namespace %q`,
+			noobaaAccount.Name, noobaaAccount.Namespace)
+	}
+}
+
+// RunStatus runs a CLI command
+func RunStatus(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+
+	if len(args) != 1 || args[0] == "" {
+		log.Fatalf(`❌ Missing expected arguments: <noobaa-account-name> %s`, cmd.UsageString())
+	}
+
+	name := args[0]
+
+	o := util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_noobaaaccount_cr_yaml)
+	noobaaAccount := o.(*nbv1.NooBaaAccount)
+	secret := util.KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret)
+
+	noobaaAccount.Name = name
+	secret.Name = fmt.Sprintf("noobaa-account-%s", name)
+	noobaaAccount.Namespace = options.Namespace
+	secret.Namespace = options.Namespace
+
+	if name == "admin@noobaa.io" {
+		secret.Name = "noobaa-admin"
+	} else if !util.KubeCheck(noobaaAccount) {
+		log.Fatalf(`❌ Could not get NooBaaAccount %q in namespace %q`,
+			noobaaAccount.Name, noobaaAccount.Namespace)
+	} else {
+		CheckPhase(noobaaAccount)
+
+		fmt.Println()
+		fmt.Println("# NooBaaAccount spec:")
+		output, err := sigyaml.Marshal(noobaaAccount.Spec)
+		util.Panic(err)
+		fmt.Print(string(output))
+		fmt.Println()
+	}
+
+	util.KubeCheck(secret)
+
+	fmt.Printf("Connection info:\n")
+	credsEnv := ""
+	for k, v := range secret.StringData {
+		if v != "" {
+			//In admin secret there is also the password, email and system that we do not want to print
+			switch k {
+			case "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY":
+				if options.ShowSecrets {
+					fmt.Printf("  %-22s : %s\n", k, v)
+				} else {
+					fmt.Printf("  %-22s : %s\n", k, nb.MaskedString(v))
+				}
+				credsEnv += k + "=" + v + " "
+			case "ARN":
+				fmt.Printf("  %-22s : %s\n", k, v)
+			}
+		}
+	}
+	fmt.Println()
+}
+
+// WaitReady waits until the system phase changes to ready by the operator
+func WaitReady(noobaaAccount *nbv1.NooBaaAccount) bool {
+	log := util.Logger()
+	klient := util.KubeClient()
+
+	interval := time.Duration(3)
+
+	err := wait.PollUntilContextCancel(ctx, interval*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := klient.Get(util.Context(), util.ObjectKey(noobaaAccount), noobaaAccount)
+		if err != nil {
+			log.Printf("⏳ Failed to get NooBaaAccount: %s", err)
+			return false, nil
+		}
+		CheckPhase(noobaaAccount)
+		if noobaaAccount.Status.Phase == nbv1.NooBaaAccountPhaseRejected {
+			return false, fmt.Errorf("NooBaaAccountPhaseRejected")
+		}
+		if noobaaAccount.Status.Phase != nbv1.NooBaaAccountPhaseReady {
+			return false, nil
+		}
+		return true, nil
+	})
+	return err == nil
+}
+
+// CheckPhase prints the phase and reason for it
+func CheckPhase(noobaaAccount *nbv1.NooBaaAccount) {
+	log := util.Logger()
+
+	reason := "waiting..."
+	for _, c := range noobaaAccount.Status.Conditions {
+		if c.Type == "Available" {
+			reason = fmt.Sprintf("%s %s", c.Reason, c.Message)
+		}
+	}
+
+	switch noobaaAccount.Status.Phase {
+
+	case nbv1.NooBaaAccountPhaseReady:
+		log.Printf("✅ NooBaaAccount %q Phase is Ready", noobaaAccount.Name)
+
+	case nbv1.NooBaaAccountPhaseRejected:
+		log.Errorf("❌ NooBaaAccount %q Phase is %q: %s", noobaaAccount.Name, noobaaAccount.Status.Phase, reason)
+
+	case nbv1.NooBaaAccountPhaseVerifying:
+		fallthrough
+	case nbv1.NooBaaAccountPhaseDeleting:
+		fallthrough
+	default:
+		log.Printf("⏳ NooBaaAccount %q Phase is %q: %s", noobaaAccount.Name, noobaaAccount.Status.Phase, reason)
+	}
+}
+
+// RunList runs a CLI command
+func RunList(cmd *cobra.Command, args []string) {
+	list := &nbv1.NooBaaAccountList{
+		TypeMeta: metav1.TypeMeta{Kind: "NooBaaAccountList"},
+	}
+	if !util.KubeList(list, &client.ListOptions{Namespace: options.Namespace}) {
+		return
+	}
+	if len(list.Items) == 0 {
+		fmt.Printf("No noobaa accounts found.\n")
+		return
+	}
+	table := (&util.PrintTable{}).AddRow(
+		"NAME",
+		"DEFAULT_RESOURCE",
+		"PHASE",
+		"AGE",
+	)
+	for i := range list.Items {
+		na := &list.Items[i]
+		defaultResource := na.Spec.DefaultResource
+		if !na.Spec.AllowBucketCreate {
+			defaultResource = "-NO-BUCKET-CREATION-"
+		}
+		table.AddRow(
+			na.Name,
+			defaultResource,
+			string(na.Status.Phase),
+			time.Since(na.CreationTimestamp.Time).Round(time.Second).String(),
+		)
+	}
+	fmt.Print(table.String())
+}
+
+// RunReconcile runs a CLI command
+func RunReconcile(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+	if len(args) != 1 || args[0] == "" {
+		log.Fatalf(`Missing expected arguments: <bucket-name> %s`, cmd.UsageString())
+	}
+	noobaaAccountName := args[0]
+	klient := util.KubeClient()
+	interval := time.Duration(3)
+	util.Panic(wait.PollUntilContextCancel(ctx, interval*time.Second, true, func(ctx context.Context) (bool, error) {
+		req := reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: options.Namespace,
+				Name:      noobaaAccountName,
+			},
+		}
+		res, err := NewReconciler(req.NamespacedName, klient, scheme.Scheme, nil).Reconcile()
+		if err != nil {
+			return false, err
+		}
+		if res.RequeueAfter != 0 {
+			log.Printf("\nRetrying in %d seconds\n", interval)
+			return false, nil
+		}
+		return true, nil
+	}))
+}
+
+// GenerateAccountKeys regenerate noobaa account (CRD based) S3 keys
+func GenerateAccountKeys(name string) error {
+	log := util.Logger()
+
+	var accessKeys nb.S3AccessKeys
+
+	sysClient, err := system.ConnectAuto()
+	if err != nil {
+		return err
+	}
+
+	// Checking that we can find the secret before we are calling the RPC to change the credentials.
+	secret := util.KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret)
+	secret.Namespace = options.Namespace
+	// Handling a special case when the account is "admin@noobaa.io" we don't have CRD but have a secret
+	if name == "admin@noobaa.io" {
+		secret.Name = "noobaa-admin"
+	} else {
+		secret.Name = fmt.Sprintf("noobaa-account-%s", name)
+	}
+	if !util.KubeCheckQuiet(secret) {
+		log.Fatalf(`❌  Could not find secret: %s, will not regenerate keys.`, secret.Name)
+	}
+
+	err = sysClient.NBClient.GenerateAccountKeysAPI(nb.GenerateAccountKeysParams{
+		Email: name,
+	})
+	if err != nil {
+		return err
+	}
+
+	// GenerateAccountKeysAPI have no replay so we need to read the account in order to get the new credentials
+	accountInfo, err := sysClient.NBClient.ReadAccountAPI(nb.ReadAccountParams{
+		Email: name,
+	})
+	if err != nil {
+		return err
+	}
+
+	accessKeys = accountInfo.AccessKeys[0]
+
+	secret.StringData = map[string]string{}
+	secret.StringData["AWS_ACCESS_KEY_ID"] = string(accessKeys.AccessKey)
+	secret.StringData["AWS_SECRET_ACCESS_KEY"] = string(accessKeys.SecretKey)
+
+	// If we will not be able to update the secret we will print the credentials as they already been changed by the RPC
+	if !util.KubeUpdate(secret) {
+		log.Printf(`❌  Please write the new credentials for account %s:`, name)
+		fmt.Printf("\nAWS_ACCESS_KEY_ID     : %s\n", string(accessKeys.AccessKey))
+		fmt.Printf("AWS_SECRET_ACCESS_KEY : %s\n\n", string(accessKeys.SecretKey))
+		log.Fatalf(`❌  Failed to update the secret %s with the new accessKeys`, secret.Name)
+	}
+
+	log.Printf("✅ Successfully regenerate s3 credentials for the account %q", name)
+	return nil
+}
+
+// GenerateNonCrdAccountKeys regenerate noobaa account (none CRD based) S3 keys
+func GenerateNonCrdAccountKeys(name string) error {
+	log := util.Logger()
+
+	var accessKeys nb.S3AccessKeys
+
+	sysClient, err := system.ConnectAuto()
+	if err != nil {
+		return err
+	}
+
+	err = sysClient.NBClient.GenerateAccountKeysAPI(nb.GenerateAccountKeysParams{
+		Email: name,
+	})
+	if err != nil {
+		if nbErr, ok := err.(*nb.RPCError); ok && nbErr.RPCCode == "NO_SUCH_ACCOUNT" {
+			log.Fatalf(`❌  Could not find the account: %s, will not regenerate keys.`, name)
+		}
+		return err
+	}
+
+	// GenerateAccountKeysAPI have no replay so we need to read the account in order to get the new credentials
+	accountInfo, err := sysClient.NBClient.ReadAccountAPI(nb.ReadAccountParams{
+		Email: name,
+	})
+	if err != nil {
+		log.Fatalf(`❌  Could not read account: %s, keys were allready regenerated, please read the account to get the keys`, name)
+	}
+
+	accessKeys = accountInfo.AccessKeys[0]
+
+	log.Printf("✅ Successfully reganerate s3 credentials for the account %q", name)
+	log.Printf(`✅  Please write the new credentials for account %s:`, name)
+	fmt.Printf("\nAWS_ACCESS_KEY_ID     : %s\n", string(accessKeys.AccessKey))
+	fmt.Printf("AWS_SECRET_ACCESS_KEY : %s\n\n", string(accessKeys.SecretKey))
+
+	return nil
+}
+
+// UpdateAccountKeys update noobaa account (CRD based) S3 keys
+func UpdateAccountKeys(name string, accessKeys nb.S3AccessKeys) error {
+	log := util.Logger()
+
+	sysClient, err := system.ConnectAuto()
+	if err != nil {
+		return err
+	}
+
+	// Checking that we can find the secret before we are calling the RPC to update the credentials.
+	secret := util.KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret)
+	secret.Namespace = options.Namespace
+	// Handling a special case when the account is "admin@noobaa.io" we don't have CRD but have a secret
+	if name == "admin@noobaa.io" {
+		secret.Name = "noobaa-admin"
+	} else {
+		secret.Name = fmt.Sprintf("noobaa-account-%s", name)
+	}
+	if !util.KubeCheckQuiet(secret) {
+		log.Fatalf(`❌  Could not find secret: %s, will not update keys.`, secret.Name)
+	}
+
+	err = sysClient.NBClient.UpdateAccountKeysAPI(nb.UpdateAccountKeysParams{
+		Email:      name,
+		AccessKeys: accessKeys,
+	})
+	if err != nil {
+		return err
+	}
+
+	// UpdateAccountKeysAPI have no reply so we need to read the account in order to get the new credentials
+	accountInfo, err := sysClient.NBClient.ReadAccountAPI(nb.ReadAccountParams{
+		Email: name,
+	})
+	if err != nil {
+		return err
+	}
+
+	accessKeys = accountInfo.AccessKeys[0]
+
+	secret.StringData = map[string]string{}
+	secret.StringData["AWS_ACCESS_KEY_ID"] = string(accessKeys.AccessKey)
+	secret.StringData["AWS_SECRET_ACCESS_KEY"] = string(accessKeys.SecretKey)
+
+	// If we will not be able to update the secret we will print the credentials as they already been changed by the RPC
+	if !util.KubeUpdate(secret) {
+		log.Printf(`❌  Please verify the updated credentials for account %s:`, name)
+		fmt.Printf("\nAWS_ACCESS_KEY_ID     : %s\n", string(accessKeys.AccessKey))
+		fmt.Printf("AWS_SECRET_ACCESS_KEY : %s\n\n", string(accessKeys.SecretKey))
+		log.Fatalf(`❌  Failed to update the secret %s with the new accessKeys`, secret.Name)
+	}
+
+	log.Printf("✅ Successfully updated s3 credentials for the account %q", name)
+	return nil
+}
+
+// UpdateNonCrdAccountKeys update noobaa account (none CRD based) S3 keys
+func UpdateNonCrdAccountKeys(name string, accessKeys nb.S3AccessKeys) error {
+	log := util.Logger()
+
+	sysClient, err := system.ConnectAuto()
+	if err != nil {
+		return err
+	}
+
+	err = sysClient.NBClient.UpdateAccountKeysAPI(nb.UpdateAccountKeysParams{
+		Email:      name,
+		AccessKeys: accessKeys,
+	})
+	if err != nil {
+		if nbErr, ok := err.(*nb.RPCError); ok && nbErr.RPCCode == "NO_SUCH_ACCOUNT" {
+			log.Fatalf(`❌  Could not find the account: %s, will not update keys.`, name)
+		}
+		return err
+	}
+
+	// UpdateAccountKeysAPI have no reply so we need to read the account in order to get the updated credentials
+	accountInfo, err := sysClient.NBClient.ReadAccountAPI(nb.ReadAccountParams{
+		Email: name,
+	})
+	if err != nil {
+		log.Fatalf(`❌  Could not read account: %s, keys were allready updated, please read the account to get the keys`, name)
+	}
+
+	accessKeys = accountInfo.AccessKeys[0]
+
+	log.Printf("✅ Successfully update s3 credentials for the account %q", name)
+	fmt.Printf("\nAWS_ACCESS_KEY_ID     : %s\n", string(accessKeys.AccessKey))
+	fmt.Printf("AWS_SECRET_ACCESS_KEY : %s\n\n", string(accessKeys.SecretKey))
+
+	return nil
+}
+
+// ValidateAccessKeys checks validity of credentials (access_key and secret_key)
+func ValidateAccessKeys(accessKeys nb.S3AccessKeys) {
+	log := util.Logger()
+
+	// validations for access_key
+	if !util.AccessKeyRegexp.MatchString(string(accessKeys.AccessKey)) {
+		log.Fatalf(`❌ Account access key length must be 20, and must contain only alpha-numeric chars`)
+	}
+
+	// validations for secret_key
+	if !util.SecretKeyRegexp.MatchString(string(accessKeys.SecretKey)) {
+		log.Fatalf(`❌ Account secret length must be 40, and must contain only alpha-numeric chars, "+", "/"`)
+	}
+}

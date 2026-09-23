@@ -6,12 +6,27 @@ metadata:
     app: noobaa
 spec:
   endpoints:
-  - port: mgmt
+  - port: mgmt-https
     path: /metrics/web_server
-  - port: mgmt
+    scheme: https
+    relabelings:
+    - sourceLabels: [__meta_kubernetes_pod_ready]
+      action: keep
+      regex: "true"
+  - port: mgmt-https
     path: /metrics/bg_workers
-  - port: mgmt
+    scheme: https
+    relabelings:
+    - sourceLabels: [__meta_kubernetes_pod_ready]
+      action: keep
+      regex: "true"
+  - port: mgmt-https
     path: /metrics/hosted_agents
+    scheme: https
+    relabelings:
+    - sourceLabels: [__meta_kubernetes_pod_ready]
+      action: keep
+      regex: "true"
   namespaceSelector: {}
   selector:
     matchLabels:

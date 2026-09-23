@@ -1,6 +1,7 @@
 package crd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"time"
@@ -15,6 +16,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/cli-runtime/pkg/printers"
 )
+
+var ctx = context.TODO()
 
 // CRD is just an alias for a long name
 type CRD = apiextv1.CustomResourceDefinition
@@ -41,6 +44,7 @@ func CmdCreate() *cobra.Command {
 		Use:   "create",
 		Short: "Create noobaa CRDs",
 		Run:   RunCreate,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -51,6 +55,7 @@ func CmdDelete() *cobra.Command {
 		Use:   "delete",
 		Short: "Delete noobaa CRDs",
 		Run:   RunDelete,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -61,6 +66,7 @@ func CmdStatus() *cobra.Command {
 		Use:   "status",
 		Short: "Status of noobaa CRDs",
 		Run:   RunStatus,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -71,6 +77,7 @@ func CmdWait() *cobra.Command {
 		Use:   "wait",
 		Short: "Wait for CRD to be ready",
 		Run:   RunWait,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -81,6 +88,7 @@ func CmdYaml() *cobra.Command {
 		Use:   "yaml",
 		Short: "Show bundled CRDs",
 		Run:   RunYaml,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -92,6 +100,7 @@ type Crds struct {
 	BackingStore      *CRD
 	NamespaceStore    *CRD
 	BucketClass       *CRD
+	NooBaaAccount     *CRD
 	ObjectBucket      *CRD
 	ObjectBucketClaim *CRD
 }
@@ -99,6 +108,11 @@ type Crds struct {
 // RunCreate runs a CLI command
 func RunCreate(cmd *cobra.Command, args []string) {
 	ForEachCRD(CreateCRD)
+}
+
+// RunUpgrade runs a CLI command
+func RunUpgrade(cmd *cobra.Command, args []string) {
+	ForEachCRD(UpgradeCRD)
 }
 
 // RunDelete runs a CLI command
@@ -125,25 +139,28 @@ func RunYaml(cmd *cobra.Command, args []string) {
 
 // LoadCrds loads the CRDs structures from the bundled yamls
 func LoadCrds() *Crds {
-	o1 := util.KubeObject(bundle.File_deploy_crds_noobaa_io_noobaas_crd_yaml)
-	o2 := util.KubeObject(bundle.File_deploy_crds_noobaa_io_backingstores_crd_yaml)
-	o3 := util.KubeObject(bundle.File_deploy_crds_noobaa_io_namespacestores_crd_yaml)
-	o4 := util.KubeObject(bundle.File_deploy_crds_noobaa_io_bucketclasses_crd_yaml)
-	o5 := util.KubeObject(bundle.File_deploy_obc_objectbucket_io_objectbucketclaims_crd_yaml)
-	o6 := util.KubeObject(bundle.File_deploy_obc_objectbucket_io_objectbuckets_crd_yaml)
+	o1 := util.KubeObject(bundle.File_deploy_crds_noobaa_io_noobaas_yaml)
+	o2 := util.KubeObject(bundle.File_deploy_crds_noobaa_io_backingstores_yaml)
+	o3 := util.KubeObject(bundle.File_deploy_crds_noobaa_io_namespacestores_yaml)
+	o4 := util.KubeObject(bundle.File_deploy_crds_noobaa_io_bucketclasses_yaml)
+	o5 := util.KubeObject(bundle.File_deploy_crds_noobaa_io_noobaaaccounts_yaml)
+	o6 := util.KubeObject(bundle.File_deploy_obc_objectbucket_io_objectbucketclaims_crd_yaml)
+	o7 := util.KubeObject(bundle.File_deploy_obc_objectbucket_io_objectbuckets_crd_yaml)
 	crds := &Crds{
 		NooBaa:            o1.(*CRD),
 		BackingStore:      o2.(*CRD),
 		NamespaceStore:    o3.(*CRD),
 		BucketClass:       o4.(*CRD),
-		ObjectBucketClaim: o5.(*CRD),
-		ObjectBucket:      o6.(*CRD),
+		NooBaaAccount:     o5.(*CRD),
+		ObjectBucketClaim: o6.(*CRD),
+		ObjectBucket:      o7.(*CRD),
 	}
 	crds.All = []*CRD{
 		crds.NooBaa,
 		crds.BackingStore,
 		crds.NamespaceStore,
 		crds.BucketClass,
+		crds.NooBaaAccount,
 		crds.ObjectBucketClaim,
 		crds.ObjectBucket,
 	}
@@ -161,6 +178,11 @@ func ForEachCRD(fn func(*CRD)) {
 // CreateCRD creates a CRD
 func CreateCRD(crd *CRD) {
 	util.KubeCreateSkipExisting(crd)
+}
+
+// UpgradeCRD Kubernetesically applies a CRD (create if doesn't exist, update otherwise)
+func UpgradeCRD(crd *CRD) {
+	util.KubeApply(crd)
 }
 
 // DeleteCRD deletes a CRD
@@ -184,8 +206,9 @@ func WaitAllReady() {
 	log := util.Logger()
 	klient := util.KubeClient()
 	crds := LoadCrds()
-	intervalSec := time.Duration(3)
-	util.Panic(wait.PollImmediateInfinite(intervalSec*time.Second, func() (bool, error) {
+	interval := time.Duration(3)
+
+	util.Panic(wait.PollUntilContextCancel(ctx, interval*time.Second, true, func(ctx context.Context) (bool, error) {
 		allReady := true
 		for _, crd := range crds.All {
 			err := klient.Get(util.Context(), client.ObjectKey{Name: crd.Name}, crd)

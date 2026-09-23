@@ -1,0 +1,20 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  labels:
+    deploymentName: noobaa-endpoint
+    origin: keda
+    app: noobaa
+    scaledobject.keda.sh/name: prometheus-scaledobject
+spec:
+  cooldownPeriod: 150
+  pollingInterval: 30
+  scaleTargetRef:
+    name: noobaa-endpoint
+    apiVersion: apps/v1
+    kind: Deployment
+  triggers:
+    - type: cpu
+      metricType: Utilization
+      metadata:
+        value: "80"

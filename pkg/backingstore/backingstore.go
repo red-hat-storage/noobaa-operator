@@ -1,9 +1,10 @@
 package backingstore
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strings"
 	"time"
 
@@ -13,7 +14,9 @@ import (
 	"github.com/noobaa/noobaa-operator/v5/pkg/options"
 	"github.com/noobaa/noobaa-operator/v5/pkg/system"
 	"github.com/noobaa/noobaa-operator/v5/pkg/util"
+	"github.com/noobaa/noobaa-operator/v5/pkg/validations"
 
+	"github.com/aws/aws-sdk-go/aws/arn"
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -27,6 +30,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	sigyaml "sigs.k8s.io/yaml"
 )
+
+var ctx = context.TODO()
 
 // Cmd returns a CLI command
 func Cmd() *cobra.Command {
@@ -48,16 +53,72 @@ func Cmd() *cobra.Command {
 // CmdCreate returns a CLI command
 func CmdCreate() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "create",
+		Use:   "create <backing-store-type> <backing-store-name>",
 		Short: "Create backing store",
+		Run:   RunCreate,
 	}
 	cmd.AddCommand(
 		CmdCreateAWSS3(),
+		CmdCreateAWSSTSS3(),
 		CmdCreateS3Compatible(),
 		CmdCreateIBMCos(),
 		CmdCreateAzureBlob(),
 		CmdCreateGoogleCloudStorage(),
+		CmdCreateGoogleCloudStorageSTS(),
 		CmdCreatePVPool(),
+		CmdCreateAzureSTS(),
+	)
+	return cmd
+}
+
+// CmdCreateAWSSTSS3 returns a cli command
+func CmdCreateAWSSTSS3() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "aws-sts-s3 <backing-store-name>",
+		Short: "Create aws-s3 backing store (using STS, short-lived credentials)",
+		Run:   RunCreateAWSSTSS3,
+	}
+	cmd.Flags().String(
+		"target-bucket", "",
+		"The target bucket name on the cloud",
+	)
+	cmd.Flags().String(
+		"aws-sts-arn", "",
+		"The AWS STS Role ARN which will assume role",
+	)
+	cmd.Flags().String(
+		"region", "",
+		"The AWS bucket region",
+	)
+	return cmd
+}
+
+// CmdCreateAzureSTS returns a CLI command
+func CmdCreateAzureSTS() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "azure-sts-blob <backing-store-name>",
+		Short: "Create azure-blob backing store (using STS, short-lived credentials)",
+		Run:   RunCreateAzureSTS,
+	}
+	cmd.Flags().String(
+		"target-blob-container", "",
+		"The target container name on Azure storage account",
+	)
+	cmd.Flags().String(
+		"account-name", "",
+		`Account name for authentication - the best practice is to **omit this flag**, in that case the CLI will prompt to prompt and read it securely from the terminal to avoid leaking secrets in the shell history`,
+	)
+	cmd.Flags().String(
+		"tenant-id", "",
+		"The Azure Tenant ID which will assume role",
+	)
+	cmd.Flags().String(
+		"client-id", "",
+		"The Azure Client ID which will assume role",
+	)
+	cmd.Flags().String(
+		"secret-name", "",
+		"Optional name of an existing secret containing azure_tenant_id (and optionally AccountName); if omitted, a secret is created from flags",
 	)
 	return cmd
 }
@@ -66,7 +127,7 @@ func CmdCreate() *cobra.Command {
 func CmdCreateAWSS3() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "aws-s3 <backing-store-name>",
-		Short: "Create aws-s3 backing store",
+		Short: "Create aws-s3 backing store (using long-lived credentials)",
 		Run:   RunCreateAWSS3,
 	}
 	cmd.Flags().String(
@@ -186,7 +247,7 @@ func CmdCreateAzureBlob() *cobra.Command {
 func CmdCreateGoogleCloudStorage() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "google-cloud-storage <backing-store-name>",
-		Short: "Create google-cloud-storage backing store",
+		Short: "Create google-cloud-storage backing store (using long-lived credentials)",
 		Run:   RunCreateGoogleCloudStorage,
 	}
 	cmd.Flags().String(
@@ -199,10 +260,49 @@ func CmdCreateGoogleCloudStorage() *cobra.Command {
 	)
 	cmd.Flags().String(
 		"secret-name", "",
-		`The name of a secret for authentication - should have GoogleServiceAccountPrivateKeyJson property`,
+		`The name of a secret for authentication - should have `+util.GoogleServiceAccountPrivateKeyJson+` property`,
 	)
 	return cmd
 }
+
+// CmdCreateGoogleCloudStorageSTS returns a CLI command
+func CmdCreateGoogleCloudStorageSTS() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "google-cloud-storage-sts <backing-store-name>",
+		Short: "Create google-cloud-storage backing store using GCP WIF (STS, short-lived credentials)",
+		Run:   RunCreateGoogleCloudStorageSTS,
+	}
+	cmd.Flags().String(
+		"target-bucket", "",
+		"The target bucket name on Google cloud storage",
+	)
+	cmd.Flags().String(
+		"service-account-email", "",
+		"The GCP service account email to impersonate",
+	)
+	cmd.Flags().String(
+		"project-number", "",
+		"The GCP project number (numeric string, e.g. 123456789; not the project ID)",
+	)
+	cmd.Flags().String(
+		"pool-id", "",
+		"The GCP workload identity pool ID",
+	)
+	cmd.Flags().String(
+		"provider-id", "",
+		"The GCP workload identity provider ID",
+	)
+	cmd.Flags().String(
+		"secret-name", "",
+		`The name of a secret for authentication - should have `+util.GoogleCredentialsJson+` property (external_account JSON)`,
+	)
+	return cmd
+}
+
+const (
+	// Default volume size for pv-pool backing store
+	defaultVolumeSize = int64(20 * 1024 * 1024 * 1024) // 20Gi=20*1024^3
+)
 
 // CmdCreatePVPool returns a CLI command
 func CmdCreatePVPool() *cobra.Command {
@@ -218,6 +318,22 @@ func CmdCreatePVPool() *cobra.Command {
 	cmd.Flags().Uint32(
 		"pv-size-gb", 0,
 		`PV size of each volume in the store`,
+	)
+	cmd.Flags().String(
+		"request-cpu", "",
+		"Request cpu for an agent pod (default: determined by performance profile)",
+	)
+	cmd.Flags().String(
+		"request-memory", "",
+		"Request memory for an agent pod (default: determined by performance profile)",
+	)
+	cmd.Flags().String(
+		"limit-cpu", "",
+		"Limit cpu for an agent pod (default: determined by performance profile)",
+	)
+	cmd.Flags().String(
+		"limit-memory", "",
+		"Limit memory for an agent pod (default: determined by performance profile)",
 	)
 	cmd.Flags().String(
 		"storage-class", "",
@@ -262,6 +378,7 @@ func CmdList() *cobra.Command {
 		Use:   "list",
 		Short: "List backing stores",
 		Run:   RunList,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
@@ -315,20 +432,140 @@ func createCommon(cmd *cobra.Command, args []string, storeType nbv1.StoreType, p
 
 	populate(backStore, secret)
 
+	if storeType == nbv1.StoreTypePVPool && backStore.Spec.PVPool != nil {
+		profileDefaults := system.GetPVPoolResources(sys)
+		effective := corev1.ResourceRequirements{
+			Requests: profileDefaults.Requests.DeepCopy(),
+			Limits:   profileDefaults.Limits.DeepCopy(),
+		}
+		if vr := backStore.Spec.PVPool.VolumeResources; vr != nil {
+			applyResourceOverrides(&effective, vr)
+		}
+		if err := validateResourceRequestsVsLimits(effective); err != nil {
+			log.Fatalf(`❌ PV pool resource conflict (against profile defaults): %v`, err)
+		}
+	}
+
+	if secretName != "" {
+		if !util.KubeCheck(secret) {
+			log.Fatalf(`❌ Could not find the suggested secret: name %q namespace %q`, secret.Name, secret.Namespace)
+			return
+		}
+	}
+
+	validationErr := validations.ValidateBackingStore(*backStore)
+	if validationErr != nil {
+		log.Fatalf(`❌ %s %s`, validationErr, cmd.UsageString())
+	}
+
+	suggestedSecret := util.CheckForIdenticalSecretsCreds(secret, string(storeType))
+	if suggestedSecret != nil {
+		var decision string
+		log.Printf("Found a Secret in the system with the same credentials (%s)", suggestedSecret.Name)
+		log.Printf("Note that using more then one secret with the same credentials is not supported")
+		log.Printf("do you want to use it for this Backingstore? y/n")
+		if _, err := fmt.Scanln(&decision); err != nil {
+			log.Fatalf(`❌ Invalid input, please select y/n`)
+		}
+		if strings.ToLower(decision) == "y" {
+			log.Printf("Will use %s as the Backingstore %s Secret", suggestedSecret.Name, backStore.Name)
+			err := util.SetBackingStoreSecretRef(backStore, &corev1.SecretReference{
+				Name:      suggestedSecret.Name,
+				Namespace: suggestedSecret.Namespace,
+			})
+			if err != nil {
+				log.Fatalf(`❌ %s`, err)
+			}
+		} else if strings.ToLower(decision) == "n" {
+			log.Fatalf("Not creating Backingstore")
+		}
+	}
+
 	// Create backing store CR
 	util.Panic(controllerutil.SetControllerReference(sys, backStore, scheme.Scheme))
 	if !util.KubeCreateFailExisting(backStore) {
 		log.Fatalf(`❌ Could not create BackingStore %q in Namespace %q (conflict)`, backStore.Name, backStore.Namespace)
 	}
 
-	if GetBackingStoreSecret(backStore) != nil && secretName == "" {
+	secretRef, _ := util.GetBackingStoreSecret(backStore)
+	if secretRef != nil && secretName == "" && suggestedSecret == nil {
 		// Create secret
 		util.Panic(controllerutil.SetControllerReference(backStore, secret, scheme.Scheme))
 		if !util.KubeCreateFailExisting(secret) {
 			log.Fatalf(`❌ Could not create Secret %q in Namespace %q (conflict)`, secret.Name, secret.Namespace)
 		}
+	} else if secretRef != nil && secretName != "" {
+		_, err := util.GetSecretFromSecretReference(secretRef)
+		if err != nil {
+			util.Logger().Fatalf(`❌ Could not found Secret %q from SecretReference`, secret.Name)
+		}
 	}
 
+	log.Printf("")
+	util.PrintThisNoteWhenFinishedApplyingAndStartWaitLoop()
+	log.Printf("")
+	log.Printf("BackingStore Wait Ready:")
+	if WaitReady(backStore) {
+		log.Printf("")
+		log.Printf("")
+		RunStatus(cmd, args)
+	}
+}
+
+// RunCreate runs a cli command
+func RunCreate(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+	if len(args) != 1 || args[0] == "" {
+		log.Fatalf(`❌ Missing expected arguments: <backing-store-type> %s`, cmd.UsageString())
+	}
+	if args[0] != "aws-s3" && args[0] != "aws-sts-s3" && args[0] != "google-cloud-storage" && args[0] != "google-cloud-storage-sts" &&
+		args[0] != "azure-blob" && args[0] != "ibm-cos" && args[0] != "pv-pool" && args[0] != "s3-compatible" && args[0] != "azure-sts-blob" {
+		log.Fatalf(`❌ Unsupported <backing-store-type> -> %s %s`, args[0], cmd.UsageString())
+	}
+}
+
+// RunCreateAWSSTSS3 runs a cli command
+func RunCreateAWSSTSS3(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+	if len(args) != 1 || args[0] == "" {
+		log.Fatalf(`❌ Missing expected arguments: <backing-store-name> %s`, cmd.UsageString())
+	}
+	name := args[0]
+	o := util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_noobaa_cr_yaml)
+	sys := o.(*nbv1.NooBaa)
+	sys.Name = options.SystemName
+	sys.Namespace = options.Namespace
+
+	o = util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_backingstore_cr_yaml)
+	backStore := o.(*nbv1.BackingStore)
+	backStore.Name = name
+	backStore.Namespace = options.Namespace
+	backStore.Spec = nbv1.BackingStoreSpec{Type: nbv1.StoreTypeAWSS3}
+
+	if !util.KubeCheck(sys) {
+		log.Fatalf(`❌ Could not find NooBaa system %q in namespace %q`, sys.Name, sys.Namespace)
+	}
+
+	err := util.KubeClient().Get(util.Context(), util.ObjectKey(backStore), backStore)
+	if err == nil {
+		log.Fatalf(`❌ BackingStore %q already exists in namespace %q`, backStore.Name, backStore.Namespace)
+	}
+	awsSTSARN := util.GetFlagStringOrPrompt(cmd, "aws-sts-arn")
+	if !arn.IsARN(awsSTSARN) {
+		log.Fatalf(`❌ aws-sts-arn %q is invalid`, awsSTSARN)
+	}
+	targetBucket := util.GetFlagStringOrPrompt(cmd, "target-bucket")
+	region, _ := cmd.Flags().GetString("region")
+	backStore.Spec.AWSS3 = &nbv1.AWSS3Spec{
+		TargetBucket:  targetBucket,
+		Region:        region,
+		AWSSTSRoleARN: &awsSTSARN,
+	}
+	// Create backing store CR
+	util.Panic(controllerutil.SetControllerReference(sys, backStore, scheme.Scheme))
+	if !util.KubeCreateFailExisting(backStore) {
+		log.Fatalf(`❌ Could not create BackingStore %q in Namespace %q (conflict)`, backStore.Name, backStore.Namespace)
+	}
 	log.Printf("")
 	util.PrintThisNoteWhenFinishedApplyingAndStartWaitLoop()
 	log.Printf("")
@@ -346,6 +583,7 @@ func RunCreateAWSS3(cmd *cobra.Command, args []string) {
 		targetBucket := util.GetFlagStringOrPrompt(cmd, "target-bucket")
 		region, _ := cmd.Flags().GetString("region")
 		secretName, _ := cmd.Flags().GetString("secret-name")
+		mandatoryProperties := []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"}
 
 		if secretName == "" {
 			accessKey := util.GetFlagStringOrPromptPassword(cmd, "access-key")
@@ -353,13 +591,55 @@ func RunCreateAWSS3(cmd *cobra.Command, args []string) {
 			secret.StringData["AWS_ACCESS_KEY_ID"] = accessKey
 			secret.StringData["AWS_SECRET_ACCESS_KEY"] = secretKey
 		} else {
-			mandatoryProperties := []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"}
 			util.VerifyCredsInSecret(secretName, options.Namespace, mandatoryProperties)
 			secret.Name = secretName
+			secret.Namespace = options.Namespace
 		}
+
 		backStore.Spec.AWSS3 = &nbv1.AWSS3Spec{
 			TargetBucket: targetBucket,
 			Region:       region,
+			Secret: corev1.SecretReference{
+				Name:      secret.Name,
+				Namespace: secret.Namespace,
+			},
+		}
+	})
+}
+
+// RunCreateAzureSTS runs a CLI command
+func RunCreateAzureSTS(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+	if len(args) != 1 || args[0] == "" {
+		log.Fatalf(`❌ Missing expected arguments: <backing-store-name> %s`, cmd.UsageString())
+	}
+	createCommon(cmd, args, nbv1.StoreTypeAzureBlob, func(backStore *nbv1.BackingStore, secret *corev1.Secret) {
+
+		secretName, _ := cmd.Flags().GetString("secret-name")
+		targetBlobContainer := util.GetFlagStringOrPrompt(cmd, "target-blob-container")
+		azureSTSClientID := ""
+		if secretName == "" {
+			azureSTSAccountName := util.GetFlagStringOrPromptPassword(cmd, "account-name")
+			azureSTSTenantID := util.GetFlagStringOrPrompt(cmd, "tenant-id")
+			azureSTSClientID = util.GetFlagStringOrPrompt(cmd, "client-id")
+			if err := validations.ValidateAzureSTSCredsPresent(&targetBlobContainer, &azureSTSAccountName, &azureSTSTenantID, &azureSTSClientID); err != nil {
+				log.Fatalf(`❌ %v %s`, err, cmd.UsageString())
+			}
+			secret.StringData["AccountName"] = azureSTSAccountName
+			secret.StringData["azure_tenant_id"] = azureSTSTenantID
+			secret.StringData["azure_client_id"] = azureSTSClientID
+		} else {
+			mandatoryProperties := []string{"AccountName", "azure_tenant_id", "azure_client_id"}
+			util.VerifyCredsInSecret(secretName, options.Namespace, mandatoryProperties)
+			secret.Name = secretName
+			secret.Namespace = options.Namespace
+			util.KubeCheck(secret)
+			azureSTSClientID = secret.StringData["azure_client_id"]
+		}
+
+		backStore.Spec.AzureBlob = &nbv1.AzureBlobSpec{
+			TargetBlobContainer: targetBlobContainer,
+			ClientId:            &azureSTSClientID,
 			Secret: corev1.SecretReference{
 				Name:      secret.Name,
 				Namespace: secret.Namespace,
@@ -375,6 +655,7 @@ func RunCreateS3Compatible(cmd *cobra.Command, args []string) {
 		targetBucket := util.GetFlagStringOrPrompt(cmd, "target-bucket")
 		sigVer, _ := cmd.Flags().GetString("signature-version")
 		secretName, _ := cmd.Flags().GetString("secret-name")
+		mandatoryProperties := []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"}
 
 		if secretName == "" {
 			accessKey := util.GetFlagStringOrPromptPassword(cmd, "access-key")
@@ -382,9 +663,9 @@ func RunCreateS3Compatible(cmd *cobra.Command, args []string) {
 			secret.StringData["AWS_ACCESS_KEY_ID"] = accessKey
 			secret.StringData["AWS_SECRET_ACCESS_KEY"] = secretKey
 		} else {
-			mandatoryProperties := []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"}
 			util.VerifyCredsInSecret(secretName, options.Namespace, mandatoryProperties)
 			secret.Name = secretName
+			secret.Namespace = options.Namespace
 		}
 
 		backStore.Spec.S3Compatible = &nbv1.S3CompatibleSpec{
@@ -406,6 +687,7 @@ func RunCreateIBMCos(cmd *cobra.Command, args []string) {
 		targetBucket := util.GetFlagStringOrPrompt(cmd, "target-bucket")
 		// sigVer, _ := cmd.Flags().GetString("signature-version")
 		secretName, _ := cmd.Flags().GetString("secret-name")
+		mandatoryProperties := []string{"IBM_COS_ACCESS_KEY_ID", "IBM_COS_SECRET_ACCESS_KEY"}
 
 		if secretName == "" {
 			accessKey := util.GetFlagStringOrPromptPassword(cmd, "access-key")
@@ -413,9 +695,9 @@ func RunCreateIBMCos(cmd *cobra.Command, args []string) {
 			secret.StringData["IBM_COS_ACCESS_KEY_ID"] = accessKey
 			secret.StringData["IBM_COS_SECRET_ACCESS_KEY"] = secretKey
 		} else {
-			mandatoryProperties := []string{"IBM_COS_ACCESS_KEY_ID", "IBM_COS_SECRET_ACCESS_KEY"}
 			util.VerifyCredsInSecret(secretName, options.Namespace, mandatoryProperties)
 			secret.Name = secretName
+			secret.Namespace = options.Namespace
 		}
 
 		backStore.Spec.IBMCos = &nbv1.IBMCosSpec{
@@ -435,16 +717,17 @@ func RunCreateAzureBlob(cmd *cobra.Command, args []string) {
 	createCommon(cmd, args, nbv1.StoreTypeAzureBlob, func(backStore *nbv1.BackingStore, secret *corev1.Secret) {
 		targetBlobContainer := util.GetFlagStringOrPrompt(cmd, "target-blob-container")
 		secretName, _ := cmd.Flags().GetString("secret-name")
+		mandatoryProperties := []string{"AccountName", "AccountKey"}
 
 		if secretName == "" {
-			accountName := util.GetFlagStringOrPrompt(cmd, "account-name")
-			accountKey := util.GetFlagStringOrPrompt(cmd, "account-key")
+			accountName := util.GetFlagStringOrPromptPassword(cmd, "account-name")
+			accountKey := util.GetFlagStringOrPromptPassword(cmd, "account-key")
 			secret.StringData["AccountName"] = accountName
 			secret.StringData["AccountKey"] = accountKey
 		} else {
-			mandatoryProperties := []string{"AccountName", "AccountKey"}
 			util.VerifyCredsInSecret(secretName, options.Namespace, mandatoryProperties)
 			secret.Name = secretName
+			secret.Namespace = options.Namespace
 		}
 
 		backStore.Spec.AzureBlob = &nbv1.AzureBlobSpec{
@@ -463,10 +746,11 @@ func RunCreateGoogleCloudStorage(cmd *cobra.Command, args []string) {
 	createCommon(cmd, args, nbv1.StoreTypeGoogleCloudStorage, func(backStore *nbv1.BackingStore, secret *corev1.Secret) {
 		targetBucket := util.GetFlagStringOrPrompt(cmd, "target-bucket")
 		secretName, _ := cmd.Flags().GetString("secret-name")
+		mandatoryProperties := []string{util.GoogleServiceAccountPrivateKeyJson}
 
 		if secretName == "" {
 			privateKeyJSONFile := util.GetFlagStringOrPrompt(cmd, "private-key-json-file")
-			bytes, err := ioutil.ReadFile(privateKeyJSONFile)
+			bytes, err := os.ReadFile(privateKeyJSONFile)
 			if err != nil {
 				log.Fatalf("Failed to read file %q: %v", privateKeyJSONFile, err)
 			}
@@ -475,11 +759,52 @@ func RunCreateGoogleCloudStorage(cmd *cobra.Command, args []string) {
 			if err != nil {
 				log.Fatalf("Failed to parse json file %q: %v", privateKeyJSONFile, err)
 			}
-			secret.StringData["GoogleServiceAccountPrivateKeyJson"] = string(bytes)
+			credentialsType, ok := privateKeyJSON["type"].(string)
+			if !ok || credentialsType != "service_account" {
+				log.Fatalf("GCP credentials JSON 'type' field must be a string with value %q", "service_account")
+			}
+			secret.StringData[util.GoogleServiceAccountPrivateKeyJson] = string(bytes)
 		} else {
-			mandatoryProperties := []string{"GoogleServiceAccountPrivateKeyJson"}
 			util.VerifyCredsInSecret(secretName, options.Namespace, mandatoryProperties)
+			util.VerifyGoogleCredentialsJSONTypeInSecret(secretName, options.Namespace, false)
 			secret.Name = secretName
+			secret.Namespace = options.Namespace
+		}
+
+		backStore.Spec.GoogleCloudStorage = &nbv1.GoogleCloudStorageSpec{
+			TargetBucket: targetBucket,
+			Secret: corev1.SecretReference{
+				Name:      secret.Name,
+				Namespace: secret.Namespace,
+			},
+		}
+	})
+}
+
+// RunCreateGoogleCloudStorageSTS runs a CLI command
+func RunCreateGoogleCloudStorageSTS(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+	createCommon(cmd, args, nbv1.StoreTypeGoogleCloudStorage, func(backStore *nbv1.BackingStore, secret *corev1.Secret) {
+		targetBucket := util.GetFlagStringOrPrompt(cmd, "target-bucket")
+		secretName, _ := cmd.Flags().GetString("secret-name")
+		mandatoryProperties := []string{util.GoogleCredentialsJson}
+
+		if secretName == "" {
+			projectNumber := util.GetFlagStringOrPrompt(cmd, "project-number")
+			poolID := util.GetFlagStringOrPrompt(cmd, "pool-id")
+			providerID := util.GetFlagStringOrPrompt(cmd, "provider-id")
+			serviceAccountEmail := util.GetFlagStringOrPrompt(cmd, "service-account-email")
+			credentialsJSON, err := util.BuildGoogleWIFCredentialsJSON(projectNumber,
+				poolID, providerID, serviceAccountEmail)
+			if err != nil {
+				log.Fatalf("Failed to build GCP WIF credentials: %v", err)
+			}
+			secret.StringData[util.GoogleCredentialsJson] = credentialsJSON
+		} else {
+			util.VerifyCredsInSecret(secretName, options.Namespace, mandatoryProperties)
+			util.VerifyGoogleCredentialsJSONTypeInSecret(secretName, options.Namespace, true)
+			secret.Name = secretName
+			secret.Namespace = options.Namespace
 		}
 
 		backStore.Spec.GoogleCloudStorage = &nbv1.GoogleCloudStorageSpec{
@@ -499,6 +824,10 @@ func RunCreatePVPool(cmd *cobra.Command, args []string) {
 		numVolumes, _ := cmd.Flags().GetUint32("num-volumes")
 		pvSizeGB, _ := cmd.Flags().GetUint32("pv-size-gb")
 		storageClass, _ := cmd.Flags().GetString("storage-class")
+		requestCPU, _ := cmd.Flags().GetString("request-cpu")
+		requestMemory, _ := cmd.Flags().GetString("request-memory")
+		limitCPU, _ := cmd.Flags().GetString("limit-cpu")
+		limitMemory, _ := cmd.Flags().GetString("limit-memory")
 		pvPoolName := args[0]
 		if len(pvPoolName) > 43 {
 			log.Fatalf(`❌ Number of characters in <backing-store-name> should not exceed 63 `)
@@ -549,13 +878,63 @@ func RunCreatePVPool(cmd *cobra.Command, args []string) {
 			}
 		}
 
+		volumeRequests := corev1.ResourceList{
+			corev1.ResourceStorage: *resource.NewQuantity(int64(pvSizeGB)*1024*1024*1024, resource.BinarySI),
+		}
+		volumeLimits := corev1.ResourceList{}
+
+		if requestCPU != "" {
+			qty, err := resource.ParseQuantity(requestCPU)
+			if err != nil {
+				log.Fatalf(`❌ Could not parse request cpu %q`, requestCPU)
+			}
+			volumeRequests[corev1.ResourceCPU] = qty
+		}
+		if requestMemory != "" {
+			qty, err := resource.ParseQuantity(requestMemory)
+			if err != nil {
+				log.Fatalf(`❌ Could not parse request memory %q`, requestMemory)
+			}
+			volumeRequests[corev1.ResourceMemory] = qty
+		}
+		if limitCPU != "" {
+			qty, err := resource.ParseQuantity(limitCPU)
+			if err != nil {
+				log.Fatalf(`❌ Could not parse limit cpu %q`, limitCPU)
+			}
+			volumeLimits[corev1.ResourceCPU] = qty
+		}
+		if limitMemory != "" {
+			qty, err := resource.ParseQuantity(limitMemory)
+			if err != nil {
+				log.Fatalf(`❌ Could not parse limit memory %q`, limitMemory)
+			}
+			volumeLimits[corev1.ResourceMemory] = qty
+		}
+
+		if reqCPU, hasReqCPU := volumeRequests[corev1.ResourceCPU]; hasReqCPU {
+			if limCPU, hasLimCPU := volumeLimits[corev1.ResourceCPU]; hasLimCPU {
+				if reqCPU.Cmp(limCPU) > 0 {
+					log.Fatalf(`❌ Request CPU %v is larger than limit CPU %v`,
+						reqCPU.String(), limCPU.String())
+				}
+			}
+		}
+		if reqMem, hasReqMem := volumeRequests[corev1.ResourceMemory]; hasReqMem {
+			if limMem, hasLimMem := volumeLimits[corev1.ResourceMemory]; hasLimMem {
+				if reqMem.Cmp(limMem) > 0 {
+					log.Fatalf(`❌ Request memory %v is larger than limit memory %v`,
+						reqMem.String(), limMem.String())
+				}
+			}
+		}
+
 		backStore.Spec.PVPool = &nbv1.PVPoolSpec{
 			StorageClass: storageClass,
 			NumVolumes:   int(numVolumes),
-			VolumeResources: &corev1.ResourceRequirements{
-				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: *resource.NewQuantity(int64(pvSizeGB)*1024*1024*1024, resource.BinarySI),
-				},
+			VolumeResources: &corev1.VolumeResourceRequirements{
+				Requests: volumeRequests,
+				Limits:   volumeLimits,
 			},
 			Secret: corev1.SecretReference{
 				Name:      secret.Name,
@@ -673,35 +1052,20 @@ func isPodinNoobaa(pod *corev1.Pod, hostsInfo *[]nb.HostInfo) bool {
 // RunStatus runs a CLI command
 func RunStatus(cmd *cobra.Command, args []string) {
 	log := util.Logger()
-
-	if len(args) != 1 || args[0] == "" {
-		log.Fatalf(`❌ Missing expected arguments: <backing-store-name> %s`, cmd.UsageString())
-	}
-
-	o := util.KubeObject(bundle.File_deploy_internal_secret_empty_yaml)
-	secret := o.(*corev1.Secret)
-	o = util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_backingstore_cr_yaml)
-	backStore := o.(*nbv1.BackingStore)
-
-	backStore.Name = args[0]
-	backStore.Namespace = options.Namespace
-	backStore.Spec = nbv1.BackingStoreSpec{}
-
-	if !util.KubeCheck(backStore) {
-		log.Fatalf(`❌ Could not get BackingStore %q in namespace %q`,
-			backStore.Name, backStore.Namespace)
-	}
-
-	secretRef := GetBackingStoreSecret(backStore)
-	if secretRef != nil {
-		secret.Name = secretRef.Name
-		secret.Namespace = secretRef.Namespace
-		if secret.Namespace == "" {
-			secret.Namespace = backStore.Namespace
-		}
-		if !util.KubeCheck(secret) {
-			log.Errorf(`❌ Could not get Secret %q in namespace %q`,
-				secret.Name, secret.Namespace)
+	backStore := GetBackingStoreFromArgs(cmd, args)
+	secret := util.KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret)
+	secretRef, _ := util.GetBackingStoreSecret(backStore)
+	if !util.IsAWSSTSClusterBS(backStore) {
+		if secretRef != nil {
+			secret.Name = secretRef.Name
+			secret.Namespace = secretRef.Namespace
+			if secret.Namespace == "" {
+				secret.Namespace = backStore.Namespace
+			}
+			if backStore.Spec.Type != nbv1.StoreTypePVPool && !util.KubeCheck(secret) {
+				log.Errorf(`❌ Could not get Secret %q in namespace %q`,
+					secret.Name, secret.Namespace)
+			}
 		}
 	}
 
@@ -713,13 +1077,30 @@ func RunStatus(cmd *cobra.Command, args []string) {
 	util.Panic(err)
 	fmt.Print(string(output))
 	fmt.Println()
-	if secretRef != nil {
-		fmt.Println("# Secret data:")
-		output, err = sigyaml.Marshal(secret.StringData)
+	if secretRef != nil && secret.Name != "" {
+		_, err = sigyaml.Marshal(secret.StringData)
 		util.Panic(err)
-		fmt.Print(string(output))
 		fmt.Println()
 	}
+}
+
+// GetBackingStoreFromArgs returns the backingstore from CLI arg
+func GetBackingStoreFromArgs(cmd *cobra.Command, args []string) *nbv1.BackingStore {
+	log := util.Logger()
+
+	if len(args) != 1 || args[0] == "" {
+		log.Fatalf(`❌ Missing expected arguments: <backing-store-name> %s`, cmd.UsageString())
+	}
+
+	backStore := util.KubeObject(bundle.File_deploy_crds_noobaa_io_v1alpha1_backingstore_cr_yaml).(*nbv1.BackingStore)
+	backStore.Name = args[0]
+	backStore.Namespace = options.Namespace
+	backStore.Spec = nbv1.BackingStoreSpec{}
+	if !util.KubeCheck(backStore) {
+		log.Fatalf(`❌ Could not get BackingStore %q in namespace %q`,
+			backStore.Name, backStore.Namespace)
+	}
+	return backStore
 }
 
 // WaitReady waits until the system phase changes to ready by the operator
@@ -727,9 +1108,9 @@ func WaitReady(backStore *nbv1.BackingStore) bool {
 	log := util.Logger()
 	klient := util.KubeClient()
 
-	intervalSec := time.Duration(3)
+	interval := time.Duration(3)
 
-	err := wait.PollImmediateInfinite(intervalSec*time.Second, func() (bool, error) {
+	err := wait.PollUntilContextCancel(ctx, interval*time.Second, true, func(ctx context.Context) (bool, error) {
 		err := klient.Get(util.Context(), util.ObjectKey(backStore), backStore)
 		if err != nil {
 			log.Printf("⏳ Failed to get BackingStore: %s", err)
@@ -800,13 +1181,16 @@ func RunList(cmd *cobra.Command, args []string) {
 	)
 	for i := range list.Items {
 		bs := &list.Items[i]
-		table.AddRow(
-			bs.Name,
-			string(bs.Spec.Type),
-			GetBackingStoreTargetBucket(bs),
-			string(bs.Status.Phase),
-			time.Since(bs.CreationTimestamp.Time).Round(time.Second).String(),
-		)
+		tb, err := util.GetBackingStoreTargetBucket(bs)
+		if err == nil {
+			table.AddRow(
+				bs.Name,
+				string(bs.Spec.Type),
+				tb,
+				string(bs.Status.Phase),
+				util.HumanizeDuration(time.Since(bs.CreationTimestamp.Time).Round(time.Second)),
+			)
+		}
 	}
 	fmt.Print(table.String())
 }
@@ -819,8 +1203,8 @@ func RunReconcile(cmd *cobra.Command, args []string) {
 	}
 	backingStoreName := args[0]
 	klient := util.KubeClient()
-	intervalSec := time.Duration(3)
-	util.Panic(wait.PollImmediateInfinite(intervalSec*time.Second, func() (bool, error) {
+	interval := time.Duration(3)
+	util.Panic(wait.PollUntilContextCancel(ctx, interval*time.Second, true, func(ctx context.Context) (bool, error) {
 		req := reconcile.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: options.Namespace,
@@ -831,48 +1215,68 @@ func RunReconcile(cmd *cobra.Command, args []string) {
 		if err != nil {
 			return false, err
 		}
-		if res.Requeue || res.RequeueAfter != 0 {
-			log.Printf("\nRetrying in %d seconds\n", intervalSec)
+		if res.RequeueAfter != 0 {
+			log.Printf("\nRetrying in %d seconds\n", interval)
 			return false, nil
 		}
 		return true, nil
 	}))
 }
 
-// GetBackingStoreSecret returns the secret reference of the backing store if it is relevant to the type
-func GetBackingStoreSecret(bs *nbv1.BackingStore) *corev1.SecretReference {
-	switch bs.Spec.Type {
-	case nbv1.StoreTypeAWSS3:
-		return &bs.Spec.AWSS3.Secret
-	case nbv1.StoreTypeS3Compatible:
-		return &bs.Spec.S3Compatible.Secret
-	case nbv1.StoreTypeIBMCos:
-		return &bs.Spec.IBMCos.Secret
-	case nbv1.StoreTypeAzureBlob:
-		return &bs.Spec.AzureBlob.Secret
-	case nbv1.StoreTypeGoogleCloudStorage:
-		return &bs.Spec.GoogleCloudStorage.Secret
-	case nbv1.StoreTypePVPool:
-		return &bs.Spec.PVPool.Secret
-	default:
+// MapSecretToBackingStores returns a list of backingstores that uses the secret in their secretReference
+// used by backingstore_controller to watch secrets changes
+func MapSecretToBackingStores(secret types.NamespacedName) []reconcile.Request {
+	log := util.Logger()
+	bsList := &nbv1.BackingStoreList{
+		TypeMeta: metav1.TypeMeta{Kind: "BackingStoreList"},
+	}
+	if !util.KubeList(bsList, &client.ListOptions{Namespace: secret.Namespace}) {
+		log.Infof("Could not found backingStores in namespace %q, while trying to find Backingstore that uses %s secret", secret.Namespace, secret.Name)
 		return nil
 	}
+
+	reqs := []reconcile.Request{}
+
+	for _, bs := range bsList.Items {
+		bsSecret, err := util.GetBackingStoreSecret(&bs)
+		if err != nil {
+			log.Error(err)
+		}
+		if bsSecret != nil && bsSecret.Name == secret.Name {
+			reqs = append(reqs, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      bs.Name,
+					Namespace: bs.Namespace,
+				},
+			})
+		}
+	}
+
+	return reqs
 }
 
-// GetBackingStoreTargetBucket returns the target bucket of the backing store if it is relevant to the type
-func GetBackingStoreTargetBucket(bs *nbv1.BackingStore) string {
-	switch bs.Spec.Type {
-	case nbv1.StoreTypeAWSS3:
-		return bs.Spec.AWSS3.TargetBucket
-	case nbv1.StoreTypeS3Compatible:
-		return bs.Spec.S3Compatible.TargetBucket
-	case nbv1.StoreTypeIBMCos:
-		return bs.Spec.IBMCos.TargetBucket
-	case nbv1.StoreTypeAzureBlob:
-		return bs.Spec.AzureBlob.TargetBlobContainer
-	case nbv1.StoreTypeGoogleCloudStorage:
-		return bs.Spec.GoogleCloudStorage.TargetBucket
-	default:
-		return ""
+// MapNoobaaToBackingStores returns a list of backingstores that are inside Noobaa system
+// used by backingstore_controller to watch Noobaa CR changes
+func MapNoobaaToBackingStores(noobaa types.NamespacedName) []reconcile.Request {
+	log := util.Logger()
+	bsList := &nbv1.BackingStoreList{
+		TypeMeta: metav1.TypeMeta{Kind: "BackingStoreList"},
 	}
+	if !util.KubeList(bsList, &client.ListOptions{Namespace: noobaa.Namespace}) {
+		log.Infof("Could not found backingStores in namespace %q, while trying to find Backingstore that inside %s Noobaa system", noobaa.Namespace, noobaa.Name)
+		return nil
+	}
+
+	reqs := []reconcile.Request{}
+
+	for _, bs := range bsList.Items {
+		reqs = append(reqs, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      bs.Name,
+				Namespace: bs.Namespace,
+			},
+		})
+	}
+
+	return reqs
 }
