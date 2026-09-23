@@ -3,7 +3,7 @@ package nb
 import (
 	"bytes"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -45,7 +45,7 @@ func (c *RPCConnHTTP) Call(req *RPCMessage, res RPCResponse) error {
 	httpResponse, err := c.RPC.HTTPClient.Do(httpRequest)
 	defer func() {
 		if httpResponse != nil && httpResponse.Body != nil {
-			httpResponse.Body.Close()
+			util.SafeClose(httpResponse.Body, "Failed to close HTTP response body")
 		}
 	}()
 	if err != nil {
@@ -57,7 +57,7 @@ func (c *RPCConnHTTP) Call(req *RPCMessage, res RPCResponse) error {
 		return err
 	}
 
-	resBytes, err := ioutil.ReadAll(httpResponse.Body)
+	resBytes, err := io.ReadAll(httpResponse.Body)
 	if err != nil {
 		return err
 	}

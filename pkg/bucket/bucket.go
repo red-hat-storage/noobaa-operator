@@ -2,13 +2,18 @@ package bucket
 
 import (
 	"fmt"
-	"log"
+	"os"
+	"strconv"
 
+	nbv1 "github.com/noobaa/noobaa-operator/v5/pkg/apis/noobaa/v1alpha1"
+	"github.com/noobaa/noobaa-operator/v5/pkg/bucketclass"
 	"github.com/noobaa/noobaa-operator/v5/pkg/nb"
+	"github.com/noobaa/noobaa-operator/v5/pkg/options"
 	"github.com/noobaa/noobaa-operator/v5/pkg/system"
 	"github.com/noobaa/noobaa-operator/v5/pkg/util"
-
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // Cmd returns a CLI command
@@ -19,6 +24,7 @@ func Cmd() *cobra.Command {
 	}
 	cmd.AddCommand(
 		CmdCreate(),
+		CmdUpdate(),
 		CmdDelete(),
 		CmdStatus(),
 		CmdList(),
@@ -33,6 +39,30 @@ func CmdCreate() *cobra.Command {
 		Short: "Create a NooBaa bucket",
 		Run:   RunCreate,
 	}
+	cmd.Flags().Bool("force_md5_etag", false, "This flag enables md5 etag calculation for bucket")
+	cmd.Flags().String("max-objects", "",
+		"Set quota max objects quantity config to requested bucket")
+	cmd.Flags().String("max-size", "",
+		"Set quota max size config to requested bucket")
+	return cmd
+}
+
+// CmdUpdate returns a CLI command
+func CmdUpdate() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "update <bucket-name>",
+		Short: "Update a NooBaa bucket",
+		Run:   RunUpdate,
+	}
+	cmd.Flags().Bool("force_md5_etag", false, "This flag enables md5 etag calculation for bucket")
+	cmd.Flags().String("max-objects", "",
+		"Set quota max objects quantity config to requested bucket")
+	cmd.Flags().String("max-size", "",
+		"Set quota max size config to requested bucket")
+	cmd.Flags().String("deep-archive-resource", "",
+		"Set or update the deep archive NamespaceStore resource for the bucket's archive policy")
+	cmd.Flags().Bool("remove-archive-policy", false,
+		"Remove the archive policy from the bucket")
 	return cmd
 }
 
@@ -62,11 +92,12 @@ func CmdList() *cobra.Command {
 		Use:   "list",
 		Short: "List NooBaa buckets",
 		Run:   RunList,
+		Args:  cobra.NoArgs,
 	}
 	return cmd
 }
 
-// RunCreate runs a CLI command
+// RunCreate runs a CLI command. The default backingstore will be used as the underlying storage for buckets created using the CLI
 func RunCreate(cmd *cobra.Command, args []string) {
 	log := util.Logger()
 	if len(args) != 1 || args[0] == "" {
@@ -74,10 +105,120 @@ func RunCreate(cmd *cobra.Command, args []string) {
 	}
 	bucketName := args[0]
 	nbClient := system.GetNBClient()
-	err := nbClient.CreateBucketAPI(nb.CreateBucketParams{Name: bucketName})
+
+	bucketClass, err := bucketclass.GetDefaultBucketClass(options.Namespace)
+	if err != nil {
+		log.Fatal(fmt.Errorf("Failed to get default bucketclass with error: %v", err))
+	}
+
+	tierName, err := bucketclass.CreateTieringStructure(*bucketClass.Spec.PlacementPolicy, bucketName, nbClient)
+	if err != nil {
+		log.Fatal(fmt.Errorf("CreateTieringStructure for PlacementPolicy failed to create policy %q with error: %v", tierName, err))
+	}
+
+	forceMd5EtagPtr, err := util.GetBoolFlagPtr(cmd, "force_md5_etag")
 	if err != nil {
 		log.Fatal(err)
 	}
+	maxSize, _ := cmd.Flags().GetString("max-size")
+	maxObjects, _ := cmd.Flags().GetString("max-objects")
+
+	quota, err := prepareQuotaConfig(bucketName, maxSize, maxObjects)
+	if err != nil {
+		log.Fatalf(`❌ Could not create bucket "%q" quota validation failed %q`, bucketName, err)
+	}
+
+	err = nbClient.CreateBucketAPI(nb.CreateBucketParams{Name: bucketName, Tiering: tierName, ForceMd5Etag: forceMd5EtagPtr})
+	if err != nil {
+		log.Fatal(err)
+	}
+	// calling updateBucketAPI to update quota for bucket
+	err = nbClient.UpdateBucketAPI(nb.CreateBucketParams{Name: bucketName, Quota: &quota})
+	if err != nil {
+		log.Fatal(err)
+	}
+	nb.WarnIfQuotaCappedByFree(bucketName, nil, nbClient, &quota, func(format string, args ...interface{}) {
+		fmt.Fprintf(os.Stderr, "Warning: "+format+"\n", args...)
+	})
+}
+
+// RunUpdate runs a CLI command
+func RunUpdate(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+	if len(args) != 1 || args[0] == "" {
+		log.Fatalf(`Missing expected arguments: <bucket-name> %s`, cmd.UsageString())
+	}
+	bucketName := args[0]
+	nbClient := system.GetNBClient()
+	forceMd5EtagPtr, err := util.GetBoolFlagPtr(cmd, "force_md5_etag")
+	if err != nil {
+		log.Fatal(err)
+	}
+	maxSize, _ := cmd.Flags().GetString("max-size")
+	maxObjects, _ := cmd.Flags().GetString("max-objects")
+	deepArchiveResource, _ := cmd.Flags().GetString("deep-archive-resource")
+	removeArchivePolicy, _ := cmd.Flags().GetBool("remove-archive-policy")
+
+	if deepArchiveResource != "" && removeArchivePolicy {
+		log.Fatalf(`❌ Cannot use both --deep-archive-resource and --remove-archive-policy`)
+	}
+
+	updateParams := nb.CreateBucketParams{
+		Name:         bucketName,
+		ForceMd5Etag: forceMd5EtagPtr,
+	}
+
+	needBucketRead := maxSize != "" || maxObjects != ""
+	var bucketInfo nb.BucketInfo
+	if needBucketRead {
+		bucketInfo, err = nbClient.ReadBucketAPI(nb.ReadBucketParams{Name: bucketName})
+		if err != nil {
+			log.Fatalf(`❌ Could not read bucket %q: %v`, bucketName, err)
+		}
+	}
+
+	if maxSize != "" || maxObjects != "" {
+		quota, err := mergeQuotaForUpdate(bucketInfo.Quota, bucketName, maxSize, maxObjects)
+		if err != nil {
+			log.Fatalf(`❌ Could not update bucket "%q" quota validation failed %q`, bucketName, err)
+		}
+		if err := nb.ValidateQuotaAgainstBucketUsage(&bucketInfo, &quota); err != nil {
+			log.Fatalf(`❌ Could not update bucket "%q" quota validation failed %v`, bucketName, err)
+		}
+		updateParams.Quota = &quota
+	}
+
+	if deepArchiveResource != "" {
+		ns := &nbv1.NamespaceStore{
+			TypeMeta:   metav1.TypeMeta{Kind: "NamespaceStore"},
+			ObjectMeta: metav1.ObjectMeta{Name: deepArchiveResource, Namespace: options.Namespace},
+		}
+		if !util.KubeCheck(ns) {
+			log.Fatalf(`❌ Could not update bucket %q archive policy: NamespaceStore %q not found in namespace %q`,
+				bucketName, deepArchiveResource, options.Namespace)
+		}
+		if !util.IsArchiveNamespaceStore(ns) {
+			log.Fatalf(`❌ Could not update bucket %q archive policy: NamespaceStore %q must have spec.archive=true`,
+				bucketName, deepArchiveResource)
+		}
+		updateParams.ArchivePolicy = &nb.ArchivePolicyConfig{
+			DeepArchiveResource: &nb.NamespaceResourceFullConfig{
+				Resource: deepArchiveResource,
+			},
+		}
+	}
+
+	if removeArchivePolicy {
+		updateParams.RemoveArchivePolicy = true
+	}
+
+	err = nbClient.UpdateBucketAPI(updateParams)
+	if err != nil {
+		log.Fatal(err)
+	}
+	nb.WarnIfQuotaCappedByFree(bucketName, nil, nbClient, updateParams.Quota, func(format string, args ...interface{}) {
+		fmt.Fprintf(os.Stderr, "Warning: "+format+"\n", args...)
+	})
 }
 
 // RunDelete runs a CLI command
@@ -116,28 +257,49 @@ func RunStatus(cmd *cobra.Command, args []string) {
 	}
 	fmt.Printf("  %-22s : %s\n", "Type", b.BucketType)
 	fmt.Printf("  %-22s : %s\n", "Mode", b.Mode)
+	if b.ForceMd5Etag != nil {
+		fmt.Printf("  %-22s : %t\n", "Force Md5 Etag", *b.ForceMd5Etag)
+	}
 	if b.PolicyModes != nil {
 		fmt.Printf("  %-22s : %s\n", "ResiliencyStatus", b.PolicyModes.ResiliencyStatus)
 		fmt.Printf("  %-22s : %s\n", "QuotaStatus", b.PolicyModes.QuotaStatus)
+	}
+	if b.ArchivePolicy != nil && b.ArchivePolicy.DeepArchiveResource != nil {
+		fmt.Printf("  %-22s : %s\n", "Archive Resource", b.ArchivePolicy.DeepArchiveResource.Resource)
+		if b.ArchivePolicy.DeepArchiveResource.Path != "" {
+			fmt.Printf("  %-22s : %s\n", "Archive Path", b.ArchivePolicy.DeepArchiveResource.Path)
+		}
 	}
 	if b.Undeletable != "" {
 		fmt.Printf("  %-22s : %s\n", "Undeletable", b.Undeletable)
 	}
 	if b.NumObjects != nil {
-		fmt.Printf("  %-22s : %d\n", "Num Objects", b.NumObjects.Value)
+		if b.BucketType == "NAMESPACE" {
+			fmt.Printf("  %-22s : N/A\n", "Num Objects")
+		} else {
+			fmt.Printf("  %-22s : %d\n", "Num Objects", b.NumObjects.Value)
+		}
 	}
 	if b.DataCapacity != nil {
-		fmt.Printf("  %-22s : %s\n", "Data Size", nb.BigIntToHumanBytes(b.DataCapacity.Size))
-		fmt.Printf("  %-22s : %s\n", "Data Size Reduced", nb.BigIntToHumanBytes(b.DataCapacity.SizeReduced))
-		fmt.Printf("  %-22s : %s\n", "Data Space Avail", nb.BigIntToHumanBytes(b.DataCapacity.AvailableToUpload))
+		if b.BucketType == "NAMESPACE" {
+			fmt.Printf("  %-22s : N/A\n", "Data Size")
+			fmt.Printf("  %-22s : N/A\n", "Data Size Reduced")
+			fmt.Printf("  %-22s : N/A\n", "Data Space Avail")
+		} else {
+			fmt.Printf("  %-22s : %s\n", "Data Size", nb.BigIntToHumanBytes(b.DataCapacity.Size))
+			fmt.Printf("  %-22s : %s\n", "Data Size Reduced", nb.BigIntToHumanBytes(b.DataCapacity.SizeReduced))
+			fmt.Printf("  %-22s : %s\n", "Data Space Avail", nb.BigIntToNonNegativeHumanBytes(b.DataCapacity.AvailableSizeToUpload))
+			fmt.Printf("  %-22s : %s\n", "Num Objects Avail", nb.BigIntToNonNegativeString(b.DataCapacity.AvailableQuantityToUpload))
+		}
 	}
 	fmt.Printf("\n")
 }
 
 // RunList runs a CLI command
 func RunList(cmd *cobra.Command, args []string) {
+	log := util.Logger()
 	nbClient := system.GetNBClient()
-	list, err := nbClient.ListBucketsAPI()
+	list, err := nbClient.ListBucketsAPI(nb.ListBucketsParams{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -153,4 +315,76 @@ func RunList(cmd *cobra.Command, args []string) {
 	fmt.Printf("\n")
 	fmt.Print(table.String())
 	fmt.Printf("\n")
+}
+
+func prepareQuotaConfig(bucketName string, maxSize string, maxObjects string) (nb.QuotaConfig, error) {
+	var bucketMaxSize, bucketMaxObjects int64
+	quota := nb.QuotaConfig{}
+
+	// validate quota config for bucket
+	if err := util.ValidateQuotaConfig(bucketName, maxSize, maxObjects); err != nil {
+		return quota, err
+	}
+
+	if maxSize != "" {
+		quantity, _ := resource.ParseQuantity(maxSize)
+		bucketMaxSize = quantity.Value()
+		if bucketMaxSize > 0 {
+			f, u := nb.GetBytesAndUnits(bucketMaxSize, 2)
+			quota.Size = &nb.SizeQuotaConfig{Value: f, Unit: u}
+		}
+	}
+	if maxObjects != "" {
+		bucketMaxObjects, _ = strconv.ParseInt(maxObjects, 10, 64)
+		if bucketMaxObjects > 0 {
+			quota.Quantity = &nb.QuantityQuotaConfig{Value: int(bucketMaxObjects)}
+		}
+	}
+
+	return quota, nil
+}
+
+// mergeQuotaForUpdate applies CLI quota flags on top of the quota returned by read_bucket.
+func mergeQuotaForUpdate(existing *nb.QuotaConfig, bucketName string, maxSize string, maxObjects string) (mergedQuota nb.QuotaConfig, err error) {
+	if err := util.ValidateQuotaConfig(bucketName, maxSize, maxObjects); err != nil {
+		return mergedQuota, err
+	}
+	if existing != nil {
+		if existing.Size != nil {
+			mergedQuota.Size = &nb.SizeQuotaConfig{
+				Value: existing.Size.Value,
+				Unit:  existing.Size.Unit,
+			}
+		}
+		if existing.Quantity != nil {
+			mergedQuota.Quantity = &nb.QuantityQuotaConfig{
+				Value: existing.Quantity.Value,
+			}
+		}
+	}
+	if maxSize != "" {
+		quantity, parseErr := resource.ParseQuantity(maxSize)
+		if parseErr != nil {
+			return mergedQuota, parseErr
+		}
+		sizeBytes := quantity.Value()
+		if sizeBytes > 0 {
+			f, u := nb.GetBytesAndUnits(sizeBytes, 2)
+			mergedQuota.Size = &nb.SizeQuotaConfig{Value: f, Unit: u}
+		} else {
+			mergedQuota.Size = nil
+		}
+	}
+	if maxObjects != "" {
+		bucketMaxObjects, parseErr := strconv.ParseInt(maxObjects, 10, 32)
+		if parseErr != nil {
+			return mergedQuota, parseErr
+		}
+		if bucketMaxObjects > 0 {
+			mergedQuota.Quantity = &nb.QuantityQuotaConfig{Value: int(bucketMaxObjects)}
+		} else {
+			mergedQuota.Quantity = nil
+		}
+	}
+	return mergedQuota, nil
 }

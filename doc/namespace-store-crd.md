@@ -1,25 +1,35 @@
 [NooBaa Operator](../README.md) /
 # NamespaceStore CRD
+The NamespaceStore CRD represents a storage target to be used as underlying storage for the data in NooBaa buckets (i.e. the buckets that are created by using the product)
+These storage targets are used to store and read plain data.
+NamespaceStores are referred to by name when defining [a BucketClass](bucket-class-crd.md).
 
-NamespaceStore CRD represents an underlying storage to be used as read or write target for the data in NooBaa 
-namespace buckets.
-These storage targets are used to store plain data.
-Namespace-Store are referred to by name when defining [BucketClass](bucket-class-crd.md).
-Multiple types of Namespace-Store are currently supported: aws-s3, s3-compatible, ibm-cos, azure-blob.
+Supported NamespaceStore types:
+- aws-s3
+- s3-compatible
+- ibm-cos
+- google-cloud-storage
+- azure-blob
+- azure-sts-blob
 
 # Definitions
+- CRD: [noobaa.io_NamespaceStores_crd.yaml](../deploy/crds/noobaa.io_namespacestores_crd.yaml)
+- CR: [noobaa.io_v1alpha1_NamespaceStore_cr.yaml](../deploy/crds/noobaa.io_v1alpha1_namespacestore_cr.yaml)
 
-- CRD: [noobaa.io_NamespaceStores_crd.yaml](../deploy/crds/noobaa.io_NamespaceStores_crd.yaml)
-- CR: [noobaa.io_v1alpha1_NamespaceStore_cr.yaml](../deploy/crds/noobaa.io_v1alpha1_NamespaceStore_cr.yaml)
 
+# Reconciliation
+It is possible to create namespace stores by using the NooBaa CLI tool (from here on referred to in shell commands as `noobaa`), or by applying YAMLs.
 
-# Reconcile
+From here on out, fields that depend on the user's choice and input will be marked with `<>`. In cases where the value might not be inferrable from context, an additional explanation might be included.
+Note that the commands will apply to the namespace that's currently active (can be checked with `kubectl config current-context`). A command-specific namespace can be set by adding the `-n <NAMESPACE>` flag.
+Also note that, if possible and applicable, omitting the `access-key` and `secret-key` flags is recommended in order to avoid leakage of secrets. When both flags are ommitted, the CLI will prompt the user to enter the keys interactively.
 
-#### AWS-S3 type
+If you choose to use the CLI's `--secret-name` option, or to apply a YAML, please see [Store Secret Creation](store-connection-secrets.md).
 
-Create a cloud resource within the NooBaa brain and use S3 API for reading or writing data in the AWS cloud.
+## AWS S3
+Uses the S3 API for IO operations on plain data in AWS buckets
 ```shell
-noobaa -n noobaa namespacestore create aws-s3 bs --access-key KEY --secret-key SECRET --target-bucket BUCKET
+noobaa namespacestore create aws-s3 <NAMESPACESTORE NAME> --access-key <> --secret-key <> --target-bucket <>
 ```
 ```yaml
 apiVersion: noobaa.io/v1alpha1
@@ -27,24 +37,27 @@ kind: NamespaceStore
 metadata:
   finalizers:
   - noobaa.io/finalizer
-  labels:
-    app: noobaa
-  name: bs
-  namespace: noobaa
+  name: <>
+  namespace: <>
 spec:
   awsS3:
     secret:
-      name: namespace-store-aws-s3-bs
-      namespace: noobaa
-    targetBucket: BUCKET
+      name: <>
+      namespace: <>
+    targetBucket: <>
   type: aws-s3
 ```
 
-#### S3-COMPATIBLE type
+## AWS-S3 Security Token Service (STS)
+Simlarly to `AWS-S3` this namespacestore uses the S3 API for storing plain data in AWS buckets.
+However, the difference between the two namespacestore types lies in the authentication method. AWS S3 uses a pair of static, user-provided access keys, while AWS S3 STS uses an Amazon Resource Name (ARN) provided by the user to create credentials for every single interaction with AWS by utilizing [AssumeRuleWithWebIdentity](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html).
+This type of namespacestore is useful in cases where the user wishes to limit access to their AWS cloud for a specific amount of time, and for easier management of the cloud's security.
 
-Create a cloud resource within the NooBaa brain and use S3 API for reading or writing data in any S3 API compatible endpoint.
+Prior to using this namespacestore, an OpenIDConnect provider needs to be set up, which is outside the scope of these docs.
+
+Please note that once the set session duration expires, the namespacestore will no longer work, and writing and reading data will not be possible any longer, without editing the namespacestore YAML and replacing the ARN manually.
 ```shell
-noobaa -n noobaa namespacestore create s3-compatible bs --endpoint ENDPOINT --signature-version v4 --access-key KEY --secret-key SECRET --target-bucket BUCKET
+noobaa namespacestore create aws-sts-s3 <NAMESPACESTORE NAME> --target-bucket <> --aws-sts-arn <>
 ```
 ```yaml
 apiVersion: noobaa.io/v1alpha1
@@ -52,26 +65,77 @@ kind: NamespaceStore
 metadata:
   finalizers:
   - noobaa.io/finalizer
-  labels:
-    app: noobaa
-  name: bs
-  namespace: noobaa
+  name: <>
+  namespace: <>
+spec:
+  awsS3:
+    awsSTSRoleARN: <>
+    targetBucket: <>
+    secret:
+      name: <>
+      namespace: <>
+  type: aws-s3
+```
+
+## S3 Compatible
+Uses the S3 API for IO operations on plain data in buckets that can be interacted with via an S3-compatible API
+```shell
+noobaa namespacestore create s3-compatible <NAMESPACESTORE NAME> --endpoint <> --signature-version <> --access-key <> --secret-key <> --target-bucket <>
+```
+```yaml
+apiVersion: noobaa.io/v1alpha1
+kind: NamespaceStore
+metadata:
+  finalizers:
+  - noobaa.io/finalizer
+  name: <>
+  namespace: <>
 spec:
   s3Compatible:
-    endpoint: ENDPOINT
+    endpoint: <>
     secret:
-      name: namespace-store-s3-compatible-bs
-      namespace: noobaa
-    signatureVersion: v4
-    targetBucket: BUCKET
+      name: <>
+      namespace: <>
+    signatureVersion: <>
+    targetBucket: <>
   type: s3-compatible
 ```
 
-#### IBM-COS type
+### S3 Compatible - Deep Archive
+Uses an S3-compatible API to write objects directly to a tape-based cold storage endpoint (e.g. IBM Deep Archive).
+This store type is intended for S3-compatible long-term archive where data is written once and read infrequently.
 
-Create a cloud resource within the NooBaa brain and use IBM COS API for reading or writing data in any IBM COS API compatible endpoint.
+`archive: true` - A flag that indicates the endpoint is a tape-based or cold-storage target (e.g. IBM Deep Archive).
+Archive stores can only be referenced via `archivePolicy` in a BucketClass; they cannot be used inside a `namespacePolicy`.
+
 ```shell
-noobaa -n noobaa namespacestore create ibm-cos bs --endpoint ENDPOINT --access-key KEY --secret-key SECRET --target-bucket BUCKET
+noobaa namespacestore create s3-compatible <NAMESPACESTORE NAME> --archive \
+  --endpoint <> --target-bucket <> --access-key <> --secret-key <> 
+```
+
+```yaml
+apiVersion: noobaa.io/v1alpha1
+kind: NamespaceStore
+metadata:
+  finalizers:
+  - noobaa.io/finalizer
+  name: <>
+  namespace: <>
+spec:
+  archive: true
+  s3Compatible:
+    endpoint: <>
+    secret:
+      name: <>
+      namespace: <>
+    targetBucket: <>
+  type: s3-compatible
+```
+
+## IBM COS
+Uses the IBM COS API for IO operations on plain data in IBM COS buckets
+```shell
+noobaa namespacestore create ibm-cos bs --endpoint <> --access-key <> --secret-key <> --target-bucket <>
 ```
 ```yaml
 apiVersion: noobaa.io/v1alpha1
@@ -79,26 +143,23 @@ kind: NamespaceStore
 metadata:
   finalizers:
   - noobaa.io/finalizer
-  labels:
-    app: noobaa
-  name: bs
-  namespace: noobaa
+  name: <>
+  namespace: <>
 spec:
   s3Compatible:
-    endpoint: ENDPOINT
+    endpoint: <>
     secret:
-      name: namespace-store-ibm-cos-bs
-      namespace: noobaa
-    signatureVersion: v2
-    targetBucket: BUCKET
+      name: <>
+      namespace: <>
+    signatureVersion: <>
+    targetBucket: <>
   type: ibm-cos
 ```
 
-#### AZURE-BLOB type
-
-Create a cloud resource within the NooBaa brain and use BLOB API for reading or writing data in Azure cloud.
+## Google Cloud Storage
+Uses the Google Cloud Storage API for IO operations on plain data in Google Cloud buckets
 ```shell
-noobaa -n noobaa namespacestore create azure-blob bs --account-key KEY --account-name NAME --target-blob-container CONTAINER
+noobaa namespacestore create google-cloud-storage <NAMESPACESTORE NAME> --private-key-json-file <PATH TO credentials.json> --target-bucket <>
 ```
 ```yaml
 apiVersion: noobaa.io/v1alpha1
@@ -106,27 +167,133 @@ kind: NamespaceStore
 metadata:
   finalizers:
   - noobaa.io/finalizer
-  labels:
-    app: noobaa
-  name: bs
-  namespace: noobaa
+  name: <>
+  namespace: <>
+spec:
+  googleCloudStorage:
+    secret:
+      name: <>
+      namespace: <>
+    targetBucket: <>
+  type: google-cloud-storage
+```
+
+## Azure Blob Storage
+Uses the Azure Blob API for IO operations on plain data in an Azure container
+```shell
+noobaa namespacestore create azure-blob <NAMESPACESTORE NAME> --account-key <> --account-name <> --target-blob-container <>
+```
+```yaml
+apiVersion: noobaa.io/v1alpha1
+kind: NamespaceStore
+metadata:
+  finalizers:
+  - noobaa.io/finalizer
+  name: <>
+  namespace: <>
 spec:
   azureBlob:
     secret:
-      name: namespace-store-azure-blob-bs
-      namespace: noobaa
-    targetBlobContainer: CONTAINER
+      name: <>
+      namespace: <>
+    targetBlobContainer: <>
   type: azure-blob
 ```
 
-#### Credentials change
+## Azure Blob Security Token Service (STS)
+Similarly to `Azure Blob`, this namespacestore uses the Azure Blob API for storing plain data in Azure containers.
+However, the difference between the two namespacestore types lies in the authentication method. Azure Blob uses a pair of static, user-provided account keys, while Azure Blob STS uses Azure Workload Identity with a Client ID and Tenant ID to obtain short-lived access tokens for every interaction with Azure by utilizing [Azure Workload Identity](https://azure.github.io/azure-workload-identity/).
+This type of namespacestore is useful in cases where the user wishes to use short-lived credentials instead of long-lived storage account keys, and for easier management of the cloud's security.
 
-In case the credentials of a Namespace-store need to be updated due to periodic security policy or concern, the appropriate secret should be updated by the user, and the operator will be responsible for watching changes in those secrets and propagating the new credential update to the NooBaa system server.
+Prior to using this namespacestore, Azure Workload Identity needs to be set up on the AKS cluster, which is outside the scope of these docs.
+
+```shell
+noobaa namespacestore create azure-sts-blob <NAMESPACESTORE NAME> --account-name <> --target-blob-container <> --tenant-id <> --client-id <>
+```
+```yaml
+apiVersion: noobaa.io/v1alpha1
+kind: NamespaceStore
+metadata:
+  finalizers:
+  - noobaa.io/finalizer
+  name: <>
+  namespace: <>
+spec:
+  azureBlob:
+    clientId: <>
+    targetBlobContainer: <>
+    secret:
+      name: <>
+      namespace: <>
+  type: azure-blob
+```
+The secret must contain the following keys: `AccountName`, `azure_tenant_id`, and `azure_client_id`.
+
+## Examples
+### AWS S3
+Note that the keys below are example keys from the AWS documentation, and will not work.
+```shell
+noobaa namespacestore create aws-s3 aws-namespacestore --access-key EXAMPLEAKIAIOSFODNN7 --secret-key EXAMPLEKEYwJalrXUtnFEMI/K7MDENG/bPxRfiCY --target-bucket personal-bucket
+```
+```yaml
+apiVersion: noobaa.io/v1alpha1
+kind: NamespaceStore
+metadata:
+  finalizers:
+  - noobaa.io/finalizer
+  name: aws-namespacestore
+  namespace: app-namespace
+spec:
+  awsS3:
+    secret:
+      name: user-created-aws-s3-secret
+      namespace: secret-namespace
+    targetBucket: personal-bucket
+  type: aws-s3
+```
+
+### Azure STS Blob
+Note that the secret referenced below must contain `AccountName`, `azure_tenant_id`, and `azure_client_id`. When using the CLI, these are populated automatically from the provided flags.
+```shell
+noobaa namespacestore create azure-sts-blob azure-sts-namespacestore --account-name azureSTSAccount --target-blob-container azure-sts-ns --client-id 8feb6304-7cee-40ea-b501-ef0d08520874 --tenant-id 486b6304-7cee-40qw-n507-hy7d520123
+```
+```yaml
+apiVersion: noobaa.io/v1alpha1
+kind: NamespaceStore
+metadata:
+  finalizers:
+  - noobaa.io/finalizer
+  name: azure-sts-namespacestore
+  namespace: app-namespace
+spec:
+  azureBlob:
+    clientId: 8feb6304-7cee-40ea-b501-ef0d08520874
+    targetBlobContainer: azure-sts-ns
+    secret:
+      name: noobaa-azure-container-creds
+      namespace: noobaa
+  type: azure-blob
+```
+The secret `noobaa-azure-container-creds` should look like:
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: noobaa-azure-container-creds
+  namespace: noobaa
+type: Opaque
+stringData:
+  AccountName: azureSTSAccount
+  azure_tenant_id: 486b6304-7cee-40qw-n507-hy7d520123
+  azure_client_id: 8feb6304-7cee-40ea-b501-ef0d08520874
+```
+
+## Modifying a Namespace Store's Credentials
+If a user wishes to change a namespace store's credentials, the appropriate secret custom resource should be edited and updated by the user, and the operator will be propagate the new credentials to the system server.
 
 
-# Read Status
-
-Here is an example of healthy status (see below an example of non-healthy status):
+# Resource Status
+Below is an example of a healthy namespace store's status:
 
 ```yaml
 apiVersion: noobaa.io/v1alpha1
@@ -162,20 +329,20 @@ status:
     reason: NamespaceStorePhaseReady
     status: "True"
     type: Upgradeable
+    mode:
+      modeCode: OPTIMAL
+      ...
   phase: Ready
 ```
 
 
-# Delete
+# Deletion
+Namespace stores are used for data persistency; therefore, a cleanup process must run before they may be deleted.
+The operator will use [the `finalizer` pattern](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/#finalizers), and set a finalizer on every namespace store to mark that external cleanup is needed before it can be deleted.
 
-Namespace-Store is used for data persistency, therefore there is a cleanup process before they can be deleted.
-The operator will use the `finalizer` pattern as explained in the link below, and set a finalizer on every Namespace-store to mark that external cleanup is needed before it can be deleted:
+After marking a namespace store for deletion, the operator will notify the NooBaa server of the deletion, which will enter a *decommissioning* state, in which NooBaa will attempt to rebuild the data to a new namespace store location. Once the decommissioning process completes the operator will remove the finalizer and allow the CR to be deleted.
 
-https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/#finalizers
-
-After marking a Namespace-store for deletion, the operator will notify the NooBaa server on the deletion which will enter a *decommissioning* state, in which NooBaa will attempt to rebuild the data to a new Namespace-store location. Once the decommissioning process completes the operator will remove the finalizer and allow the CR to be deleted.
-
-There are cases where the decommissioning cannot complete due to the inability to read the data from the Namespace-store that is already not serving - for example, if the target bucket was already deleted or the credentials were invalidated or there is no network from the system to the Namespace-store service. In such cases the system status will be used to report these issues and suggest a manual resolution for example:
+There are cases where the decommissioning cannot be completed due to an inability to read the data from the namespace store. For example, in cases where the target bucket was already deleted, the credentials were invalidated, or the system cannot connect to the target storage. In these cases the system status will be used to report the issue and suggest a manual resolution. For example, this unhealthy namespacestore:
 
 ```yaml
 apiVersion: noobaa.io/v1alpha1

@@ -8,9 +8,11 @@ import (
 
 	nbv1 "github.com/noobaa/noobaa-operator/v5/pkg/apis/noobaa/v1alpha1"
 	"github.com/noobaa/noobaa-operator/v5/pkg/nb"
+	"github.com/noobaa/noobaa-operator/v5/pkg/util"
 	routev1 "github.com/openshift/api/route/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -26,11 +28,23 @@ func (r *Reconciler) ReconcilePhaseConnecting() error {
 	if r.JoinSecret == nil {
 		r.CheckServiceStatus(r.ServiceMgmt, r.RouteMgmt, &r.NooBaa.Status.Services.ServiceMgmt, "mgmt-https")
 	}
+
+	// wait for at least one ready core pod (HA: only the leader becomes Ready; standbys stay not Ready)
+	if r.CoreApp.Spec.Replicas == nil {
+		return fmt.Errorf("noobaa core statefulset replicas is nil, cannot proceed")
+	} else if r.CoreApp.Status.ReadyReplicas < 1 {
+		return fmt.Errorf("waiting for noobaa core pod to be ready, currently ready replicas: %d, expected: at least 1 (%d configured)",
+			r.CoreApp.Status.ReadyReplicas, *r.CoreApp.Spec.Replicas)
+	}
+
 	if err := r.InitNBClient(); err != nil {
 		return err
 	}
 
 	r.CheckServiceStatus(r.ServiceS3, r.RouteS3, &r.NooBaa.Status.Services.ServiceS3, "s3-https")
+	r.CheckServiceStatus(r.ServiceSts, r.RouteSts, &r.NooBaa.Status.Services.ServiceSts, "sts-https")
+	r.CheckServiceStatus(r.ServiceIam, r.RouteIam, &r.NooBaa.Status.Services.ServiceIam, "iam-https")
+	r.CheckServiceStatus(r.ServiceVectors, r.RouteVectors, &r.NooBaa.Status.Services.ServiceVectors, "vectors-https")
 
 	return nil
 
@@ -71,14 +85,19 @@ func (r *Reconciler) CheckServiceStatus(srv *corev1.Service, route *routev1.Rout
 				if pod.Status.HostIP != "" {
 					status.NodePorts = append(
 						status.NodePorts,
-						fmt.Sprintf("%s://%s:%d", proto, pod.Status.HostIP, servicePort.NodePort),
+						util.GetFormattedEndpoint(proto, pod.Status.HostIP, servicePort.NodePort),
 					)
 				}
 				if pod.Status.PodIP != "" {
-					status.PodPorts = append(
-						status.PodPorts,
-						fmt.Sprintf("%s://%s:%s", proto, pod.Status.PodIP, servicePort.TargetPort.String()),
-					)
+					portNumber, ok := podTargetPortNumber(&pod, servicePort.TargetPort)
+					if ok {
+						status.PodPorts = append(
+							status.PodPorts,
+							util.GetFormattedEndpoint(proto, pod.Status.PodIP, portNumber),
+						)
+					} else {
+						log.Warnf("Could not resolve target port %q for pod %s", servicePort.TargetPort.String(), pod.Name)
+					}
 				}
 			}
 		}
@@ -88,7 +107,7 @@ func (r *Reconciler) CheckServiceStatus(srv *corev1.Service, route *routev1.Rout
 	if srv.Spec.ClusterIP != "" {
 		status.InternalIP = append(
 			status.InternalIP,
-			fmt.Sprintf("%s://%s:%d", proto, srv.Spec.ClusterIP, servicePort.Port),
+			util.GetFormattedEndpoint(proto, srv.Spec.ClusterIP, servicePort.Port),
 		)
 		status.InternalDNS = append(
 			status.InternalDNS,
@@ -100,7 +119,7 @@ func (r *Reconciler) CheckServiceStatus(srv *corev1.Service, route *routev1.Rout
 	if route.Spec.Host != "" {
 		status.ExternalDNS = append(
 			status.ExternalDNS,
-			fmt.Sprintf("%s://%s", proto, route.Spec.Host),
+			util.GetFormattedEndpoint(proto, route.Spec.Host, servicePort.Port),
 		)
 	}
 
@@ -110,7 +129,7 @@ func (r *Reconciler) CheckServiceStatus(srv *corev1.Service, route *routev1.Rout
 			if lb.IP != "" {
 				status.ExternalIP = append(
 					status.ExternalIP,
-					fmt.Sprintf("%s://%s:%d", proto, lb.IP, servicePort.Port),
+					util.GetFormattedEndpoint(proto, lb.IP, servicePort.Port),
 				)
 			}
 			if lb.Hostname != "" {
@@ -127,7 +146,7 @@ func (r *Reconciler) CheckServiceStatus(srv *corev1.Service, route *routev1.Rout
 		for _, ip := range srv.Spec.ExternalIPs {
 			status.ExternalIP = append(
 				status.ExternalIP,
-				fmt.Sprintf("%s://%s:%d", proto, ip, servicePort.Port),
+				util.GetFormattedEndpoint(proto, ip, servicePort.Port),
 			)
 		}
 	}
@@ -161,4 +180,19 @@ func (r *Reconciler) InitNBClient() error {
 	// even when auth_token is empty.
 	_, err := r.NBClient.ReadAuthAPI()
 	return err
+}
+
+// podTargetPortNumber resolves a service targetPort to the numeric container port on a pod.
+func podTargetPortNumber(pod *corev1.Pod, targetPort intstr.IntOrString) (int32, bool) {
+	if targetPort.Type == intstr.Int {
+		return targetPort.IntVal, true
+	}
+	for i := range pod.Spec.Containers {
+		for _, port := range pod.Spec.Containers[i].Ports {
+			if port.Name == targetPort.StrVal {
+				return port.ContainerPort, true
+			}
+		}
+	}
+	return 0, false
 }

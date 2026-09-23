@@ -1,0 +1,290 @@
+package validations
+
+import (
+	"fmt"
+
+	nbv1 "github.com/noobaa/noobaa-operator/v5/pkg/apis/noobaa/v1alpha1"
+	"github.com/noobaa/noobaa-operator/v5/pkg/util"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// ValidateBucketClass bucket class
+func ValidateBucketClass(bc *nbv1.BucketClass) error {
+	if bc == nil {
+		return nil
+	}
+	if err := ValidateVectorPolicy(bc.Spec.VectorPolicy, bc.Spec.PlacementPolicy, bc.Spec.NamespacePolicy, bc.Namespace); err != nil {
+		return err
+	}
+	if bc.Spec.NamespacePolicy != nil {
+		if err := ValidateNSFSSingleBC(bc); err != nil {
+			return err
+		}
+	}
+	if bc.Spec.PlacementPolicy != nil {
+		if err := ValidateTiersNumber(bc.Spec.PlacementPolicy.Tiers); err != nil {
+			return err
+		}
+	}
+	if err := ValidateArchivePolicy(bc); err != nil {
+		return err
+	}
+
+	return ValidateQuotaConfig(bc.Name, bc.Spec.Quota)
+}
+
+// ValidateArchivePolicy validates the archivePolicy field of a BucketClass.
+// It checks that placementPolicy is present, that the referenced
+// NamespaceStore exists, is of type s3-compatible, has spec.archive=true, and is Ready.
+func ValidateArchivePolicy(bc *nbv1.BucketClass) error {
+	if bc.Spec.ArchivePolicy == nil {
+		return nil
+	}
+	if bc.Spec.PlacementPolicy == nil {
+		return util.ValidationError{
+			Msg: fmt.Sprintf("BucketClass %q has archivePolicy but no placementPolicy; placementPolicy is required when archivePolicy is set", bc.Name),
+		}
+	}
+	return ValidateArchivePolicyNS(bc)
+}
+
+// ValidateArchivePolicyNS verifies that the NamespaceStore referenced by archivePolicy
+// exists, is of type s3-compatible, has spec.archive=true, and is in the Ready phase.
+func ValidateArchivePolicyNS(bc *nbv1.BucketClass) error {
+	if bc.Spec.ArchivePolicy == nil {
+		return nil
+	}
+
+	nsName := bc.Spec.ArchivePolicy.DeepArchiveResource
+	if nsName == "" {
+		return util.ValidationError{
+			Msg: fmt.Sprintf("BucketClass %q has archivePolicy but empty DeepArchiveResource; DeepArchiveResource must reference an s3-compatible NamespaceStore with spec.archive=true", bc.Name),
+		}
+	}
+	ns := &nbv1.NamespaceStore{
+		TypeMeta: metav1.TypeMeta{Kind: "NamespaceStore"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      nsName,
+			Namespace: bc.Namespace,
+		},
+	}
+	if !util.KubeCheck(ns) {
+		return util.NewPersistentError("InvalidArchivePolicy",
+			fmt.Sprintf("BucketClass %q archivePolicy references NamespaceStore %q which does not exist in namespace %q",
+				bc.Name, nsName, bc.Namespace))
+	}
+	if ns.Spec.Type != nbv1.NSStoreTypeS3Compatible || !ns.Spec.Archive {
+		return util.NewPersistentError("InvalidArchivePolicy",
+			fmt.Sprintf("BucketClass %q archivePolicy references NamespaceStore %q of type %q; must be %q with archive=true",
+				bc.Name, nsName, ns.Spec.Type, nbv1.NSStoreTypeS3Compatible))
+	}
+	if ns.Status.Phase != nbv1.NamespaceStorePhaseReady {
+		return fmt.Errorf("BucketClass %q archivePolicy NamespaceStore %q is not Ready (phase: %q); will retry",
+			bc.Name, nsName, ns.Status.Phase)
+	}
+	return nil
+}
+
+// ValidateImmutLabelChange validates that immutable labels are not changed
+func ValidateImmutLabelChange(bc *nbv1.BucketClass, oldBC *nbv1.BucketClass, immuts map[string]struct{}) error {
+	if bc == nil || oldBC == nil {
+		return nil
+	}
+
+	for immutableLabel := range immuts {
+		val1 := oldBC.GetLabels()[immutableLabel]
+		val2 := bc.GetLabels()[immutableLabel]
+
+		if val1 != val2 {
+			return util.ValidationError{
+				Msg: fmt.Sprintf("immutable label %q cannot be changed", immutableLabel),
+			}
+		}
+	}
+
+	return nil
+}
+
+// ValidateQuotaConfig validates the quota values
+func ValidateQuotaConfig(bcName string, quota *nbv1.Quota) error {
+	if quota == nil {
+		return nil
+	}
+
+	return util.ValidateQuotaConfig(bcName, quota.MaxSize, quota.MaxObjects)
+}
+
+// ValidateTiersNumber validates the provided number of tiers is 1 or 2
+func ValidateTiersNumber(tiers []nbv1.Tier) error {
+	if len(tiers) != 1 && len(tiers) != 2 {
+		return util.ValidationError{
+			Msg: "unsupported number of tiers, bucketclass supports only 1 or 2 tiers",
+		}
+	}
+	return nil
+}
+
+// GetBucketclassNamespaceStoreArray returns an array of namespacestores of the provided bc
+func GetBucketclassNamespaceStoreArray(namespacePolicy *nbv1.NamespacePolicy) []string {
+	log := util.Logger()
+	log.Infof("creating namespace store array %+v from namespace policy", namespacePolicy)
+	var namespaceStoresArr []string
+
+	switch namespacePolicy.Type {
+	case nbv1.NSBucketClassTypeCache:
+		namespaceStoresArr = append(namespaceStoresArr, namespacePolicy.Cache.HubResource)
+	case nbv1.NSBucketClassTypeMulti:
+		if namespacePolicy.Multi.WriteResource == "" {
+			namespaceStoresArr = namespacePolicy.Multi.ReadResources
+		} else {
+			namespaceStoresArr = append(namespacePolicy.Multi.ReadResources, namespacePolicy.Multi.WriteResource)
+		}
+	case nbv1.NSBucketClassTypeSingle:
+		namespaceStoresArr = append(namespaceStoresArr, namespacePolicy.Single.Resource)
+	}
+	log.Infof("created namespace store array successfully %+v", namespaceStoresArr)
+	return namespaceStoresArr
+}
+
+// ValidatePlacementPolicy validates backingstore existance and readiness
+func ValidatePlacementPolicy(placementPolicy *nbv1.PlacementPolicy, namespace string) error {
+	log := util.Logger()
+	log.Infof("validating placement policy %+v", placementPolicy)
+	if placementPolicy == nil {
+		return nil
+	}
+
+	for i := range placementPolicy.Tiers {
+		tier := &placementPolicy.Tiers[i]
+		for _, backingStoreName := range tier.BackingStores {
+			backStore := &nbv1.BackingStore{
+				TypeMeta: metav1.TypeMeta{Kind: "BackingStore"},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      backingStoreName,
+					Namespace: namespace,
+				},
+			}
+			if !util.KubeCheck(backStore) {
+				return util.NewPersistentError("MissingBackingStore",
+					fmt.Sprintf("NooBaa BackingStore %q not found or deleted", backingStoreName))
+			}
+			if backStore.Status.Phase == nbv1.BackingStorePhaseRejected {
+				return util.NewPersistentError("RejectedBackingStore",
+					fmt.Sprintf("NooBaa BackingStore %q is in rejected phase", backingStoreName))
+			}
+			if backStore.Status.Phase != nbv1.BackingStorePhaseReady {
+				return fmt.Errorf("NooBaa BackingStore %q is not yet ready", backingStoreName)
+			}
+		}
+	}
+	log.Infof("validated placement policy successfully %+v", placementPolicy)
+	return nil
+}
+
+// ValidateNamespacePolicy validates namespacestores existance and readiness
+func ValidateNamespacePolicy(namespacePolicy *nbv1.NamespacePolicy, namespace string) error {
+	log := util.Logger()
+	log.Infof("validating namespace policy %+v", namespacePolicy)
+	if namespacePolicy == nil {
+		return nil
+	}
+
+	namespaceStoresArr := GetBucketclassNamespaceStoreArray(namespacePolicy)
+	// check that namespace stores exists and their phase it ready
+	for _, name := range namespaceStoresArr {
+		nsStore := &nbv1.NamespaceStore{
+			TypeMeta: metav1.TypeMeta{Kind: "NamespaceStore"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+			},
+		}
+		if !util.KubeCheck(nsStore) {
+			return util.NewPersistentError("MissingNamespaceStore",
+				fmt.Sprintf("NooBaa NamespaceStore %q not found or deleted", name))
+		}
+		if util.IsArchiveNamespaceStore(nsStore) {
+			return util.NewPersistentError("InvalidNamespaceStore",
+				fmt.Sprintf("NamespaceStore %q is an archive store and cannot be referenced in a namespacePolicy; use archivePolicy instead",
+					name))
+		}
+		if nsStore.Status.Phase == nbv1.NamespaceStorePhaseRejected {
+			return util.NewPersistentError("RejectedNamespaceStore",
+				fmt.Sprintf("NooBaa NamespaceStore %q is in rejected phase", name))
+		}
+		if nsStore.Status.Phase != nbv1.NamespaceStorePhaseReady {
+			return fmt.Errorf("NooBaa NamespaceStore %q is not yet ready", name)
+		}
+	}
+	log.Infof("validated namespace policy successfully %+v", namespacePolicy)
+	return nil
+}
+
+// ValidateVectorPolicy validates that a vector policy does not coexist with
+// a PlacementPolicy or NamespacePolicy, and that the referenced namespace
+// store exists, is ready, and is of a supported type.
+func ValidateVectorPolicy(vectorPolicy *nbv1.VectorPolicy, placementPolicy *nbv1.PlacementPolicy, namespacePolicy *nbv1.NamespacePolicy, namespace string) error {
+	log := util.Logger()
+	if vectorPolicy == nil {
+		return nil
+	}
+	if placementPolicy != nil || namespacePolicy != nil {
+		return util.ValidationError{
+			Msg: "VectorPolicy cannot be used together with PlacementPolicy or NamespacePolicy",
+		}
+	}
+	if vectorPolicy.Resource == "" {
+		return util.NewPersistentError("InvalidVectorPolicy",
+			"VectorPolicy resource must not be empty")
+	}
+	nsStore := &nbv1.NamespaceStore{
+		TypeMeta: metav1.TypeMeta{Kind: "NamespaceStore"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      vectorPolicy.Resource,
+			Namespace: namespace,
+		},
+	}
+	if !util.KubeCheck(nsStore) {
+		return util.NewPersistentError("MissingNamespaceStore",
+			fmt.Sprintf("NooBaa NamespaceStore %q not found or deleted", vectorPolicy.Resource))
+	}
+	if nsStore.Status.Phase == nbv1.NamespaceStorePhaseRejected {
+		return util.NewPersistentError("RejectedNamespaceStore",
+			fmt.Sprintf("NooBaa NamespaceStore %q is in rejected phase", vectorPolicy.Resource))
+	}
+	if nsStore.Status.Phase != nbv1.NamespaceStorePhaseReady {
+		return fmt.Errorf("NooBaa NamespaceStore %q is not yet ready", vectorPolicy.Resource)
+	}
+	if nsStore.Spec.Type != nbv1.NSStoreTypeNSFS {
+		return util.NewPersistentError("InvalidNamespaceStoreType",
+			fmt.Sprintf("NooBaa NamespaceStore %q must be of type NSFS for vector policy, got %q", vectorPolicy.Resource, nsStore.Spec.Type))
+	}
+	log.Infof("validated vector policy successfully %+v", vectorPolicy)
+	return nil
+}
+
+// ValidateNSFSSingleBC validates that bucketclass configured to NS of type NSFS it will only be of type Single.
+func ValidateNSFSSingleBC(bc *nbv1.BucketClass) error {
+	if bc.Spec.NamespacePolicy.Type == nbv1.NSBucketClassTypeSingle {
+		return nil
+	}
+	namespaceStoresArr := GetBucketclassNamespaceStoreArray(bc.Spec.NamespacePolicy)
+	for _, name := range namespaceStoresArr {
+		nsStore := &nbv1.NamespaceStore{
+			TypeMeta: metav1.TypeMeta{Kind: "NamespaceStore"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: bc.Namespace,
+			},
+		}
+		if !util.KubeCheck(nsStore) {
+			return fmt.Errorf("failed to KubeCheck namespacestore in NSFS single bucketclass type validation")
+		}
+		if nsStore.Spec.Type == nbv1.NSStoreTypeNSFS {
+			return util.ValidationError{
+				Msg: fmt.Sprintf("invalid namespaceStore types, nsfs namespacestore %q is allowed on bucketclass of type single", name),
+			}
+		}
+	}
+	return nil
+}

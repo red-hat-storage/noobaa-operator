@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: noobaa-pvpool
+  labels:
+    app: noobaa
+spec:
+  podSelector:
+    matchExpressions:
+    - key: pool
+      operator: Exists
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector: {}
+    ports:
+    # N2N ICE listens on a random port in this range (see noobaa-core rpc_n2n_agent)
+    - protocol: TCP
+      port: 60101
+      endPort: 60600
