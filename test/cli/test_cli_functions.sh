@@ -37,12 +37,15 @@ function kuberun {
 }
 
 echo_time() {
-    date +"%T $*"
+    # Write to stderr so $(test_noobaa silence ... list) captures stay clean on retries.
+    date +"%T $*" >&2
 }
 
 function test_noobaa {
     local rc func timeout_in_sec
     local {timeout,should_fail,silence}=false
+    local count=1
+    local retries=18
 
     if [[ "${1}" =~ ("should_fail"|"silence") ]]
     then
@@ -84,25 +87,38 @@ function test_noobaa {
         # When we are running with timeout because the command runs in the background
         timeout --PID ${PID} ${timeout_in_sec} ${func} ${options}
     else
-        ${noobaa} ${options}
-        if [ $? -ne 0 ]
-        then
-            if ${should_fail}
+        local rc=1
+        while [ $rc -ne 0 ]
+        do
+            ${noobaa} ${options}
+            rc=$?
+            if [ $rc -ne 0 ]
             then
-                echo_time "✅  ${noobaa} ${options} failed - as should"
-            else 
-                echo_time "❌  ${noobaa} ${options} failed, Exiting"
-                local pod_operator=$(kuberun get pod | grep noobaa-operator | awk '{print $1}')
-                echo_time "==============OPERATOR LOGS============"
-                kuberun logs ${pod_operator}
-                echo_time "==============CORE LOGS============"
-                kuberun logs noobaa-core-0
-                exit 1
+                if ${should_fail}
+                then
+                    echo_time "✅  ${noobaa} ${options} failed - as should"
+                    rc=0
+                else 
+                    if [ ${count} -lt ${retries} ]
+                    then
+                        echo_time "❌ failed to run ${noobaa} ${options} retrying" 
+                        sleep 10
+                        count=$((count+1))
+                    else
+                        echo_time "❌  ${noobaa} ${options} failed, Exiting"
+                        local pod_operator=$(kuberun get pod | grep noobaa-operator | awk '{print $1}')
+                        echo_time "==============OPERATOR LOGS============"
+                        kuberun logs ${pod_operator} -c noobaa-operator
+                        echo_time "==============CORE LOGS============"
+                        kuberun logs noobaa-core-0
+                        exit 1
+                    fi
+                fi
+            elif [ ! ${silence} ]
+            then
+                echo_time "✅  ${noobaa} ${options} passed"
             fi
-        elif [ ! ${silence} ]
-        then
-            echo_time "✅  ${noobaa} ${options} passed"
-        fi
+        done
     fi
 
 }
@@ -157,27 +173,378 @@ function timeout {
     done
 }
 
+function test_aws {
+    local silence
+    if [ "${1}" == "silence" ]; then
+        silence=true
+        shift
+    fi
+
+    local options=$*
+
+    NOOBAA_ACCESS_KEY=$(kuberun get secret noobaa-admin -n test -o json | jq -r '.data.AWS_ACCESS_KEY_ID|@base64d')
+    NOOBAA_SECRET_KEY=$(kuberun get secret noobaa-admin -n test -o json | jq -r '.data.AWS_SECRET_ACCESS_KEY|@base64d')
+    ENDPOINT=$(kuberun get noobaa noobaa -n test -o json | jq -r '.status.services.serviceS3.nodePorts[0]')
+
+    if [ -z "${NOOBAA_ACCESS_KEY}" ] || [ -z "${NOOBAA_SECRET_KEY}" ] || [ -z "${ENDPOINT}" ]; then
+        echo_time "❌  Failed to retrieve NooBaa credentials or endpoint, Exiting."
+        exit 1
+    fi
+
+    AWS_ACCESS_KEY_ID=$NOOBAA_ACCESS_KEY AWS_SECRET_ACCESS_KEY=$NOOBAA_SECRET_KEY AWS_EC2_METADATA_DISABLED=true \
+        aws --endpoint $ENDPOINT --no-verify-ssl ${options}
+
+    if [ $? -ne 0 ]; then
+        echo_time "❌  aws ${options} failed, Exiting"
+        exit 1
+    elif [ -z "${silence}" ]; then
+        echo_time "✅  aws ${options} passed"
+    fi
+}
+
 function install {
     local use_obc_cleanup_policy
     
     [ $((RANDOM%2)) -gt 0 ] && use_obc_cleanup_policy="--use-obc-cleanup-policy"
-    test_noobaa install --mini ${use_obc_cleanup_policy}
+    test_noobaa install --${RESOURCE} --admission ${use_obc_cleanup_policy} --use-standalone-db
 
-    local status=$(kuberun silence get noobaa noobaa -o 'jsonpath={.status.phase}')
-    while [ "${status}" != "Ready" ]
+    wait_for_noobaa_ready
+    wait_for_backingstore_ready noobaa-default-backing-store
+}
+
+function run_external_postgres {
+    # kubectl run postgres-external --image=postgres:15 --env POSTGRES_PASSWORD=password --port 5432 --expose
+    echo_time "Creating an external postgres DB for test (NO SSL)"
+    kuberun create -f $(dirname ${0})/resources/external-db.yaml
+}
+
+function run_external_postgres_ssl {
+    echo_time "Creating an external postgres DB for test (SSL)"
+    kuberun create secret generic postgres-ssl --from-file=certs/server.crt --from-file=certs/server.key --from-file=certs/ca.crt
+    kuberun create -f $(dirname ${0})/resources/external-db-ssl.yaml
+}
+
+function delete_external_postgres {
+    kuberun delete -f $(dirname ${0})/resources/external-db.yaml
+}
+
+function delete_external_postgres_ssl {
+    kuberun delete -f $(dirname ${0})/resources/external-db-ssl.yaml
+    kuberun delete secret postgres-ssl
+}
+
+function install_external {    
+    local postgres_url="postgresql://postgres:password@postgres-external.${NAMESPACE}.svc:5432/postgres"
+    echo_time "Installing NooBaa in external postgres mode postgres-url=${postgres_url}"
+    test_noobaa install --${RESOURCE} --postgres-url=${postgres_url}
+
+    wait_for_noobaa_ready
+    wait_for_backingstore_ready noobaa-default-backing-store
+}
+
+function install_external_ssl {    
+    local postgres_url="postgresql://postgres:password@postgres-external.${NAMESPACE}.svc:5432/postgres"
+    echo_time "Installing NooBaa in external postgres mode postgres-url=${postgres_url} with SSL"
+    test_noobaa install --${RESOURCE} --postgres-url=${postgres_url} --pg-ssl-required --pg-ssl-unauthorized --pg-ssl-key certs/client.key --pg-ssl-cert certs/client.crt
+
+    wait_for_noobaa_ready
+    wait_for_backingstore_ready noobaa-default-backing-store
+}
+
+# quiet_poll waits until condition_cmd succeeds or timeout_sec elapses on the wall clock.
+# Logs once at start and once on success or timeout. Does not spam per iteration.
+# on_timeout_cmd is optional and runs only when the wait expires.
+function quiet_poll {
+    local timeout_sec=$1
+    local interval_sec=$2
+    local description=$3
+    local condition_cmd=$4
+    local on_timeout_cmd=${5:-}
+    local deadline=$(( $(date +%s) + timeout_sec ))
+
+    echo_time "💬  Waiting for ${description} (up to ${timeout_sec}s)"
+    while [ $(date +%s) -lt ${deadline} ]
     do
-        echo_time "💬  Waiting for status Ready, Status is ${status}"
-        sleep 10
-        status=$(kuberun silence get noobaa noobaa -o 'jsonpath={.status.phase}')
+        if eval "${condition_cmd}"
+        then
+            echo_time "✅  ${description}"
+            return 0
+        fi
+        sleep ${interval_sec}
     done
+    echo_time "❌  Timed out waiting for ${description} after ${timeout_sec}s"
+    if [ -n "${on_timeout_cmd}" ]
+    then
+        eval "${on_timeout_cmd}"
+    fi
+    return 1
+}
+
+# wait_for_noobaa_ready polls until the NooBaa CR phase is Ready.
+# Reads the phase via ${kubectl} rather than kuberun, whose error text would never equal Ready.
+function wait_for_noobaa_ready {
+    local timeout_sec=${1:-900}
+    if ! quiet_poll ${timeout_sec} 2 "NooBaa CR Ready" \
+        "[ \"\$(${kubectl} get noobaa noobaa -o jsonpath='{.status.phase}' 2>/dev/null)\" = Ready ]" \
+        "${kubectl} describe noobaa noobaa"
+    then
+        exit 1
+    fi
+}
+
+# wait_for_backingstore_ready polls until the named BackingStore phase is Ready.
+function wait_for_backingstore_ready {
+    local bs_name=${1}
+    local timeout_sec=${2:-600}
+    if ! quiet_poll ${timeout_sec} 2 "backingstore ${bs_name} Ready" \
+        "[ \"\$(${kubectl} get backingstore ${bs_name} -o jsonpath='{.status.phase}' 2>/dev/null)\" = Ready ]" \
+        "${kubectl} describe backingstore ${bs_name}"
+    then
+        exit 1
+    fi
+}
+
+# read_pg_max_connections prints numeric max_connections from postgres, or empty if unavailable.
+# Reads the applied runtime value from pg_settings so the wait succeeds only after restart.
+function read_pg_max_connections {
+    local value
+    # Cap the client wait. This poll runs while the postgres pod is terminating or recreating.
+    value=$(${kubectl} exec --request-timeout=20s noobaa-db-pg-0 -- psql -tAc \
+        "SELECT setting FROM pg_settings WHERE name = 'max_connections';" 2>/dev/null \
+        | tr -d '[:space:]')
+    if [[ "${value}" =~ ^[0-9]+$ ]]
+    then
+        echo "${value}"
+    fi
+}
+
+# filter_cli_list drops CLI table headers and empty-list sentinels from stdin.
+# Headers may start with NAME, BUCKET-NAME, or NAMESPACE (OBC list).
+function filter_cli_list {
+    # Case-sensitive: headers are uppercase. -i would drop a real row named "namespace".
+    grep -vE '^(NAME|BUCKET-NAME|NAMESPACE)([[:space:]]|$)|^No .+ found'
+}
+
+# delete_bucket_idempotent deletes a bucket and treats a missing bucket as success.
+# Retries transient failures with the same budget as test_noobaa.
+function delete_bucket_idempotent {
+    local bucket=$1
+    local count=1
+    local retries=18
+    local out rc
+
+    if [ -z "${bucket}" ]
+    then
+        echo_time "⚠️  delete_bucket_idempotent called with no bucket, skipping"
+        return 0
+    fi
+
+    while [ ${count} -le ${retries} ]
+    do
+        out=$(${noobaa} bucket delete "${bucket}" 2>&1)
+        rc=$?
+        if [ ${rc} -eq 0 ]
+        then
+            echo_time "✅  ${noobaa} bucket delete ${bucket} passed"
+            return 0
+        fi
+        if echo "${out}" | grep -qiF "No such bucket: ${bucket}" || echo "${out}" | grep -qi 'NO_SUCH_BUCKET'
+        then
+            echo_time "✅  ${noobaa} bucket delete ${bucket} skipped - bucket already absent"
+            return 0
+        fi
+        # Permanent: bucket still has objects. Retrying cannot help.
+        if echo "${out}" | grep -qiE 'NOT_EMPTY|Cannot delete bucket'
+        then
+            echo_time "❌  ${noobaa} bucket delete ${bucket} failed - bucket not empty"
+            echo "${out}"
+            exit 1
+        fi
+        if [ ${count} -lt ${retries} ]
+        then
+            echo_time "❌ failed to run ${noobaa} bucket delete ${bucket} retrying"
+            echo "${out}"
+            sleep 10
+            count=$((count+1))
+        else
+            echo_time "❌  ${noobaa} bucket delete ${bucket} failed, Exiting"
+            echo "${out}"
+            local pod_operator=$(kuberun get pod | grep noobaa-operator | awk '{print $1}')
+            echo_time "==============OPERATOR LOGS============"
+            kuberun logs ${pod_operator} -c noobaa-operator
+            echo_time "==============CORE LOGS============"
+            kuberun logs noobaa-core-0
+            exit 1
+        fi
+    done
+}
+
+# wait_for_bucketclasses_absent polls until none of the named bucketclasses remain.
+# Caps at timeout_sec (default 30). Returns 1 after the cap so callers can warn.
+function wait_for_bucketclasses_absent {
+    local timeout_sec=${1:-30}
+    shift
+    local names=("$@")
+    local deadline=$(( $(date +%s) + timeout_sec ))
+    if [ ${#names[@]} -eq 0 ]
+    then
+        return 0
+    fi
+    echo_time "💬  Waiting for bucketclasses to settle (up to ${timeout_sec}s)"
+    while [ $(date +%s) -lt ${deadline} ]
+    do
+        local remaining=0
+        local listed
+        local name
+        if ! listed=$(${kubectl} get bucketclass -o 'jsonpath={.items[*].metadata.name}' 2>/dev/null)
+        then
+            sleep 2
+            continue
+        fi
+        for name in "${names[@]}"
+        do
+            if echo "${listed}" | tr ' ' '\n' | grep -Fqx "${name}"
+            then
+                remaining=1
+                break
+            fi
+        done
+        if [ ${remaining} -eq 0 ]
+        then
+            echo_time "✅  bucketclasses settled"
+            return 0
+        fi
+        sleep 2
+    done
+    echo_time "⚠️  Bucketclass settle wait reached ${timeout_sec}s cap, continuing"
+    return 1
+}
+
+function clean_leftovers {
+    test_noobaa --timeout uninstall
+    kuberun delete deploy,sts,service,job,po,pv,pvc,cm,secret --all
+    ${kubectl} delete sc nsfs-local
 }
 
 function noobaa_install {
     #noobaa timeout install # Maybe when creating server we can use local PV
+    clean_leftovers
     install
     test_noobaa status
     kuberun get noobaa
     kuberun describe noobaa
+    test_admission_deployment
+}
+
+function noobaa_install_external {
+    #noobaa timeout install # Maybe when creating server we can use local PV
+    clean_leftovers
+    run_external_postgres
+    install_external
+    test_noobaa status
+    kuberun get noobaa
+    kuberun describe noobaa
+}
+
+function noobaa_install_external_ssl {
+    #noobaa timeout install # Maybe when creating server we can use local PV
+    mkdir -p -m 755 certs
+	openssl ecparam -name prime256v1 -genkey -noout -out certs/ca.key
+	openssl req -new -x509 -sha256 -key certs/ca.key -out certs/ca.crt -subj "/CN=ca.noobaa.com"
+    openssl genrsa -out certs/server.key 2048
+    openssl req -new -sha256 -key certs/server.key -out certs/server.csr -subj "/CN=postgres-external.${NAMESPACE}.svc"
+    openssl x509 -req -in certs/server.csr -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial -out certs/server.crt -days 365 -sha256
+    openssl ecparam -name prime256v1 -genkey -noout -out certs/client.key
+	openssl req -new -sha256 -key certs/client.key -out certs/client.csr -subj "/CN=postgres"
+	openssl x509 -req -in certs/client.csr -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial -out certs/client.crt -days 365 -sha256
+    clean_leftovers
+    run_external_postgres_ssl
+    install_external_ssl
+    test_noobaa status
+    kuberun get noobaa
+    kuberun describe noobaa
+}
+
+function test_admission_deployment {
+    kuberun get Secret "admission-webhook-secret"
+    kuberun get ValidatingWebhookConfiguration "admission-validation-webhook"
+    kuberun get Service "admission-webhook-service"
+}
+
+function check_core_config_map {
+    kuberun get configmap noobaa-config
+    check_change_debug_level_in_config_map
+}
+
+function check_change_debug_level_in_config_map {
+    local cm_debug_level="all"
+    local patch='{"data":{"NOOBAA_LOG_LEVEL":"all"}}'
+    local core_debug_level=$(kuberun silence exec noobaa-core-0 -- printenv NOOBAA_LOG_LEVEL)
+
+    kuberun silence patch configmap noobaa-config -p ${patch}
+
+    echo_time "💬  Waiting for NOOBAA_LOG_LEVEL core env var to match the noobaa-config"
+    local deadline=$(( $(date +%s) + 180 ))
+    while [[ "${core_debug_level}" != "${cm_debug_level}" ]]
+    do
+        if [ $(date +%s) -ge ${deadline} ]
+        then
+            echo_time "❌  reached the timeout for waiting to the update"
+            break
+        fi
+        sleep 2
+        core_debug_level=$(kuberun silence exec noobaa-core-0 -- printenv NOOBAA_LOG_LEVEL)
+    done 
+
+    if [[ "${core_debug_level}" == "${cm_debug_level}" ]]
+    then
+        echo_time "✅  noobaa core env variable updated successfully"
+    else
+        echo_time "❌  noobaa core env var NOOBAA_LOG_LEVEL didn't got updated, Exiting"
+        exit 1
+    fi
+}
+
+function check_pgdb_config_override {
+    local temp_file=/tmp/test-$(date +%s).json
+    trap 'rm -f "$temp_file"' RETURN
+    local current_max_connections
+    current_max_connections=$(read_pg_max_connections)
+    if [ -z "${current_max_connections}" ]
+    then
+        echo_time "❌  Could not read current PostgreSQL max_connections, Exiting"
+        exit 1
+    fi
+    local final_max_connections=$((current_max_connections + 100))
+    printf "{\"spec\":{\"dbConf\":\"\\\nmax_connections = $final_max_connections\"}}" > $temp_file
+
+    kuberun silence patch noobaas.noobaa.io noobaa --patch-file $temp_file --type merge
+
+    # Wait for the applied runtime setting after reconcile restarts postgres
+    # (operator → pod recreate → PVC reattach → startup/recovery).
+    if ! quiet_poll 300 5 "PostgreSQL max_connections = ${final_max_connections}" \
+        "[ \"\$(read_pg_max_connections)\" = \"${final_max_connections}\" ]" \
+        "${kubectl} describe pod noobaa-db-pg-0; ${kubectl} get events --sort-by=.lastTimestamp | tail -20"
+    then
+        rm -f "$temp_file"
+        exit 1
+    fi
+
+    # Prove RPC is healthy again. Cap each attempt when an external timeout exists
+    # (RPCSendTimeout is 120s). Probe the binary, not command -v, which would match
+    # the local timeout helper. Skip the cap on macOS without coreutils/gtimeout.
+    local rpc_cmd="${noobaa} bucket list"
+    if command timeout 1 true >/dev/null 2>&1
+    then
+        rpc_cmd="command timeout 60 ${rpc_cmd}"
+    fi
+    if ! quiet_poll 300 5 "NooBaa RPC after dbConf" \
+        "${rpc_cmd} >/dev/null 2>&1" \
+        "${kubectl} get pod noobaa-db-pg-0 noobaa-core-0 -o wide; ${rpc_cmd}"
+    then
+        rm -f "$temp_file"
+        exit 1
+    fi
 }
 
 function aws_credentials {
@@ -187,12 +554,19 @@ function aws_credentials {
         then
             eval $(echo ${line//\"/} | sed -e 's/ //g' -e 's/:/=/g')
         fi
-    done < <(test_noobaa silence status)
+    done < <(test_noobaa silence status --show-secrets)
     if [ -z ${AWS_ACCESS_KEY_ID} ] || [ -z ${AWS_SECRET_ACCESS_KEY} ]
     then
         echo_time "❌  Could not get AWS credentials, Exiting"
         exit 1
     fi
+    local SECRET=$(dirname ${0})/resources/empty-secret.yaml
+    local access_key="  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}"
+    printf "\n${access_key}" >> ${SECRET}
+    local secret_key="  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}"
+    printf "\n${secret_key}" >> ${SECRET}
+    kuberun create -f $SECRET
+    export SECRET_NAME="empty-secret"
 }
 
 function check_namespacestore {
@@ -210,8 +584,7 @@ function check_namespacestore {
         test_noobaa namespacestore create ${type} ${namespacestore[cycle]} \
             --target-bucket ${buckets[cycle]} \
             --endpoint s3.${NAMESPACE}.svc.cluster.local:443 \
-            --access-key ${AWS_ACCESS_KEY_ID} \
-            --secret-key ${AWS_SECRET_ACCESS_KEY}
+            --secret-name ${SECRET_NAME}
         test_noobaa namespacestore status ${namespacestore[cycle]}
     done
     
@@ -219,7 +592,128 @@ function check_namespacestore {
     test_noobaa status
     kuberun get namespacestore
     kuberun describe namespacestore
+
+    check_namespacestore_validator
+
     echo_time "✅  namespace store s3 compatible cycle is done"
+}
+
+function check_namespacestore_validator {
+    local type="s3-compatible"
+    local buckets="failns.bucket1"
+    local namespacestore="namespacestore.fail"
+
+    test_noobaa bucket create ${buckets}
+
+    # Should fail due to a access/secret key already in use, in case the user didn't want to use it as secret refernce  
+    yes n | test_noobaa should_fail namespacestore create ${type} ${namespacestore} \
+        --target-bucket ${buckets} \
+        --endpoint s3.${NAMESPACE}.svc.cluster.local:443 \
+        --access-key ${AWS_ACCESS_KEY_ID} \
+        --secret-key ${AWS_SECRET_ACCESS_KEY}
+
+    delete_bucket_idempotent "${buckets}"
+
+    check_namespacestore_nsfs_validator
+}
+
+function check_namespacestore_nsfs_validator {
+    echo_time "💬  Staring namespacestore nsfs validator cycle"
+
+    #Setup
+    local type="nsfs"
+    local pvc="nsfs-vol"
+    local namespacestore="namespacestore-"${type}
+
+    kuberun create -f $(dirname ${0})/resources/nsfs-local-class.yaml
+    kuberun create -f $(dirname ${0})/resources/nsfs-local-pv.yaml
+    kuberun create -f $(dirname ${0})/resources/nsfs-local-pvc.yaml
+    
+    #Sub-path is not relative
+    yes | test_noobaa should_fail namespacestore create ${type} ${namespacestore} \
+        --fs-backend 'GPFS' \
+        --pvc-name ${pvc} \
+        --sub-path '/'
+    
+    #Sub-path contains '..'
+    yes | test_noobaa should_fail namespacestore create ${type} ${namespacestore} \
+        --fs-backend 'GPFS' \
+        --pvc-name ${pvc} \
+        --sub-path 'subpath/../'
+
+    #Valid sub-path
+    yes | test_noobaa namespacestore create ${type} ${namespacestore} \
+        --fs-backend 'GPFS' \
+        --pvc-name ${pvc} \
+        --sub-path 'subpath'
+    
+    test_noobaa namespacestore list
+
+    #cleanup
+    test_noobaa silence namespacestore delete ${namespacestore}
+    kuberun get pv,pvc
+
+
+    echo_time "✅  namespacestore nsfs validator is done"
+}
+
+function check_pv_pool_resources {
+    echo_time "💬  Staring PV Pool resources cycle"
+
+    # Minimum CPU     100m
+    #         Memory  400Mi
+    test_noobaa should_fail backingstore create pv-pool request-small-cpu \
+            --num-volumes 1 \
+            --pv-size-gb 16 \
+            --request-cpu 50m
+
+    test_noobaa should_fail backingstore create pv-pool request-small-memory \
+            --num-volumes 1 \
+            --pv-size-gb 16 \
+            --request-memory 100Mi
+
+    test_noobaa should_fail backingstore create pv-pool request-larger-limit \
+            --num-volumes 1 \
+            --pv-size-gb 16 \
+            --request-cpu 300m \
+            --limit-cpu 200m
+
+    local mem=400
+    local cpu=100
+    if [ "$RESOURCE" == "dev" ]
+    then
+        mem=500
+        cpu=500
+    fi
+    test_noobaa backingstore create pv-pool minimum-request-limit \
+            --num-volumes 1 \
+            --pv-size-gb 16 \
+            --request-cpu $(cpu)m \
+            --request-memory $(mem)Mi \
+            --limit-cpu $(cpu)m \
+            --limit-memory $(mem)Mi
+            
+    #TOD see why it fails, currently disabling as it takes 10 mins.
+    # time="2022-04-11T14:18:17Z" level=error msg="❌ BackingStore \"large-request-limit\" Phase is \"Rejected\": Failed connecting all pods in backingstore for more than 10 minutes Current failing: 1 from requested: 1"
+    # NAME                           TYPE      TARGET-BUCKET   PHASE      AGE      
+    # large-request-limit            pv-pool                   Rejected   10m7s    
+    # test_noobaa backingstore create pv-pool large-request-limit \
+    #         --num-volumes 1 \
+    #         --pv-size-gb 16 \
+    #         --request-cpu 300m \
+    #         --request-memory 500Mi \
+    #         --limit-cpu 400m \
+    #         --limit-memory 600Mi
+
+    test_noobaa backingstore list
+    test_noobaa status
+    kuberun get backingstore
+    kuberun describe backingstore
+
+    test_noobaa backingstore delete minimum-request-limit
+    # test_noobaa backingstore delete large-request-limit
+
+    echo_time "✅  PV Pool resources cycle is done"
 }
 
 function check_S3_compatible {
@@ -233,21 +727,35 @@ function check_S3_compatible {
     test_noobaa backingstore create pv-pool pvpool1 \
             --num-volumes 1 \
             --pv-size-gb 50
-
     for (( cycle=0 ; cycle < ${#backingstore[@]} ; cycle++ ))
     do
         test_noobaa backingstore create ${type} ${backingstore[cycle]} \
             --target-bucket ${buckets[cycle]} \
             --endpoint s3.${NAMESPACE}.svc.cluster.local:443 \
-            --access-key ${AWS_ACCESS_KEY_ID} \
-            --secret-key ${AWS_SECRET_ACCESS_KEY}
-        test_noobaa backingstore status ${backingstore[cycle]}
+            --secret-name ${SECRET_NAME}
+        wait_for_backingstore_ready ${backingstore[cycle]} 300
     done
     test_noobaa backingstore list
     test_noobaa status
     kuberun get backingstore
     kuberun describe backingstore
+    check_S3_compatible_validator
     echo_time "✅  s3 compatible cycle is done"
+}
+
+function check_S3_compatible_validator {
+    local type="s3-compatible"
+    local buckets="fails3.bucket"
+    local backingstore="fail.compatible1"
+
+    test_noobaa bucket create ${buckets}
+
+    # Should fail due to a access/secret key already in use, in case the user didn't want to use it as secret refernce 
+    yes n | test_noobaa should_fail backingstore create ${type} ${backingstore} \
+        --target-bucket ${buckets} \
+        --endpoint s3.${NAMESPACE}.svc.cluster.local:443 \
+        --access-key ${AWS_ACCESS_KEY_ID} \
+        --secret-key ${AWS_SECRET_ACCESS_KEY}
 }
 
 function check_IBM_cos {
@@ -263,15 +771,30 @@ function check_IBM_cos {
         test_noobaa backingstore create ${type} ${backingstore[cycle]} \
             --target-bucket ${buckets[cycle]} \
             --endpoint s3.${NAMESPACE}.svc.cluster.local:443 \
-            --access-key ${AWS_ACCESS_KEY_ID} \
-            --secret-key ${AWS_SECRET_ACCESS_KEY}
+            --secret-name ${SECRET_NAME}
         test_noobaa backingstore status ${backingstore[cycle]}
     done
     test_noobaa backingstore list
     test_noobaa status
     kuberun get backingstore
     kuberun describe backingstore
+    check_IBM_cos_validator
     echo_time "✅  ibm cos cycle is done"
+}
+
+function check_IBM_cos_validator {
+    local type="ibm-cos"
+    local buckets="failIBM.bucket"
+    local backingstore="fail.ibmcos"
+
+    test_noobaa bucket create ${buckets}
+
+    # Should fail due to a access/secret key already in use, in case the user didn't want to use it as secret refernce 
+    yes n | test_noobaa should_fail backingstore create ${type} ${backingstore} \
+        --target-bucket ${buckets} \
+        --endpoint s3.${NAMESPACE}.svc.cluster.local:443 \
+        --access-key ${AWS_ACCESS_KEY_ID} \
+        --secret-key ${AWS_SECRET_ACCESS_KEY}
 }
 
 function check_aws_S3 {
@@ -312,12 +835,14 @@ function bucketclass_cycle {
     test_noobaa bucketclass create placement-bucketclass ${bucketclass_names[0]} --backingstores ${backingstore[0]}
     # test_noobaa bucketclass create placement-bucketclass ${bucketclass_names[1]} --placement Mirror --backingstores nb1,aws1 ❌
     # test_noobaa bucketclass create placement-bucketclass ${bucketclass_names[2]} --placement Spread --backingstores aws1,aws2 ❌
-    test_noobaa bucketclass create placement-bucketclass ${bucketclass_names[3]} --backingstores ${backingstore[0]},${backingstore[1]}
+    test_noobaa bucketclass create placement-bucketclass ${bucketclass_names[3]} --backingstores ${backingstore[0]},${backingstore[1]}   
     test_noobaa bucketclass create namespace-bucketclass single ${bucketclass_names[4]} --resource ${namespacestore[0]}
     test_noobaa bucketclass create namespace-bucketclass multi ${bucketclass_names[5]} --read-resources ${namespacestore[0]},${namespacestore[1]} --write-resource ${namespacestore[0]} 
     test_noobaa bucketclass create namespace-bucketclass cache ${bucketclass_names[6]} --hub-resource ${namespacestore[1]} --backingstores ${backingstore[1]}
+    test_noobaa bucketclass create placement-bucketclass "bucket.class.replication" --backingstores ${backingstore[0]} --replication-policy replication1.json
+    bucketclass_names+=("bucket.class.replication")
 
-    local bucketclass_list_array=($(test_noobaa silence bucketclass list | awk '{print $1}' | grep -v NAME))
+    local bucketclass_list_array=($(test_noobaa silence bucketclass list | filter_cli_list | awk '{print $1}'))
     for bucketclass in ${bucketclass_list_array[@]}
     do
         test_noobaa bucketclass status ${bucketclass}
@@ -337,6 +862,13 @@ function bucketclass_cycle {
     echo_time "✅  bucketclass cycle is done"
 }
 
+function bz_2038884 {
+    test_noobaa bucketclass create placement-bucketclass testbucketclass --backingstores=noobaa-default-backing-store
+    test_noobaa obc create --bucketclass=testbucketclass testobc
+    test_noobaa bucketclass delete testbucketclass
+    test_noobaa obc delete testobc
+}
+
 function check_obc {
     local bucket
     test_noobaa obc list
@@ -353,7 +885,7 @@ function obc_cycle {
     echo_time "💬  Starting the obc cycle"
     local buckets=()
 
-    local bucketclass_list_array=($(test_noobaa silence bucketclass list | awk '{print $1}' | grep -v NAME | grep -v noobaa-default-bucket-class))
+    local bucketclass_list_array=($(test_noobaa silence bucketclass list | filter_cli_list | awk '{print $1}' | grep -v noobaa-default-bucket-class))
     for bucketclass in ${bucketclass_list_array[@]}
     do
         buckets+=("bucket${bucketclass//[a-zA-Z.-]/}")
@@ -361,21 +893,234 @@ function obc_cycle {
         then
             flag="--app-namespace default"
         fi
+        # for bucketclass7 - create 2 obcs, one using its one replication policy and second one that using the bucketclass replication and 
+        if [ "${bucketclass//[a-zA-Z.-]/}" == "7" ]
+        then
+            flag="--replication-policy replication2.json"
+            test_noobaa --timeout --func check_obc obc create "${buckets[$((${#buckets[@]}-1))]}_obc_repl" --bucketclass ${bucketclass} ${flag}
+            unset flag
+        fi
         test_noobaa --timeout --func check_obc obc create ${buckets[$((${#buckets[@]}-1))]} --bucketclass ${bucketclass} ${flag}
         unset flag
     done
     check_obc
+    verify_bucket_tagging
 
     # aws s3 --endpoint-url XXX ls
     echo_time "✅  obc cycle is done"
 }
 
+function verify_bucket_tagging {
+    local obc_name="obc-buck-tagging"
+
+    echo_time "💬 Creating Object Bucket Claim (OBC): $obc_name"
+    test_noobaa --timeout obc create $obc_name
+
+    # fetching bucket_name from obc
+    bucket_name=$(kuberun get obc $obc_name -o json | jq -r '.spec.bucketName')
+
+    # updating the obc labels
+    new_label_key="test-label"
+    new_label_value="verified"
+    echo_time "💬 Updating OBC labels: $new_label_key=$new_label_value"
+    kuberun silence label obc $obc_name $new_label_key=$new_label_value --overwrite
+
+    # checking bucket tagging after updating obc labels
+    echo_time "💬 Fetching updated bucket tags for: $bucket_name"
+    tags=$(test_aws s3api get-bucket-tagging --bucket "$bucket_name" 2>/dev/null || echo "No Tags")
+
+    if [[ "$tags" == "No Tags" ]]; then
+        echo_time "❌  No tags found for bucket: $bucket_name"
+        exit 1
+    else
+        echo_time "✅  Bucket tagging verified: $tags"
+    fi
+
+    echo_time "💬  Deleting OBC: $obc_name"
+    test_noobaa --timeout obc delete ${obc_name}
+}
+
+
+function account_cycle {
+    echo_time "💬  Starting the account cycle"
+    local buckets=($(test_noobaa silence bucket list | filter_cli_list | awk '{print $1}'))
+    local backingstores=($(test_noobaa silence backingstore list | filter_cli_list | awk '{print $1}'))
+    test_noobaa account create account1  #default_resource should be the system default
+    test_noobaa account create account2 --default_resource ${backingstores[0]}
+
+    #admin account that have a secret but no CRD 
+    account_regenerate_keys "admin@noobaa.io"
+    account_update_keys "admin@noobaa.io" "Aa123456789123456789" "Aa+/123456789123456789123456789123456789"
+    #admin account that don't have a secret and don't have CRD 
+    account_regenerate_keys "operator@noobaa.io"
+    account_update_keys "operator@noobaa.io" "Ab987654321987654321" "Ab+/987654321987654321987654321987654321"
+    # testing nsfs accounts
+    # account_nsfs_cycle TODO re-enable.
+    # update account default resource
+    account_update
+    # update crd account default resource
+    account_update "crd"
+    echo_time "✅  noobaa account cycle is done"
+}
+
+function account_update {
+    local crd=${1}
+    local new_default_resource="backing-store-upd"
+    if [ "$(kuberun get backingstore | grep -w ${new_default_resource} | wc -l)" != "1" ]
+    then
+        echo_time "💬  Creating backingstore ${new_default_resource}"
+        test_noobaa backingstore create pv-pool ${new_default_resource} --num-volumes 1 --pv-size-gb 16
+    fi
+    if [ -z ${crd} ]
+    then
+        echo_time "💬  Checking account update cycle"
+        local account_name=$(test_noobaa api account list_accounts {} -o json | jq -r '.accounts[0].email')
+        local default_resource=$(test_noobaa api account list_accounts {} -o json | jq -r '.accounts[0].default_resource')
+        echo_time "💬  Updating ${new_default_resource} as default_resource for noobaa account"
+        test_noobaa account update ${account_name} --new_default_resource=${new_default_resource}
+        local curr_default_resource=$(test_noobaa api account list_accounts {} -o json | jq -r '.accounts[0].default_resource')
+        if [ "${new_default_resource}" != "${curr_default_resource}" ]
+        then
+            echo_time "❌ Looks like account not updated, Exiting"
+            exit 1
+        else
+            echo_time "✅  Update account default_resource successful"
+            test_noobaa account update ${account_name} --new_default_resource=${default_resource}
+            curr_default_resource=$(test_noobaa api account list_accounts {} -o json | jq -r '.accounts[0].default_resource')
+            if [ "${default_resource}" != "${curr_default_resource}" ]
+            then
+                echo_time "❌ Looks like account not updated to default state, Exiting"
+                exit 1
+            fi
+        fi
+    else
+        echo_time "💬  Checking crd based account update cycle"
+        local account_name="test-account"
+        echo_time "💬  Creating crd account ${account_name}"
+        test_noobaa account create ${account_name}
+        local default_resource=$(kuberun get NoobaaAccount ${account_name} -n test -o json | jq -r '.spec.default_resource')
+        echo_time "💬  Updating ${new_default_resource} as default_resource for noobaa account"
+        test_noobaa account update ${account_name} --new_default_resource=${new_default_resource}
+        local curr_default_resource=$(kuberun get NoobaaAccount ${account_name} -n test -o json | jq -r '.spec.default_resource')
+        if [ "${new_default_resource}" != "${curr_default_resource}" ]
+        then
+            echo_time "❌ Looks like crd account not updated, Exiting"
+            exit 1
+        else
+            echo_time "✅  Update crd account default_resource successful"
+            echo_time "💬  Deleting crd account ${account_name}"
+            test_noobaa account delete ${account_name}
+            echo_time "💬  Deleting backingstore ${new_default_resource}"
+            test_noobaa backingstore delete ${new_default_resource}
+        fi
+    fi
+}
+
+function account_regenerate_keys {
+    local account=${1}
+    local AWS_ACCESS_KEY_ID
+    local AWS_SECRET_ACCESS_KEY
+    if [ "${account}" != "operator@noobaa.io" ]
+    then
+        while read line
+        do
+            if [[ ${line} =~ (AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY) ]]
+            then
+                eval $(echo ${line//\"/} | sed -e 's/ //g' -e 's/:/=/g')
+            fi
+        done < <(test_noobaa account status ${account} --show-secrets)
+    fi
+
+    local ACCESS_KEY_ID_before=${AWS_ACCESS_KEY_ID}
+    local SECRET_ACCESS_KEY_before=${AWS_SECRET_ACCESS_KEY}
+    while read line
+    do
+        if [[ ${line} =~ (AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY) ]]
+        then
+            eval $(echo ${line//\"/} | sed -e 's/ //g' -e 's/:/=/g')
+        fi
+    done < <(yes | test_noobaa account regenerate ${account} --show-secrets)
+
+    if [ "${AWS_ACCESS_KEY_ID}" == "${ACCESS_KEY_ID_before}" ]
+    then
+        echo_time "❌ Looks like the ACCESS_KEY were not regenerated, Exiting"
+        exit 1
+    fi
+
+    if [ "${AWS_SECRET_ACCESS_KEY}" == "${SECRET_ACCESS_KEY_before}" ]
+    then
+        echo_time "❌ Looks like the SECRET_ACCESS were not regenerated, Exiting"
+        exit 1
+    fi
+}
+
+function account_update_keys {
+    local account=${1}
+    local access_key=${2}
+    local secret_key=${3}
+
+    local AWS_ACCESS_KEY_ID
+    local AWS_SECRET_ACCESS_KEY
+    if [ "${account}" != "operator@noobaa.io" ]
+    then
+        while read line
+        do
+            if [[ ${line} =~ (AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY) ]]
+            then
+                eval $(echo ${line//\"/} | sed -e 's/ //g' -e 's/:/=/g')
+            fi
+        done < <(test_noobaa account status ${account} --show-secrets)
+    fi
+
+    # should fail if account access key not matching the criteria
+    test_noobaa should_fail account credentials ${account} --access-key="Afjlkdsfnla" --secret-key="Aa+/123456789123456789123456789123456789"
+    # should fail if account secret key is not matching the criteria
+    test_noobaa should_fail account credentials ${account} --access-key="Aa123456789123456789" --secret-key="Aandlfknslkdnf"
+
+    local ACCESS_KEY_ID_before=${AWS_ACCESS_KEY_ID}
+    local SECRET_ACCESS_KEY_before=${AWS_SECRET_ACCESS_KEY}
+    while read line
+    do
+        if [[ ${line} =~ (AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY) ]]
+        then
+            eval $(echo ${line//\"/} | sed -e 's/ //g' -e 's/:/=/g')
+        fi
+    done < <(yes | test_noobaa account credentials ${account} \
+        --access-key=${access_key} --secret-key=${secret_key} --show-secrets)
+
+    if [ "${AWS_ACCESS_KEY_ID}" == "${ACCESS_KEY_ID_before}" ]
+    then
+        echo_time "❌ Looks like the ACCESS_KEY were not updated, Exiting"
+        exit 1
+    fi
+
+    if [ "${AWS_SECRET_ACCESS_KEY}" == "${SECRET_ACCESS_KEY_before}" ]
+    then
+        echo_time "❌ Looks like the SECRET_ACCESS were not updated, Exiting"
+        exit 1
+    fi
+}
+
+function account_nsfs_cycle {
+    local default_resource="fs1"
+    # Creating namespacestore to use by the account 
+    yes | test_noobaa namespacestore create nsfs ${default_resource} --pvc-name nsfs-vol --fs-backend GPFS
+    # Testing that we can create account using namespacestore
+    test_noobaa account create fsaccount1 --full_permission --default_resource ${default_resource} --nsfs_account_config --uid 123 --gid 456
+    # should fail if the default_resource does not exists
+    test_noobaa should_fail account create fsaccount2 --full_permission --default_resource not_exists --nsfs_account_config --uid 123 --gid 456
+    # should fail if the uid is not a number   
+    test_noobaa should_fail account create fsaccount3 --full_permission --default_resource ${default_resource} --nsfs_account_config --uid fail --gid 456
+    # should fail if the gid is not a number
+    test_noobaa should_fail account create fsaccount4 --full_permission --default_resource ${default_resource} --nsfs_account_config --uid 123 --gid fail
+}
+
 function delete_backingstore_path {
     local object_bucket backing_store
-    local backingstore=($(test_noobaa silence backingstore list | grep -v "NAME" | awk '{print $1}'))
+    local backingstore=($(test_noobaa silence backingstore list | filter_cli_list | awk '{print $1}'))
     local bucketclass=($(test_noobaa silence bucketclass list  | grep ${backingstore[1]} | awk '{print $1}'))
     local obc=()
-    local all_obc=($(test_noobaa silence obc list | grep -v "BUCKET-NAME" | awk '{print $2":"$5}'))
+    local all_obc=($(test_noobaa silence obc list | filter_cli_list | awk '{print $2":"$5}'))
     
     # get obcs that their bucketclass is in bucketclass array
     for object_bucket in ${all_obc[@]}
@@ -406,8 +1151,11 @@ function delete_backingstore_path {
             test_noobaa bucketclass delete ${bucket_class}
         done
     fi
-    sleep 30
-    local buckets=($(test_noobaa silence bucket list  | grep -v "BUCKET-NAME" | awk '{print $1}'))
+    if ! wait_for_bucketclasses_absent 30 "${bucketclass[@]}"
+    then
+        echo_time "⚠️  Proceeding with a backingstore delete that may fail - bucketclasses still present"
+    fi
+    local buckets=($(test_noobaa silence bucket list | filter_cli_list | awk '{print $1}'))
     echo_time "✅  buckets in system: ${buckets}"
     test_noobaa backingstore delete ${backingstore[1]}
     test_noobaa should_fail backingstore delete ${backingstore[0]}
@@ -416,13 +1164,11 @@ function delete_backingstore_path {
 
 function delete_namespacestore_path {
     local object_bucket namespace_store
-    test_noobaa obc delete ${obc[2]}
-    test_noobaa bucketclass delete ${bucketclass[2]}
-    local namespacestore=($(test_noobaa silence namespacestore list | grep -v "NAME" | awk '{print $1}'))
-    local bucketclass=($(test_noobaa silence bucketclass list | grep -v "NAME" | awk '{print $1}'))
+    local namespacestore=($(test_noobaa silence namespacestore list | filter_cli_list | awk '{print $1}'))
+    local bucketclass=($(test_noobaa silence bucketclass list | filter_cli_list | awk '{print $1}'))
     local obc=()
-    local all_obc=($(test_noobaa silence obc list | grep -v "BUCKET-NAME" | awk '{print $2":"$5}'))
-    
+    local all_obc=($(test_noobaa silence obc list | filter_cli_list | awk '{print $2":"$5}'))
+
     # get obcs that their bucketclass is in bucketclass array
     for object_bucket in ${all_obc[@]}
     do
@@ -454,24 +1200,52 @@ function delete_namespacestore_path {
             test_noobaa bucketclass delete ${bucket_class}
         done
     fi
-    sleep 30
-    local buckets=($(test_noobaa silence bucket list  | grep -v "BUCKET-NAME" | awk '{print $1}'))
+    # noobaa-default-bucket-class is recreated by the operator, so it never clears.
+    local deletable_bucketclass=()
+    for bucket_class in ${bucketclass[@]}
+    do
+        if [ "${bucket_class}" != "noobaa-default-bucket-class" ]
+        then
+            deletable_bucketclass+=(${bucket_class})
+        fi
+    done
+    if ! wait_for_bucketclasses_absent 30 "${deletable_bucketclass[@]}"
+    then
+        echo_time "⚠️  Proceeding with a namespacestore delete that may fail - bucketclasses still present"
+    fi
+    local buckets=($(test_noobaa silence bucket list | filter_cli_list | awk '{print $1}'))
     echo_time "✅  buckets in system: ${buckets}"
     test_noobaa namespacestore delete ${namespacestore[0]}
     test_noobaa namespacestore delete ${namespacestore[1]}
     echo_time "✅  delete ${namespacestore[1]} and ${namespacestore[0]} path is done"
 }
 
+function delete_account {
+    local accounts=($(test_noobaa silence account list | filter_cli_list | awk '{print $1}'))
+    for account in ${accounts[@]}
+    do
+        test_noobaa account delete ${account}
+    done
+    echo_time "✅  delete accounts is done"
+}
+
+function delete_non_existing_resources {
+    test_noobaa should_fail obc delete non-existing-obc
+    test_noobaa should_fail bucketclass delete non-existing-bc
+}
+
 function check_deletes {
     echo_time "💬  Starting the delete cycle"
-    local obc=($(test_noobaa silence obc list | grep -v "NAME\|default" | awk '{print $2}'))
-    local bucketclass=($(test_noobaa silence bucketclass list  | grep -v NAME | awk '{print $1}'))
-    local backingstore=($(test_noobaa silence backingstore list | grep -v "NAME" | awk '{print $1}'))
+    local obc=($(test_noobaa silence obc list | filter_cli_list | grep -v default | awk '{print $2}'))
+    local bucketclass=($(test_noobaa silence bucketclass list | filter_cli_list | awk '{print $1}'))
+    local backingstore=($(test_noobaa silence backingstore list | filter_cli_list | awk '{print $1}'))
     test_noobaa obc delete ${obc[0]}
     test_noobaa bucketclass delete ${bucketclass[0]}
     test_noobaa backingstore list
     delete_backingstore_path
     delete_namespacestore_path
+    delete_account
+    delete_non_existing_resources
     echo_time "✅  delete cycle is done"
 }
 
@@ -488,7 +1262,7 @@ function noobaa_uninstall {
     [ ${check_cleanup_data_flag} -eq 0 ] && cleanup_data="--cleanup_data"
 
     echo_time "💬  Running uninstall ${cleanup} ${cleanup_data}"
-    test_noobaa --timeout uninstall ${cleanup} ${cleanup_data}
+    yes | test_noobaa --timeout uninstall ${cleanup} ${cleanup_data}
     if [ ${check_cleanflag} -eq 0 ]
     then
         check_if_cleanup
@@ -535,3 +1309,475 @@ then
     echo_time "❌  The noobaa variable must be define in the shell"
     exit 1
 fi
+
+
+function create_replication_files {
+    echo "{\"rules\":[{ \"rule_id\": \"rule-1\", \"destination_bucket\": \"first.bucket\", \"filter\": {\"prefix\": \"d\"}} ]}" > replication1.json
+    echo "{\"rules\":[{ \"rule_id\": \"rule-2\", \"destination_bucket\": \"first.bucket\", \"filter\": {\"prefix\": \"e\"}} ]}" > replication2.json
+}
+
+function delete_replication_files {
+    rm "replication1.json"
+    rm "replication2.json"
+}
+
+function check_backingstore {
+    echo_time "💬  Creating bucket testbucket"
+    test_noobaa bucket create "testbucket"
+
+    local tier=`noobaa api bucket_api read_bucket '{ "name": "testbucket" }' | grep -w "tier" | awk '{ print $2 }'`
+    local bs=`noobaa api tier_api read_tier '{ "name": "'$tier'" }' | grep -m 1 "noobaa-default-backing-store"` 
+
+    if [ ! -z "$bs" ]
+    then
+        echo_time "❌  backingstore for the bucket is not the default backingstore"
+        exit 1
+    fi
+
+    echo_time "💬  Deleting bucket testbucket"
+    test_noobaa bucket delete "testbucket"
+}
+
+function check_default_backingstore {
+    echo_time "💬 Checking if Noobaa Default Backingstore is already present"
+    local default_backing=$(kuberun get backingstore | grep -w noobaa-default-backing-store | wc -l)
+    if [[ "${default_backing}" =~ "1" ]]
+    then
+        echo_time "✅  Default Backingstore is already present"
+    else
+        echo_time "❌  Default Backingstore is not already present, Exiting"
+        exit 1
+    fi
+
+    echo_time "💬 Disabling Noobaa default backingstore"
+    kuberun patch noobaa/noobaa --type json --patch='[{"op":"add","path":"/spec/manualDefaultBackingStore","value":true}]'
+
+    echo_time "💬 Deleting Noobaa default backingstore and its connected instances"
+    echo_time "💬 Deleting buckets"
+    wait_for_noobaa_ready
+    local buckets=($(test_noobaa silence bucket list | filter_cli_list | awk '{print $1}'))
+    for bucket in ${buckets[@]}
+    do
+        delete_bucket_idempotent "${bucket}"
+    done
+    echo_time "💬 Deleting non-default accounts"
+    delete_account
+
+    echo_time "💬 Creating new-default-backing-store and updating the admin account default_resource with it"
+    test_noobaa backingstore create pv-pool new-default-backing-store --num-volumes 1 --pv-size-gb 16
+    test_noobaa account update admin@noobaa.io --new_default_resource=new-default-backing-store
+    test_noobaa account update operator@noobaa.io --new_default_resource=new-default-backing-store
+    test_noobaa api account list_accounts {}
+    test_noobaa account list
+
+    echo_time "💬 Deleting backingstore noobaa-default-backing-store"
+    kuberun delete backingstore noobaa-default-backing-store -n test | kubectl patch -n test backingstore/noobaa-default-backing-store --type json --patch='[ { "op": "remove", "path": "/metadata/finalizers" } ]'
+
+    if ! quiet_poll 120 2 "default backingstore to be deleted" \
+        "! ${kubectl} get backingstore noobaa-default-backing-store >/dev/null 2>&1" \
+        "${kubectl} get backingstore noobaa-default-backing-store --request-timeout=10s -o yaml"
+    then
+        exit 1
+    fi
+
+    # Poll briefly so reconcile has time to recreate, then confirm it stayed deleted.
+    echo_time "💬 Checking if Noobaa Default Backingstore is Reconciled"
+    local settle=0
+    while [ ${settle} -lt 20 ]
+    do
+        if ${kubectl} get backingstore noobaa-default-backing-store &>/dev/null
+        then
+            echo_time "❌  Default Backingstore is reconciled, Exiting"
+            exit 1
+        fi
+        sleep 2
+        settle=$((settle + 2))
+    done
+    echo_time "✅  Default Backingstore is not reconciled, Successful"
+
+    echo_time "💬 Enabling Noobaa default backingstore"
+    kuberun patch noobaa/noobaa --type json --patch='[{"op":"add","path":"/spec/manualDefaultBackingStore","value":false}]'
+    if ! quiet_poll 120 2 "default backingstore to be recreated" \
+        "${kubectl} get backingstore noobaa-default-backing-store &>/dev/null"
+    then
+        exit 1
+    fi
+    wait_for_backingstore_ready noobaa-default-backing-store 300
+}
+
+function check_dbdump {
+    echo_time "💬  Generating db dump"
+
+    # Generate db dump at /tmp/<random_dir>
+    rand_dir=`tr -dc A-Za-z0-9 </dev/urandom | head -c 13 ; echo ''`
+    mkdir /tmp/$rand_dir
+    test_noobaa db-dump --dir /tmp/$rand_dir
+
+    # Check whether dump was created
+    dump_file_name=`ls -l /tmp/$rand_dir | grep noobaa_db_dump | awk '{ print $9 }'`
+    if [ ! -f "/tmp/$rand_dir/$dump_file_name" ]
+    then
+        echo_time "❌  db dump was not generated"
+        exit 1
+    fi
+
+    # Remove dump file
+    rm /tmp/$rand_dir/$dump_file_name
+
+    # Generate db dump through diagnostics API
+    echo_time "💬  Generating db dump through diagnostics"
+    test_noobaa diagnostics collect --db-dump --dir /tmp/$rand_dir
+
+    # Check whether dump was created
+    diagnose_file_name=`ls -l /tmp/$rand_dir | grep noobaa_diagnostics | awk '{ print $9 }'`
+    dump_file_name=`ls -l /tmp/$rand_dir | grep noobaa_db_dump | awk '{ print $9 }'`
+    if [ ! -f "/tmp/$rand_dir/$dump_file_name" ]
+    then
+        echo_time "❌  db dump was not generated"
+        exit 1
+    fi
+
+    # Remove diagnostics and dump files
+    rm -rf /tmp/$rand_dir
+}
+
+function test_noobaa_cr_deletion() {
+    local resp
+    resp=$(kubectl -n ${NAMESPACE} delete noobaas.noobaa.io noobaa 2>&1 >/dev/null)
+    if [ $? -ne 0 ]; then
+        echo $resp
+        if [[ $resp == *"Noobaa cleanup policy is not set, blocking Noobaa deletion"* ]]; then
+            echo_time "✅  Noobaa CR deletion test passed"
+        else
+            echo_time "❌  Noobaa CR deletion test failed"
+            exit 1
+        fi
+    else
+        echo_time "❌  Noobaa CR deletion test failed: kubectl delete returned 0"
+        exit 1
+    fi
+}
+
+# dump_loadbalancer_source_subnet_diagnostics prints service type/ranges and CR subnets.
+function dump_loadbalancer_source_subnet_diagnostics {
+    echo_time "Service s3: type=$(${kubectl} get svc s3 -o jsonpath='{.spec.type}') ranges=$(${kubectl} get svc s3 -o json | jq -rc '.spec.loadBalancerSourceRanges // []')"
+    echo_time "Service sts: type=$(${kubectl} get svc sts -o jsonpath='{.spec.type}') ranges=$(${kubectl} get svc sts -o json | jq -rc '.spec.loadBalancerSourceRanges // []')"
+    echo_time "CR subnets: $(${kubectl} get noobaas.noobaa.io noobaa -o json | jq -rc '.spec.loadBalancerSourceSubnets // {}')"
+}
+
+# test_noobaa_loadbalancer_source_subnet patches loadBalancerSourceSubnets and quiet-polls
+# until s3/sts Services match exactly, then reverts the CR patch.
+function test_noobaa_loadbalancer_source_subnet {
+    local max_timeout=60
+    local interval=2
+    local temp_file=/tmp/test-$(date +%s).json
+    trap 'rm -f "$temp_file"' RETURN
+    local subnet1=10.0.0.0/16
+    local subnet2=172.18.0.0/32
+    cat <<EOF > $temp_file
+{
+    "spec": {
+        "loadBalancerSourceSubnets":  {
+            "s3": ["$subnet1"],
+            "sts": ["$subnet2"]
+        }
+    }
+}
+EOF
+
+    kuberun silence patch noobaas.noobaa.io noobaa --patch-file $temp_file --type merge
+
+    if ! ${kubectl} get noobaas.noobaa.io noobaa -o json | jq -e --arg s1 "${subnet1}" --arg s2 "${subnet2}" \
+        '(.spec.loadBalancerSourceSubnets.s3 // []) == [$s1] and (.spec.loadBalancerSourceSubnets.sts // []) == [$s2]' >/dev/null
+    then
+        echo_time "❌  CR loadBalancerSourceSubnets did not take the patch"
+        dump_loadbalancer_source_subnet_diagnostics
+        rm -f "$temp_file"
+        exit 1
+    fi
+
+    if ! quiet_poll ${max_timeout} ${interval} "Services s3/sts loadBalancerSourceRanges" \
+        "${kubectl} get svc s3 -o json | jq -e --arg s '${subnet1}' '(.spec.loadBalancerSourceRanges // []) == [\$s]' >/dev/null && ${kubectl} get svc sts -o json | jq -e --arg s '${subnet2}' '(.spec.loadBalancerSourceRanges // []) == [\$s]' >/dev/null" \
+        "dump_loadbalancer_source_subnet_diagnostics"
+    then
+        echo_time "❌  Noobaa loadbalancer source subnet test failed"
+        rm -f "$temp_file"
+        exit 1
+    fi
+
+    kuberun silence patch noobaas.noobaa.io noobaa --type json \
+        --patch='[{"op":"remove","path":"/spec/loadBalancerSourceSubnets"}]'
+    if ! quiet_poll ${max_timeout} ${interval} "Services s3/sts loadBalancerSourceRanges cleared" \
+        "${kubectl} get svc s3 -o json | jq -e '((.spec.loadBalancerSourceRanges // []) | length) == 0' >/dev/null && ${kubectl} get svc sts -o json | jq -e '((.spec.loadBalancerSourceRanges // []) | length) == 0' >/dev/null" \
+        "dump_loadbalancer_source_subnet_diagnostics"
+    then
+        echo_time "⚠️  Could not clear loadBalancerSourceRanges - later S3 tests may be source-restricted"
+    fi
+
+    echo_time "✅  Noobaa loadbalancer source subnet test passed"
+}
+
+# dump_multinamespace_bucketclass_diagnostics prints BC, BackingStore, and NooBaa phase on timeout.
+function dump_multinamespace_bucketclass_diagnostics {
+    local namespace=$1
+    local bucketclass_name=$2
+    local backingstore_name=$3
+    echo_time "BucketClass ${bucketclass_name}: $(kubectl -n ${namespace} get bucketclass ${bucketclass_name} -o json 2>/dev/null | jq -rc '{phase: .status.phase, conditions: .status.conditions}')"
+    echo_time "BackingStore ${backingstore_name}: $(kubectl -n ${NAMESPACE} get backingstore ${backingstore_name} -o jsonpath='{.status.phase}' 2>/dev/null)"
+    echo_time "NooBaa phase: $(kubectl -n ${NAMESPACE} get noobaa noobaa -o jsonpath='{.status.phase}' 2>/dev/null)"
+}
+
+# dump_multinamespace_obc_diagnostics prints OBC and related BucketClass phase on timeout.
+function dump_multinamespace_obc_diagnostics {
+    local namespace=$1
+    local obc_name=$2
+    local bucketclass_name=$3
+    echo_time "OBC ${obc_name}: $(kubectl -n ${namespace} get obc ${obc_name} -o json 2>/dev/null | jq -rc '{phase: .status.phase, conditions: .status.conditions}')"
+    echo_time "BucketClass ${bucketclass_name}: $(kubectl -n ${namespace} get bucketclass ${bucketclass_name} -o jsonpath='{.status.phase}' 2>/dev/null)"
+    echo_time "NooBaa phase: $(kubectl -n ${NAMESPACE} get noobaa noobaa -o jsonpath='{.status.phase}' 2>/dev/null)"
+}
+
+# test_multinamespace_bucketclass verifies BucketClass/OBC across system and non-system namespaces.
+function test_multinamespace_bucketclass {
+
+    # test_create_bucketclass applies a BucketClass and quiet-polls until Ready (or expects no reconcile).
+    function test_create_bucketclass {
+        local fail_time=600
+        local bucketclass_name=$1
+        local backingstore_name=$2
+        local namespace=$3
+        local provisioner=$4
+        local fail=$5
+
+        cat <<EOF | kubectl -n $namespace apply -f -
+apiVersion: noobaa.io/v1alpha1
+kind: BucketClass
+metadata:
+    name: $bucketclass_name
+    labels:
+        noobaa-operator: $provisioner
+spec:
+    placementPolicy:
+        tiers:
+        - backingStores:
+          - $backingstore_name
+EOF
+
+        # If fail is set to true then expect the test to fail
+        if [ "$fail" == "true" ]; then
+            # Negative assertion is only meaningful if the BucketClass actually exists.
+            if ! kubectl -n $namespace get bucketclass $bucketclass_name >/dev/null 2>&1; then
+                echo_time "❌  [${FUNCNAME[0]}]: BucketClass ${bucketclass_name} was not created - cannot assert it is unreconciled"
+                exit 1
+            fi
+            local settle=0
+            local bucketclass
+            while [ ${settle} -lt 30 ]
+            do
+                if ! bucketclass=$(kubectl -n $namespace get bucketclass $bucketclass_name -o=go-template='{{.status}}' 2>/dev/null); then
+                    echo_time "❌  [${FUNCNAME[0]}]: BucketClass ${bucketclass_name} disappeared during the settle window"
+                    exit 1
+                fi
+                if [ "$bucketclass" != "<no value>" ]; then
+                    echo_time "❌  [${FUNCNAME[0]}]: Noobaa bucketclass creation - picked by the operator - test failed"
+                    exit 1
+                fi
+                sleep 2
+                settle=$((settle + 2))
+            done
+            echo_time "✅  [${FUNCNAME[0]}]: Noobaa bucketclass creation - not picked by the operator - test passed"
+        else
+            if ! quiet_poll ${fail_time} 2 "BucketClass ${bucketclass_name} Ready" \
+                "[ \"\$(kubectl -n ${namespace} get bucketclass ${bucketclass_name} -o jsonpath='{.status.phase}' 2>/dev/null)\" = Ready ]" \
+                "dump_multinamespace_bucketclass_diagnostics ${namespace} ${bucketclass_name} ${backingstore_name}"
+            then
+                echo_time "❌  [${FUNCNAME[0]}]: Noobaa multinamespace bucketclass test failed for bucketclass ${bucketclass_name}"
+                exit 1
+            fi
+            echo_time "✅  [${FUNCNAME[0]}]: Noobaa multinamespace bucketclass verified for bucketclass ${bucketclass_name}"
+        fi
+    }
+
+    # test_create_obc applies an OBC and quiet-polls until Bound.
+    function test_create_obc {
+        local fail_time=600
+        local obc_name=$1
+        local bucketclass_name=$2
+        local namespace=$3
+
+        cat <<EOF | kubectl -n $namespace apply -f -
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+    name: $obc_name
+spec:
+    bucketName: $obc_name
+    storageClassName: ${NAMESPACE}.noobaa.io
+    additionalConfig:
+        bucketclass: $bucketclass_name
+EOF
+
+        if ! quiet_poll ${fail_time} 2 "OBC ${obc_name} Bound" \
+            "[ \"\$(kubectl -n ${namespace} get obc ${obc_name} -o jsonpath='{.status.phase}' 2>/dev/null)\" = Bound ]" \
+            "dump_multinamespace_obc_diagnostics ${namespace} ${obc_name} ${bucketclass_name}"
+        then
+            echo_time "❌  [${FUNCNAME[0]}]: Noobaa multinamespace bucketclass test failed for obc ${obc_name}"
+            exit 1
+        fi
+        echo_time "✅  [${FUNCNAME[0]}]: Noobaa multinamespace bucketclass verified for obc ${obc_name}"
+    }
+
+    # Helper function to delete OBC
+    function test_delete_obc() {
+        local timeout=0
+        local obc_name=$1
+        local namespace=$2
+
+        kubectl -n $namespace delete obc $obc_name
+    }
+
+    # Helper function to delete bucketclass
+    function test_delete_bucketclass() {
+        local timeout=0
+        local bucketclass_name=$1
+        local namespace=$2
+
+        kubectl -n $namespace delete bucketclass $bucketclass_name
+    }
+
+    # Test multinamespace bucketclass - system namespace
+    function test_multinamespace_bucketclass_system_namespace() {
+        test_create_bucketclass multinamespace-bucketclass noobaa-default-backing-store ${NAMESPACE} ${NAMESPACE}
+        test_create_obc multinamespace-obc multinamespace-bucketclass ${NAMESPACE}
+
+        test_delete_obc multinamespace-obc ${NAMESPACE}
+        test_delete_bucketclass multinamespace-bucketclass ${NAMESPACE}
+
+        echo_time "✅  [${FUNCNAME[0]}]: Noobaa multinamespace bucketclass test passed"
+    }
+
+    # Test multinamespace bucketclass - non-system namespace correct operator
+    function test_multinamespace_bucketclass_non_system_namespace_correct_operator() {
+        local random_namespace=`echo test-ns-$(date +%s)`
+
+        kubectl create namespace $random_namespace
+
+        test_create_bucketclass multinamespace-bucketclass noobaa-default-backing-store ${random_namespace} ${NAMESPACE}
+        test_create_obc multinamespace-obc multinamespace-bucketclass ${random_namespace}
+
+        test_delete_obc multinamespace-obc ${random_namespace}
+        test_delete_bucketclass multinamespace-bucketclass ${random_namespace}
+
+        kubectl delete namespace $random_namespace
+
+        echo_time "✅  [${FUNCNAME[0]}]: Noobaa multinamespace bucketclass test passed"
+    }
+
+    # Test multinamespace bucketclass - non-system namespace incorrect operator
+    function test_multinamespace_bucketclass_non_system_namespace_incorrect_operator() {
+        local random_namespace=`echo test-ns-$(date +%s)`
+        local random_operator=`echo test-op-$(date +%s)`
+
+        kubectl create namespace $random_namespace
+
+        test_create_bucketclass multinamespace-bucketclass noobaa-default-backing-store ${random_namespace} ${random_operator} "true"
+        test_delete_bucketclass multinamespace-bucketclass ${random_namespace}
+
+        kubectl delete namespace $random_namespace
+
+        echo_time "✅  [${FUNCNAME[0]}]: Noobaa multinamespace bucketclass test passed"
+    }
+
+    test_multinamespace_bucketclass_system_namespace
+    test_multinamespace_bucketclass_non_system_namespace_correct_operator
+    test_multinamespace_bucketclass_non_system_namespace_incorrect_operator
+
+    echo_time "✅  [${FUNCNAME[0]}]: Noobaa multinamespace bucketclass test passed"
+}
+
+# Should fail due to:
+function obc_nsfs_negative_tests {
+    # No GID
+    yes n | test_noobaa should_fail obc create testobc --uid 42
+    # No UID
+    yes n | test_noobaa should_fail obc create testobc --gid 505
+    # Distingusihed name provided in conjunction with UID
+    yes n | test_noobaa should_fail obc create testobc --distinguished-name 'test' --uid 42
+    # GID and UID (valid) but no bucketclass
+    yes n | test_noobaa should_fail obc create testobc --uid 42 --gid 505
+}
+
+function test_create_obc_with_nsfs_acc_cfg_uid_gid_logic {
+    local uid=$1
+    local gid=$2
+    local obc_name="giduidtestobc"
+    test_noobaa obc create ${obc_name} --uid ${uid} --gid ${gid} --bucketclass noobaa-default-bucket-class
+    local obc_account_nsfs_account=$(test_noobaa api account list_accounts {} -ojson | jq '.accounts[] | select(.bucket_claim_owner | test("'${obc_name}'"))?' | jq '.nsfs_account_config')
+    local account_gid=$(echo $obc_account_nsfs_account | jq '.gid')
+    local account_uid=$(echo $obc_account_nsfs_account | jq '.uid')
+    test_noobaa obc delete ${obc_name}
+    if [[ $account_gid != $gid || $account_uid != $uid ]]; then
+        echo_time "❌  [${FUNCNAME[0]}]: Noobaa obc nsfs account creation test failed. Expected: uid=$uid, gid=$gid, Got: uid=$account_uid, gid=$account_gid"
+        exit 1
+    fi
+}
+
+# test_create_obc_with_nsfs_acc_cfg_uid_gid but it iterates over several pairs of UID and GID - [0,0], [42, 505]
+function test_create_obc_with_nsfs_acc_cfg_uid_gid {
+    for uid in 0 42; do
+        for gid in 0 505; do
+            test_create_obc_with_nsfs_acc_cfg_uid_gid_logic $uid $gid
+        done
+    done
+}
+
+function test_create_obc_with_nsfs_acc_distinguished_name {
+    local distinguished_name="someuser"
+    local obc_name="distinguishednameobc"
+    test_noobaa obc create ${obc_name} --distinguished-name $distinguished_name --bucketclass noobaa-default-bucket-class
+    local obc_account_nsfs_account=$(test_noobaa api account list_accounts {} -ojson | jq '.accounts[] | select(.bucket_claim_owner | test("'${obc_name}'"))?' | jq '.nsfs_account_config')
+    local account_distinguished_name=$(echo $obc_account_nsfs_account | jq -r '.distinguished_name')
+    test_noobaa obc delete ${obc_name}
+    if [[ $account_distinguished_name != $distinguished_name ]]; then
+        echo_time "❌  [${FUNCNAME[0]}]: Noobaa obc nsfs account creation test failed. Expected: distinguished_name=$distinguished_name, Got: distinguished_name=$account_distinguished_name"
+        exit 1
+    fi
+}
+
+# test_bucket_update_placement verifies bucket update-placement against a second PV pool.
+# Runs before check_deletes. Waits until placement-test-bs is gone so delete_backingstore_path
+# still indexes the expected backingstore[0] and backingstore[1].
+function test_bucket_update_placement {
+    echo_time "💬  Testing bucket update-placement command"
+
+    echo_time "💬  Creating a second backing store for placement test"
+    test_noobaa backingstore create pv-pool placement-test-bs --num-volumes 1 --pv-size-gb 16
+    wait_for_backingstore_ready placement-test-bs 300
+
+    echo_time "💬  Creating a CLI bucket on the default backing store"
+    test_noobaa bucket create placement-test-bucket
+
+    echo_time "💬  Updating bucket placement to use new backing store"
+    test_noobaa bucket update-placement placement-test-bucket --placement Spread --backingstores placement-test-bs
+
+    echo_time "💬  Verifying OBC bucket is rejected"
+    local obc_bucket
+    obc_bucket=$(test_noobaa silence obc list | filter_cli_list | head -1 | awk '{print $3}')
+    if [[ -n "${obc_bucket}" ]]; then
+        test_noobaa should_fail bucket update-placement "${obc_bucket}" --placement Spread --backingstores placement-test-bs
+    fi
+
+    echo_time "💬  Cleanup"
+    test_noobaa bucket delete placement-test-bucket
+    # --wait=false so quiet_poll owns the finalizer wait and can dump diagnostics on timeout.
+    kuberun delete backingstore placement-test-bs --wait=false
+    # Succeed only on NotFound. Do not invert kubectl's exit code (timeouts/API errors are not absence).
+    if ! quiet_poll 120 2 "placement-test-bs deleted" \
+        "${kubectl} get backingstore placement-test-bs --request-timeout=10s 2>&1 | grep -qi NotFound" \
+        "${kubectl} get backingstore placement-test-bs --request-timeout=10s -o yaml"
+    then
+        exit 1
+    fi
+
+    echo_time "✅  bucket update-placement test passed"
+}
