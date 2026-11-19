@@ -3,6 +3,7 @@ package nb
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -172,19 +173,20 @@ func (r *APIRouterPortForward) GetAddress(api string) string {
 // GetAddress implements the router
 func (r *APIRouterPodPort) GetAddress(api string) string {
 	port := FindPortByName(r.ServiceMgmt, GetAPIPortName(api)).TargetPort.IntValue()
-	return fmt.Sprintf("wss://%s:%d/rpc/", r.PodIP, port)
+	return fmt.Sprintf("wss://%s/rpc/", net.JoinHostPort(r.PodIP, strconv.Itoa(port)))
 }
 
 // GetAddress implements the router
 func (r *APIRouterNodePort) GetAddress(api string) string {
 	port := FindPortByName(r.ServiceMgmt, GetAPIPortName(api)).NodePort
-	return fmt.Sprintf("wss://%s:%d/rpc/", r.NodeIP, port)
+	return util.GetFormattedEndpoint("wss", r.NodeIP, port)
 }
 
 // GetAddress implements the router
 func (r *APIRouterServicePort) GetAddress(api string) string {
-	port := FindPortByName(r.ServiceMgmt, GetAPIPortName(api)).Port
-	return fmt.Sprintf("wss://%s.%s.svc.cluster.local:%d/rpc/", r.ServiceMgmt.Name, r.ServiceMgmt.Namespace, port)
+	srv := r.ServiceMgmt
+	port := FindPortByName(srv, GetAPIPortName(api)).Port
+	return fmt.Sprintf("wss://%s.%s.svc.cluster.local:%d/rpc/", srv.Name, srv.Namespace, port)
 }
 
 // FindPortByName returns the port in the service that matches the given name.
@@ -198,13 +200,9 @@ func FindPortByName(srv *corev1.Service, portName string) *corev1.ServicePort {
 }
 
 // GetAPIPortName maps every noobaa api name to the service port name that serves it.
+// The typed nb.Client only talks to mgmt (and hosted-agents). BG scrubber RPC is
+// reached from core/endpoints via BG_ADDR, not this router.
 func GetAPIPortName(api string) string {
-	if api == "object_api" || api == "func_api" {
-		return "md-https"
-	}
-	if api == "scrubber_api" {
-		return "bg-https"
-	}
 	if api == "hosted_agents_api" {
 		return "hosted-agents-https"
 	}
