@@ -1,0 +1,49 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: noobaa-endpoint
+  labels:
+    app: noobaa
+spec:
+  podSelector:
+    matchLabels:
+      noobaa-s3: noobaa
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 6001
+    - protocol: TCP
+      port: 6443
+    - protocol: TCP
+      port: 7443
+    - protocol: TCP
+      port: 8444
+    - protocol: TCP
+      port: 9443
+    - protocol: TCP
+      port: 13443
+    - protocol: TCP
+      port: 14443
+    # N2N ICE listens on a random port in this range (see noobaa-core rpc_n2n_agent)
+    - protocol: TCP
+      port: 60101
+      endPort: 60600
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 6001
+    - protocol: TCP
+      port: 6443
+    - protocol: TCP
+      port: 7443
+    - protocol: TCP
+      port: 9443
+    - protocol: TCP
+      port: 13443
+    - protocol: TCP
+      port: 14443
